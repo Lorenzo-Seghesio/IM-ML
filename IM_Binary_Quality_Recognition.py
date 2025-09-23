@@ -33,6 +33,9 @@ best_model_global = None
 batch_size = 32
 dropout = 0.2
 
+test_csv_path = 'data/IM_Data_Test.csv'  # Path to the test dataset
+train_csv_path = 'data/IM_Data_Train.csv'  # Path to the training dataset
+
 
 # === Model Definition ===
 class BinaryClassifier(nn.Module):
@@ -164,23 +167,23 @@ def evaluate_model(model, loader, device, metric='f1'):
         return auc_score
 
 # === Evaluate Model and plot results ===
-def evaluate_and_plot_results(model_tp, X_test_tp, y_test_tp, model_rs, X_test_rs, y_test_rs, device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png"):
+def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png"):
         
         # Evaluate model_tp
         model_tp.eval()
         with torch.no_grad():
-            test_outputs_presigmoid_tp = model_tp(torch.tensor(X_test_tp, dtype=torch.float32).to(device))
+            test_outputs_presigmoid_tp = model_tp(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_tp = torch.sigmoid(test_outputs_presigmoid_tp).float().cpu().numpy()
             thresholds_tp = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6]
             test_preds_tp = {threshold: (test_outputs_prob_tp > threshold).astype(float) for threshold in thresholds_tp}
 
-        fpr_tp, tpr_tp, _ = roc_curve(y_test_tp, test_outputs_prob_tp)
+        fpr_tp, tpr_tp, _ = roc_curve(y_test, test_outputs_prob_tp)
         roc_auc_tp = auc(fpr_tp, tpr_tp)
 
         results_tp = {}
         for threshold, preds in test_preds_tp.items():
-            f1 = f1_score(y_test_tp, preds)
-            acc = accuracy_score(y_test_tp, preds)
+            f1 = f1_score(y_test, preds)
+            acc = accuracy_score(y_test, preds)
             results_tp[threshold] = {"f1": f1, "accuracy": acc}
 
         print(f"ROC AUC on Test (TP): {roc_auc_tp:.4f}")
@@ -190,18 +193,18 @@ def evaluate_and_plot_results(model_tp, X_test_tp, y_test_tp, model_rs, X_test_r
         # Evaluate model_rs
         model_rs.eval()
         with torch.no_grad():
-            test_outputs_presigmoid_rs = model_rs(torch.tensor(X_test_rs, dtype=torch.float32).to(device))
+            test_outputs_presigmoid_rs = model_rs(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_rs = torch.sigmoid(test_outputs_presigmoid_rs).float().cpu().numpy()
             thresholds_rs = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6]
             test_preds_rs = {threshold: (test_outputs_prob_rs > threshold).astype(float) for threshold in thresholds_rs}
 
-        fpr_rs, tpr_rs, _ = roc_curve(y_test_rs, test_outputs_prob_rs)
+        fpr_rs, tpr_rs, _ = roc_curve(y_test, test_outputs_prob_rs)
         roc_auc_rs = auc(fpr_rs, tpr_rs)
 
         results_rs = {}
         for threshold, preds in test_preds_rs.items():
-            f1 = f1_score(y_test_rs, preds)
-            acc = accuracy_score(y_test_rs, preds)
+            f1 = f1_score(y_test, preds)
+            acc = accuracy_score(y_test, preds)
             results_rs[threshold] = {"f1": f1, "accuracy": acc}
 
         print(f"ROC AUC on Test (RS): {roc_auc_rs:.4f}")
@@ -305,7 +308,7 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
 
 
 # === Retrain Final Model ===
-def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
+def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train='data/IM_Data_Train.csv', csv_path_test='data/IM_Data_Test.csv'):
     global best_model_global
     global batch_size
     global dropout
@@ -317,21 +320,22 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X, y = load_dataset(csv_path)
-    print(f"The Data has {X.shape[0]} samples and {X.shape[1]} features.")
+    # Train data
+    X_train, y_train = load_dataset(csv_path_train)
+    print(f"The Data has {X_train.shape[0]} samples and {X_train.shape[1]} features.")
 
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     batch_size = 32
     dropout = 0.0
     # TPE
-    model_tp = BinaryClassifier(input_size=X.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
+    model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
     criterion_tp = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
     optimizer_tp = torch.optim.Adam(model_tp.parameters(), lr=params_tpe["lr"])
     #RS
-    model_rs = BinaryClassifier(input_size=X.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
-    criterion_rs = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
-    optimizer_rs = torch.optim.Adam(model_rs.parameters(), lr=params_tpe["lr"])
+    model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout).to(device)
+    criterion_rs = BinaryFocalLoss(alpha=params_rs["alpha"], gamma=params_rs["gamma"])
+    optimizer_rs = torch.optim.Adam(model_rs.parameters(), lr=params_rs["lr"])
 
     auc_scores_tp = []
     best_auc_tp = 0
@@ -341,14 +345,14 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/
     best_auc_rs = 0
     best_model_rs = None
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
+        X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+        y_train_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
 
-        train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
-                                 torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
-        val_ds = TensorDataset(torch.tensor(X_val, dtype=torch.float32),
-                               torch.tensor(y_val, dtype=torch.float32).unsqueeze(1))
+        train_ds = TensorDataset(torch.tensor(X_train_fold, dtype=torch.float32),
+                                 torch.tensor(y_train_fold, dtype=torch.float32).unsqueeze(1))
+        val_ds = TensorDataset(torch.tensor(X_val_fold, dtype=torch.float32),
+                               torch.tensor(y_val_fold, dtype=torch.float32).unsqueeze(1))
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=batch_size)
@@ -363,15 +367,15 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/
         if auc_score_tp > best_auc_tp:
             best_auc_tp = auc_score_tp
             best_model_tp = model_tp
-            X_test_tp, y_test_tp = X_val, y_val  # Save the test set for final evaluation
+            # X_test_tp, y_test_tp = X_val_fold, y_val_fold  # Save the test set for final evaluation
         # Evaluate RS
         auc_score_rs = evaluate_model(model_rs, val_loader, device, 'auc')
         auc_scores_rs.append(auc_score_rs)
         if auc_score_rs > best_auc_rs:
             best_auc_rs = auc_score_rs
             best_model_rs = model_rs
-            X_test_rs, y_test_rs = X_val, y_val  # Save the test set for final evaluation
-    
+            # X_test_rs, y_test_rs = X_val_fold, y_val_fold  # Save the test set for final evaluation
+
     print(f"TP: Best AUC Score across folds: {best_auc_tp:.4f} and mean AUC Score: {np.mean(auc_scores_tp):.4f}, after {len(auc_scores_tp)} folds.")
     print(f"RS: Best AUC Score across folds: {best_auc_rs:.4f} and mean AUC Score: {np.mean(auc_scores_rs):.4f}, after {len(auc_scores_rs)} folds.")
 
@@ -380,7 +384,9 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path='data/
 
     # Model evaluation
     print(f"\nRe-trained models evaluation")
-    evaluate_and_plot_results(best_model_tp, X_test_tp, y_test_tp, best_model_rs, X_test_rs, y_test_rs, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
+    # Load test data
+    X_test, y_test = load_dataset(csv_path_test)
+    evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
 
 
 # === Run Optuna Optimization ===
@@ -442,20 +448,32 @@ if __name__ == "__main__":
         else:
             print("\nUsing by default the full dataset, both PP and ABS data.\n")
             csv_path = 'data/DATA_ABS_&_PP_Binary.csv'
-    
+
+    # Split data into train and test sets
+    df = pd.read_csv(csv_path)
+    Data_train, Data_test = train_test_split(df, test_size=0.2, stratify=df.iloc[:, -1], random_state=42)
+    Data_train_df = pd.DataFrame(Data_train)
+    Data_test_df = pd.DataFrame(Data_test)
+    Data_train_df.to_csv(train_csv_path, index=False)
+    Data_test_df.to_csv(test_csv_path, index=False)
+    print(f"The training data has {Data_train.shape[0]} samples and the test data has {Data_test.shape[0]} samples.")
+    # print(Data_train_df, Data_test_df)
+
     # Run HPO otpimization with TPE sampler and HyperbandPruner
+    print(f"\nStarting TPE optimization...\n")
     sampler = optuna.samplers.TPESampler(seed=1) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_tpe = run_optimization(sampler, pruner, csv_path)
+    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path)
 
-    # Run HPO otpimization with TPE sampler and HyperbandPruner
+    # Run HPO otpimization with RS sampler and MedianPruner
+    print(f"\nStarting RS optimization...\n")
     sampler = optuna.samplers.RandomSampler(seed=1)  # Use RandomSampler for simplicity
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=5, n_startup_trials=10)
-    best_trial_rs = run_optimization(sampler, pruner, csv_path)
+    best_trial_rs = run_optimization(sampler, pruner, train_csv_path)
 
     # Retrain the best models
-    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path=csv_path)
-    
+    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+
     # Print total time taken
     end_time = time.time()
     print(f"\nTotal time taken: {end_time - start_time:.2f} seconds")
