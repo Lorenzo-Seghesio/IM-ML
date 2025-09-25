@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, auc, roc_curve, RocCurveDisplay, roc_auc_score
+from sklearn.feature_selection import mutual_info_classif
 import time
 import argparse
 from plotly.io import show
@@ -451,28 +452,44 @@ if __name__ == "__main__":
 
     # Split data into train and test sets
     df = pd.read_csv(csv_path)
-    Data_train, Data_test = train_test_split(df, test_size=0.2, stratify=df.iloc[:, -1], random_state=42)
-    Data_train_df = pd.DataFrame(Data_train)
-    Data_test_df = pd.DataFrame(Data_test)
-    Data_train_df.to_csv(train_csv_path, index=False)
-    Data_test_df.to_csv(test_csv_path, index=False)
-    print(f"The training data has {Data_train.shape[0]} samples and the test data has {Data_test.shape[0]} samples.")
-    # print(Data_train_df, Data_test_df)
+    X = df.iloc[:, :-1].values
+    y = df.iloc[:, -1].values
+    # Compute Mutual Information (MI) Scores for each feature
+    MI_scores = mutual_info_classif(X, y, random_state=42)
+    for i, score in enumerate(MI_scores):
+        print(f"Feature {i}: MI Score = {score:.4f}")
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(MI_scores)), MI_scores, color='skyblue')
+    plt.xlabel('Feature Index')
+    plt.ylabel('Mutual Information Score')
+    plt.title('Mutual Information Scores for Features')
+    plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig("images/mi_scores.png")
+    plt.show()
 
-    # Run HPO otpimization with TPE sampler and HyperbandPruner
-    print(f"\nStarting TPE optimization...\n")
-    sampler = optuna.samplers.TPESampler(seed=1) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
-    pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path)
+    # Data_train, Data_test = train_test_split(df, test_size=0.2, stratify=df.iloc[:, -1], random_state=42)
+    # Data_train_df = pd.DataFrame(Data_train)
+    # Data_test_df = pd.DataFrame(Data_test)
+    # Data_train_df.to_csv(train_csv_path, index=False)
+    # Data_test_df.to_csv(test_csv_path, index=False)
+    # print(f"The training data has {Data_train.shape[0]} samples and the test data has {Data_test.shape[0]} samples.")
+    # # print(Data_train_df, Data_test_df)
 
-    # Run HPO otpimization with RS sampler and MedianPruner
-    print(f"\nStarting RS optimization...\n")
-    sampler = optuna.samplers.RandomSampler(seed=1)  # Use RandomSampler for simplicity
-    pruner = optuna.pruners.MedianPruner(n_warmup_steps=5, n_startup_trials=10)
-    best_trial_rs = run_optimization(sampler, pruner, train_csv_path)
+    # # Run HPO otpimization with TPE sampler and HyperbandPruner
+    # print(f"\nStarting TPE optimization...\n")
+    # sampler = optuna.samplers.TPESampler(seed=1) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
+    # pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
+    # best_trial_tpe = run_optimization(sampler, pruner, train_csv_path)
 
-    # Retrain the best models
-    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+    # # Run HPO otpimization with RS sampler and MedianPruner
+    # print(f"\nStarting RS optimization...\n")
+    # sampler = optuna.samplers.RandomSampler(seed=1)  # Use RandomSampler for simplicity
+    # pruner = optuna.pruners.MedianPruner(n_warmup_steps=5, n_startup_trials=10)
+    # best_trial_rs = run_optimization(sampler, pruner, train_csv_path)
+
+    # # Retrain the best models
+    # train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
 
     # Print total time taken
     end_time = time.time()
