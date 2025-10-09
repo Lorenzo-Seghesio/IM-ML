@@ -26,6 +26,7 @@ from optuna.visualization.matplotlib import plot_param_importances
 from optuna.visualization.matplotlib import plot_rank
 from optuna.visualization.matplotlib import plot_slice
 from optuna.visualization.matplotlib import plot_timeline
+import math
 
 # Global variables
 best_auc_global = 0
@@ -33,6 +34,7 @@ best_model_global = None
 
 batch_size = 32
 dropout = 0.2
+# lr = 2.5e-3
 
 test_csv_path = 'data/IM_Data_Test.csv'  # Path to the test dataset
 train_csv_path = 'data/IM_Data_Train.csv'  # Path to the training dataset
@@ -105,6 +107,41 @@ def load_dataset(csv_path):
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
     return X, y
+
+# === Weight Initialization with Prior ===
+def init_weights_with_prior(model: nn.Module, pos_prior: float | None = None, method: str = "kaiming"):
+    """
+    Initialize Linear layers:
+      - Hidden: Kaiming (He) for ReLU
+      - Output: Xavier; bias set to logit(pos_prior) if provided
+    """
+    # Find last Linear layer (output)
+    last_linear = None
+    if hasattr(model, "net"):
+        for m in reversed(model.net):
+            if isinstance(m, nn.Linear):
+                last_linear = m
+                break
+
+    def _init(m):
+        if isinstance(m, nn.Linear):
+            if m is last_linear:
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    if pos_prior is not None:
+                        p = max(min(float(pos_prior), 1 - 1e-4), 1e-4)
+                        m.bias.data.fill_(math.log(p / (1 - p)))
+                    else:
+                        nn.init.zeros_(m.bias)
+            else:
+                if method == "kaiming":
+                    nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                else:
+                    nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain("relu"))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    model.apply(_init)
+    return model
 
 
 # === Training Function ===
@@ -246,22 +283,29 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
     global best_model_global
     global batch_size
     global dropout
+    # global lr
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     X, y = load_dataset(csv_path)
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
+    neuron_min_limit = 1/4 * X.shape[1]
+    neuron_max_limit = 4 * X.shape[1]
+
     # Hyperparameters
     lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
     alpha = trial.suggest_float("alpha", 0.1, 0.9)
     gamma = trial.suggest_float("gamma", 0.5, 5.0)
     # batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    n_layers = trial.suggest_int("n_layers", 1, 8)
+    n_layers = trial.suggest_int("n_layers", 1, 4)
     # dropout = trial.suggest_float("dropout", 0.0, 0.4)
-    layers_dim = [
-        trial.suggest_int("size_layer{}".format(i), 4, 128, log=True) for i in range(n_layers)  # TODO Here I can start from 4 or mmaybe from X.shape[1] ??
-    ]
+    layers_dim = []
+    for i in range(n_layers):
+        size_layer = trial.suggest_int("size_layer{}".format(i), neuron_min_limit, neuron_max_limit, log=True)  # TODO Here I can start from 4 or mmaybe from X.shape[1] ??
+        neuron_max_limit = size_layer  # Ensure next layer has less or equal neurons
+        neuron_min_limit = 1
+        layers_dim.append(size_layer)
 
     auc_scores = []
     best_auc = 0
@@ -280,6 +324,8 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
         val_loader = DataLoader(val_ds, batch_size=batch_size)
 
         model = BinaryClassifier(input_size=X.shape[1], layers_dim=layers_dim, dropout=dropout).to(device)
+        # Initialize using training fold positive prior
+        init_weights_with_prior(model, pos_prior=float(y_train.mean()))
         criterion = BinaryFocalLoss(alpha=alpha, gamma=gamma)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -313,6 +359,7 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     global best_model_global
     global batch_size
     global dropout
+    # global lr
 
     # batch_size = params["batch_size"]
     # dropout = params["dropout"]
@@ -333,10 +380,12 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
     criterion_tp = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
     optimizer_tp = torch.optim.Adam(model_tp.parameters(), lr=params_tpe["lr"])
+    init_weights_with_prior(model_tp, pos_prior=float(y_train.mean()))
     #RS
     model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout).to(device)
     criterion_rs = BinaryFocalLoss(alpha=params_rs["alpha"], gamma=params_rs["gamma"])
     optimizer_rs = torch.optim.Adam(model_rs.parameters(), lr=params_rs["lr"])
+    init_weights_with_prior(model_rs, pos_prior=float(y_train.mean()))
 
     auc_scores_tp = []
     best_auc_tp = 0
@@ -392,12 +441,16 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
 
 # === Run Optuna Optimization ===
 def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
-    n_trials = 20
+    n_trials = 100
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
     study.optimize(lambda trial: objective(trial, csv_path=csv_path), n_trials=n_trials, timeout=3600)
 
     # Best trial
-    print("\nBest trial:")
+    if sampler.__class__.__name__ == "TPESampler":
+        print("\n=== TPE ===")
+    elif sampler.__class__.__name__ == "RandomSampler":
+        print("\n=== RandomSampler ===")
+    print("Best trial:")
     trial = study.best_trial
     print(f"  AUC Score: {trial.value:.4f}")
     for key, value in trial.params.items():
@@ -427,6 +480,8 @@ if __name__ == "__main__":
     parser.add_argument('--first_data_full', action='store_true', help="Decide whether to use first dataset with also measurements, if selected only the first dataset with measurement will be used")
     parser.add_argument('--pp_data', action='store_true', help="Decide whether to use PP dataset, can be used together with ABS dataset")
     parser.add_argument('--abs_data', action='store_true', help="Decide whether to use the ABS dataset, can be used together with PP dataset")
+    parser.add_argument('--pp_p1_data', action='store_true', help="Decide whether to use the PP Position 1 dataset")
+    parser.add_argument('--pp_weight_data', action='store_true', help="Decide whether to use the PP Weight dataset")
     args = parser.parse_args()
     # Load data path
     if args.first_data:
@@ -435,6 +490,9 @@ if __name__ == "__main__":
     elif args.first_data_full:
         print("\nUsing the first dataset with all measurments.\n")
         csv_path = 'data/IM_Data_Full.csv'
+    elif args.pp_p1_data:
+        print("\nUsing only the PP Position 1 dataset.\n")
+        csv_path = 'data/DATA_PP_P1_W.csv'
     else:
         if args.pp_data:
             if args.abs_data:
@@ -450,46 +508,118 @@ if __name__ == "__main__":
             print("\nUsing by default the full dataset, both PP and ABS data.\n")
             csv_path = 'data/DATA_ABS_&_PP_Binary.csv'
 
-    # Split data into train and test sets
+    # Read data
     df = pd.read_csv(csv_path)
-    X = df.iloc[:, :-1].values
-    y = df.iloc[:, -1].values
-    # Compute Mutual Information (MI) Scores for each feature
-    MI_scores = mutual_info_classif(X, y, random_state=42)
-    for i, score in enumerate(MI_scores):
-        print(f"Feature {i}: MI Score = {score:.4f}")
-    plt.figure(figsize=(10, 6))
-    plt.bar(range(len(MI_scores)), MI_scores, color='skyblue')
-    plt.xlabel('Feature Index')
-    plt.ylabel('Mutual Information Score')
-    plt.title('Mutual Information Scores for Features')
-    plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
-    plt.tight_layout()
-    plt.savefig("images/mi_scores.png")
-    plt.show()
+    # X = df.iloc[:, :-1].values
+    # y = df.iloc[:, -1].values
+    # # Compute Mutual Information (MI) Scores for each feature
+    # MI_scores = mutual_info_classif(X, y, random_state=42)
+    # for i, score in enumerate(MI_scores):
+    #     print(f"Feature {i}: MI Score = {score:.4f}")
+    # plt.figure(figsize=(10, 6))
+    # plt.bar(range(len(MI_scores)), MI_scores, color='skyblue')
+    # plt.xlabel('Feature Index')
+    # plt.ylabel('Mutual Information Score')
+    # plt.title('Mutual Information Scores for Features')
+    # plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
+    # plt.tight_layout()
+    # plt.savefig("images/mi_scores.png")
+    # plt.show()
 
-    # Data_train, Data_test = train_test_split(df, test_size=0.2, stratify=df.iloc[:, -1], random_state=42)
-    # Data_train_df = pd.DataFrame(Data_train)
-    # Data_test_df = pd.DataFrame(Data_test)
-    # Data_train_df.to_csv(train_csv_path, index=False)
-    # Data_test_df.to_csv(test_csv_path, index=False)
-    # print(f"The training data has {Data_train.shape[0]} samples and the test data has {Data_test.shape[0]} samples.")
-    # # print(Data_train_df, Data_test_df)
+    # Split data into 80% train and 20% test with shuffle
+    Data_train, Data_test = train_test_split(df, test_size=0.2, shuffle=True, random_state=42)
+    Data_train_df = pd.DataFrame(Data_train)
+    Data_test_df = pd.DataFrame(Data_test)
+    
+    # Compute statistics on train data only
+    if 'Product weight g' in Data_train_df.columns:
+        mean_w_train = Data_train_df['Product weight g'].mean()
+        std_dev_w_train = Data_train_df['Product weight g'].std()
+        
+        print(f"Train data - Product weight g: mean={mean_w_train:.4f}, std={std_dev_w_train:.4f}")
+        
+        # Create Product_Goodness column for train data
+        Data_train_df['Product_Goodness'] = (
+            (Data_train_df['Product weight g'] >= mean_w_train - std_dev_w_train) & 
+            (Data_train_df['Product weight g'] <= mean_w_train + std_dev_w_train)
+        ).astype(int)
+        
+        # Create Product_Goodness column for test data using train statistics
+        Data_test_df['Product_Goodness'] = (
+            (Data_test_df['Product weight g'] >= mean_w_train - std_dev_w_train) & 
+            (Data_test_df['Product weight g'] <= mean_w_train + std_dev_w_train)
+        ).astype(int)
+        
+        # Remove Product weight g column from both datasets
+        Data_train_df = Data_train_df.drop(columns=['Product weight g'])
+        Data_test_df = Data_test_df.drop(columns=['Product weight g'])
+        
+        print(f"Created 'Product_Goodness' column and removed 'Product weight g' column.")
+        
+        # Compute percentage of 0s in Product_Goodness column
+        train_zero_pct = (Data_train_df['Product_Goodness'] == 0).sum() / len(Data_train_df) * 100
+        test_zero_pct = (Data_test_df['Product_Goodness'] == 0).sum() / len(Data_test_df) * 100
+        
+        print(f"Percentage of 0s in Product_Goodness - Train: {train_zero_pct:.2f}%, Test: {test_zero_pct:.2f}%")
+        
+        # # Plot the percentages
+        # plt.figure(figsize=(8, 6))
+        # datasets = ['Train', 'Test']
+        # percentages = [train_zero_pct, test_zero_pct]
+        # colors = ['#3498db', '#e74c3c']
+        
+        # bars = plt.bar(datasets, percentages, color=colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+        # plt.ylabel('Percentage (%)', fontsize=12)
+        # plt.title('Percentage of 0s in Product_Goodness Column', fontsize=14, fontweight='bold')
+        # plt.ylim(0, 100)
+        # plt.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        # # Add percentage labels on bars
+        # for bar, pct in zip(bars, percentages):
+        #     height = bar.get_height()
+        #     plt.text(bar.get_x() + bar.get_width()/2., height,
+        #             f'{pct:.2f}%', ha='center', va='bottom', fontsize=11, fontweight='bold')
+        
+        # plt.tight_layout()
+        # plt.savefig("images/product_goodness_distribution.png")
+        # plt.show()
+    
+    Data_train_df.to_csv(train_csv_path, index=False)
+    Data_test_df.to_csv(test_csv_path, index=False)
+    print(f"The training data has {Data_train.shape[0]} samples and the test data has {Data_test.shape[0]} samples.")
+    # print(Data_train_df, Data_test_df)
 
-    # # Run HPO otpimization with TPE sampler and HyperbandPruner
-    # print(f"\nStarting TPE optimization...\n")
-    # sampler = optuna.samplers.TPESampler(seed=1) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
-    # pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    # best_trial_tpe = run_optimization(sampler, pruner, train_csv_path)
+    # # Compute Mutual Information (MI) Scores for each feature in train data only
+    # X_train_mi = Data_train_df.iloc[:, :-1].values
+    # y_train_mi = Data_train_df.iloc[:, -1].values
+    # MI_scores = mutual_info_classif(X_train_mi, y_train_mi, random_state=42)
+    # for i, score in enumerate(MI_scores):
+    #     print(f"Feature {i}: MI Score = {score:.4f}")
+    # plt.figure(figsize=(10, 6))
+    # plt.bar(range(len(MI_scores)), MI_scores, color='skyblue')
+    # plt.xlabel('Feature Index')
+    # plt.ylabel('Mutual Information Score')
+    # plt.title('Mutual Information Scores for Features')
+    # plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
+    # plt.tight_layout()
+    # plt.savefig("images/mi_scores.png")
+    # plt.show()
+    
 
-    # # Run HPO otpimization with RS sampler and MedianPruner
-    # print(f"\nStarting RS optimization...\n")
-    # sampler = optuna.samplers.RandomSampler(seed=1)  # Use RandomSampler for simplicity
-    # pruner = optuna.pruners.MedianPruner(n_warmup_steps=5, n_startup_trials=10)
-    # best_trial_rs = run_optimization(sampler, pruner, train_csv_path)
+    # Run HPO otpimization with TPE sampler and HyperbandPruner
+    print(f"\nStarting TPE optimization...\n")
+    sampler = optuna.samplers.TPESampler(n_startup_trials=40, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
+    pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
+    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path)
 
-    # # Retrain the best models
-    # train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+    # Run HPO otpimization with RS sampler and MedianPruner
+    print(f"\nStarting RS optimization...\n")
+    sampler = optuna.samplers.RandomSampler(seed=42)  # Use RandomSampler for simplicity
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=5, n_startup_trials=10)
+    best_trial_rs = run_optimization(sampler, pruner, train_csv_path)
+
+    # Retrain the best models
+    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
 
     # Print total time taken
     end_time = time.time()
