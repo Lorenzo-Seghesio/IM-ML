@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split, GroupKFold, StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, auc, roc_curve, RocCurveDisplay, roc_auc_score
 from sklearn.feature_selection import mutual_info_classif
@@ -31,6 +31,9 @@ import math
 # Global variables
 best_auc_global = 0
 best_model_global = None
+best_auc_RS_global = 0
+best_model_RS_global = None
+best_params_RS_global = None
 
 batch_size = 32
 dropout = 0.2
@@ -102,12 +105,23 @@ class EarlyStopping:
 
 
 # === Data Loader ===
-def load_dataset(csv_path):
+def load_dataset(csv_path, return_groups=False):
     df = pd.read_csv(csv_path)
-    X = df.iloc[:, :-1].values
+    
+    # Check if 'shot' column exists for grouping
+    if 'shot' in df.columns and return_groups:
+        groups = df['shot'].values
+        X = df.drop(columns=['shot']).iloc[:, :-1].values
+    else:
+        groups = None
+        X = df.iloc[:, :-1].values
+    
     y = df.iloc[:, -1].values
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
+    
+    if return_groups:
+        return X, y, groups
     return X, y
 
 # === Weight Initialization with Prior ===
@@ -304,7 +318,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
         with torch.no_grad():
             test_outputs_presigmoid_tp = model_tp(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_tp = torch.sigmoid(test_outputs_presigmoid_tp).float().cpu().numpy()
-            thresholds_tp = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6]
+            thresholds_tp = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
             test_preds_tp = {threshold: (test_outputs_prob_tp > threshold).astype(float) for threshold in thresholds_tp}
 
         fpr_tp, tpr_tp, _ = roc_curve(y_test, test_outputs_prob_tp)
@@ -370,9 +384,12 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
 
 
 # === Objective Function ===
-def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
+def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_startup_trials=10, sampler="RandomSampler"):
     global best_auc_global
     global best_model_global
+    global best_auc_RS_global
+    global best_model_RS_global
+    global best_params_RS_global
     global batch_size
     global dropout
     # global n_layers
@@ -381,8 +398,13 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X, y = load_dataset(csv_path)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    X, y, groups = load_dataset(csv_path, return_groups=True)
+    
+    # Use StratifiedGroupKFold if groups are available, otherwise use StratifiedKFold
+    if groups is not None:
+        skf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    else:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
     neuron_min_limit = int(1/6 * X.shape[1])
     neuron_max_limit = 5 * X.shape[1]
@@ -405,7 +427,13 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
     best_auc = 0
     best_model = None
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+    # Split with groups if available
+    if groups is not None:
+        fold_iterator = skf.split(X, y, groups=groups)
+    else:
+        fold_iterator = skf.split(X, y)
+    
+    for fold, (train_idx, val_idx) in enumerate(fold_iterator):
         X_train, X_val = X[train_idx], X[val_idx]
         y_train, y_val = y[train_idx], y[val_idx]
 
@@ -421,7 +449,7 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
         # Initialize using training fold positive prior
         init_weights_with_prior(model, pos_prior=float(y_train.mean()))
         criterion = BinaryFocalLoss(alpha=alpha, gamma=gamma)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Train
         model = train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optimizer)
@@ -436,6 +464,7 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
         
         trial.report(np.mean(auc_score), fold)
 
+
         if trial.should_prune():
             raise optuna.TrialPruned()
 
@@ -443,14 +472,18 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv'):
         if best_model_global is None or np.mean(auc_scores) > best_auc_global:
             best_auc_global = np.mean(auc_scores)
             best_model_global = best_model
-            torch.save(best_model_global.state_dict(), "models/best_model_AUC_optuna.pt")
+            torch.save(best_model_global.state_dict(), "models/best_model_AUC_global.pt")
+            if (sampler == "TPESampler") and (trial.number < n_startup_trials):
+                    best_auc_RS_global = best_auc_global
+                    best_model_RS_global = best_model_global
+                    best_params_RS_global = trial.params  # Store the TRIAL parameters (hyperparameters), not model weights
+                    torch.save(best_model_RS_global.state_dict(), "models/best_model_AUC_RS.pt")
 
     return np.mean(auc_scores)
 
 
 # === Retrain Final Model ===
 def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train='data/IM_Data_Train.csv', csv_path_test='data/IM_Data_Test.csv'):
-    global best_model_global
     global batch_size
     global dropout
     # global lr
@@ -465,10 +498,16 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Train data
-    X_train, y_train = load_dataset(csv_path_train)
+    X_train, y_train, groups = load_dataset(csv_path_train, return_groups=True)
     print(f"The Data has {X_train.shape[0]} samples and {X_train.shape[1]} features.")
 
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    # Use StratifiedGroupKFold if groups are available, otherwise use StratifiedKFold
+    if groups is not None:
+        skf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+        print(f"Using StratifiedGroupKFold to keep shots together in folds")
+    else:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        print(f"Using StratifiedKFold (no shot grouping available)")
 
     auc_scores_tp = []
     best_auc_tp = 0
@@ -482,18 +521,24 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     early_stopping_patience = 20
     num_epochs = 200
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_train, y_train)):
+    # Split with groups if available
+    if groups is not None:
+        fold_iterator = skf.split(X_train, y_train, groups=groups)
+    else:
+        fold_iterator = skf.split(X_train, y_train)
+
+    for fold, (train_idx, val_idx) in enumerate(fold_iterator):
         
         # Initialize models for each fold
         # TPE
         model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
         criterion_tp = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
-        optimizer_tp = torch.optim.Adam(model_tp.parameters(), lr=params_tpe["lr"], weight_decay=weight_decay)
+        optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=params_tpe["lr"], weight_decay=weight_decay)
         init_weights_with_prior(model_tp, pos_prior=float(y_train.mean()))
         #RS
         model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout).to(device)
         criterion_rs = BinaryFocalLoss(alpha=params_rs["alpha"], gamma=params_rs["gamma"])
-        optimizer_rs = torch.optim.Adam(model_rs.parameters(), lr=params_rs["lr"], weight_decay=weight_decay)
+        optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=params_rs["lr"], weight_decay=weight_decay)
         init_weights_with_prior(model_rs, pos_prior=float(y_train.mean()))
 
         # Prepare data loaders
@@ -536,19 +581,23 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
 
     # Model evaluation
     print(f"\nRe-trained models evaluation")
-    # Load test data
-    X_test, y_test = load_dataset(csv_path_test)
+    # Load test data (with return_groups=True to remove 'shot' column)
+    X_test, y_test, _ = load_dataset(csv_path_test, return_groups=True)
     evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
 
 
 # === Run Optuna Optimization ===
-def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_trials=100):
+def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_trials=100, n_startup_trials=10):
+    global best_auc_RS_global
+    global best_model_RS_global
+    global best_params_RS_global
+    
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
-    study.optimize(lambda trial: objective(trial, csv_path=csv_path), n_trials=n_trials, timeout=3600)
+    study.optimize(lambda trial: objective(trial, csv_path=csv_path, n_startup_trials=n_startup_trials, sampler=sampler.__class__.__name__), n_trials=n_trials, timeout=3600)
 
-    # Best trial
+    # Best trial overall (hoping is TPE)
     if sampler.__class__.__name__ == "TPESampler":
-        print("\n=== TPE ===")
+        print("\n=== Best model after intial {} RS and {} TPE trials ===".format(n_startup_trials, (n_trials - n_startup_trials)))
     elif sampler.__class__.__name__ == "RandomSampler":
         print("\n=== RandomSampler ===")
     print("Best trial:")
@@ -556,6 +605,13 @@ def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv', 
     print(f"  AUC Score: {trial.value:.4f}")
     for key, value in trial.params.items():
         print(f"  {key}: {value}")
+
+    # If TPE optimizer, Best trial RS
+    if (sampler.__class__.__name__ == "TPESampler") and (n_startup_trials > 0) and (best_params_RS_global is not None):
+            print("\n=== Best model found with initial {} RS trials ===".format(n_startup_trials))
+            print(f"  AUC Score: {best_auc_RS_global:.4f}")
+            for key, value in best_params_RS_global.items():
+                print(f"  {key}: {value}")
 
     # Visualizations
     # fig = plot_optimization_history(study)
@@ -611,11 +667,11 @@ if __name__ == "__main__":
 
     # CSV path
     csv_path_1 = 'data/DATA_PP_P1_W.csv'
-    # csv_path_2 = 'data/DATA_PP_P2_W.csv'
+    csv_path_2 = 'data/DATA_PP_P2_W.csv'
 
     # Read data
     df_1 = pd.read_csv(csv_path_1)
-    # df_2 = pd.read_csv(csv_path_2)
+    df_2 = pd.read_csv(csv_path_2)
     
     # Check if both datasets have 'shot' column
     if 'shot' not in df_1.columns: #or 'shot' not in df_2.columns:
@@ -634,9 +690,9 @@ if __name__ == "__main__":
     Data_train_df_1 = df_1[df_1['shot'].isin(train_shots)].copy()
     Data_test_df_1 = df_1[df_1['shot'].isin(test_shots)].copy()
     
-    # # Split df_2 based on the same shot numbers
-    # Data_train_df_2 = df_2[df_2['shot'].isin(train_shots)].copy()
-    # Data_test_df_2 = df_2[df_2['shot'].isin(test_shots)].copy()
+    # Split df_2 based on the same shot numbers
+    Data_train_df_2 = df_2[df_2['shot'].isin(train_shots)].copy()
+    Data_test_df_2 = df_2[df_2['shot'].isin(test_shots)].copy()
     
     print(f"Dataset 1 - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
     # print(f"Dataset 2 - Train: {len(Data_train_df_2)} samples, Test: {len(Data_test_df_2)} samples")
@@ -647,9 +703,9 @@ if __name__ == "__main__":
     print(f"Dataset 1 - Train Product weight g: mean={mean_w_train_1:.4f}, std={std_dev_w_train_1:.4f}")
     
     # Compute statistics for dataset 2
-    # mean_w_train_2 = Data_train_df_2['Product weight g'].mean()
-    # std_dev_w_train_2 = Data_train_df_2['Product weight g'].std()
-    # print(f"Dataset 2 - Train Product weight g: mean={mean_w_train_2:.4f}, std={std_dev_w_train_2:.4f}")
+    mean_w_train_2 = Data_train_df_2['Product weight g'].mean()
+    std_dev_w_train_2 = Data_train_df_2['Product weight g'].std()
+    print(f"Dataset 2 - Train Product weight g: mean={mean_w_train_2:.4f}, std={std_dev_w_train_2:.4f}")
     
     # Create Product_Goodness column for dataset 1 (train)
     Data_train_df_1['Product_Goodness'] = (
@@ -663,62 +719,72 @@ if __name__ == "__main__":
         (Data_test_df_1['Product weight g'] <= mean_w_train_1 + std_dev_w_train_1)
     ).astype(int)
     
-    # # Create Product_Goodness column for dataset 2 (train)
-    # Data_train_df_2['Product_Goodness'] = (
-    #     (Data_train_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
-    #     (Data_train_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
-    # ).astype(int)
+    # Create Product_Goodness column for dataset 2 (train)
+    Data_train_df_2['Product_Goodness'] = (
+        (Data_train_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
+        (Data_train_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
+    ).astype(int)
     
-    # # Create Product_Goodness column for dataset 2 (test)
-    # Data_test_df_2['Product_Goodness'] = (
-    #     (Data_test_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
-    #     (Data_test_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
-    # ).astype(int)
+    # Create Product_Goodness column for dataset 2 (test)
+    Data_test_df_2['Product_Goodness'] = (
+        (Data_test_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
+        (Data_test_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
+    ).astype(int)
     
     print(f"Created 'Product_Goodness' column for both datasets")
     
     # Compute percentage of 0s in Product_Goodness column for both datasets
     train_zero_pct_1 = (Data_train_df_1['Product_Goodness'] == 0).sum() / len(Data_train_df_1) * 100
     test_zero_pct_1 = (Data_test_df_1['Product_Goodness'] == 0).sum() / len(Data_test_df_1) * 100
-    # train_zero_pct_2 = (Data_train_df_2['Product_Goodness'] == 0).sum() / len(Data_train_df_2) * 100
-    # test_zero_pct_2 = (Data_test_df_2['Product_Goodness'] == 0).sum() / len(Data_test_df_2) * 100
+    train_zero_pct_2 = (Data_train_df_2['Product_Goodness'] == 0).sum() / len(Data_train_df_2) * 100
+    test_zero_pct_2 = (Data_test_df_2['Product_Goodness'] == 0).sum() / len(Data_test_df_2) * 100
     
     print(f"Dataset 1 - Percentage of 0s in Product_Goodness - Train: {train_zero_pct_1:.2f}%, Test: {test_zero_pct_1:.2f}%")
-    # print(f"Dataset 2 - Percentage of 0s in Product_Goodness - Train: {train_zero_pct_2:.2f}%, Test: {test_zero_pct_2:.2f}%")
+    print(f"Dataset 2 - Percentage of 0s in Product_Goodness - Train: {train_zero_pct_2:.2f}%, Test: {test_zero_pct_2:.2f}%")
     
-    # Drop Product weight g column from all datasets
+    # Drop Product weight g column from all datasets (but KEEP 'shot' column for grouping)
     Data_train_df_1 = Data_train_df_1.drop(columns=['Product weight g'])
     Data_test_df_1 = Data_test_df_1.drop(columns=['Product weight g'])
-    # Data_train_df_2 = Data_train_df_2.drop(columns=['Product weight g'])
-    # Data_test_df_2 = Data_test_df_2.drop(columns=['Product weight g'])
+    Data_train_df_2 = Data_train_df_2.drop(columns=['Product weight g'])
+    Data_test_df_2 = Data_test_df_2.drop(columns=['Product weight g'])
     
-    print(f"Removed 'Product weight g' columns from all datasets")
+    print(f"Removed 'Product weight g' columns from all datasets (kept 'shot' for group-based CV)")
     
-    # # Combine datasets: train_1 + train_2, test_1 + test_2 and shuffle
-    # Data_train_combined = pd.concat([Data_train_df_1, Data_train_df_2], axis=0, ignore_index=True)
-    # Data_test_combined = pd.concat([Data_test_df_1, Data_test_df_2], axis=0, ignore_index=True)
-    # Data_train_combined = Data_train_combined.sample(frac=1, random_state=42).reset_index(drop=True)
-    # Data_test_combined = Data_test_combined.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    # Shuffle individual datasets
-    Data_train_df_1 = Data_train_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
-    Data_test_df_1 = Data_test_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    # print(f"Combined and shuffled datasets - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
-
-    print(f"Shuffled datasets - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
+    # Combine datasets: train_1 + train_2, test_1 + test_2
+    # NOTE: We shuffle within groups, not breaking shot numbers apart
+    Data_train_combined = pd.concat([Data_train_df_1, Data_train_df_2], axis=0, ignore_index=True)
+    Data_test_combined = pd.concat([Data_test_df_1, Data_test_df_2], axis=0, ignore_index=True)
     
-    # # Save combined datasets
-    # Data_train_combined.to_csv(train_csv_path, index=False)
-    # Data_test_combined.to_csv(test_csv_path, index=False)
-    # print(f"Saved combined train and test datasets to {train_csv_path} and {test_csv_path}")
-    # # print(Data_train_combined, Data_test_combined)
+    # Shuffle but keep shot groups together (shuffle at shot level, not row level)
+    train_shots_order = Data_train_combined['shot'].unique()
+    np.random.seed(42)
+    np.random.shuffle(train_shots_order)
+    Data_train_combined = Data_train_combined.set_index('shot').loc[train_shots_order].reset_index()
+    
+    test_shots_order = Data_test_combined['shot'].unique()
+    np.random.seed(42)
+    np.random.shuffle(test_shots_order)
+    Data_test_combined = Data_test_combined.set_index('shot').loc[test_shots_order].reset_index()
 
-    # Save individual datasets
-    Data_train_df_1.to_csv(train_csv_path, index=False)
-    Data_test_df_1.to_csv(test_csv_path, index=False)
-    print(f"Saved individual train and test datasets to {train_csv_path} and {test_csv_path}")
-    # print(Data_train_df, Data_test_df)
+    # # Shuffle individual datasets
+    # Data_train_df_1 = Data_train_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
+    # Data_test_df_1 = Data_test_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
+
+    print(f"Combined and shuffled datasets - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
+
+    # print(f"Shuffled datasets - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
+    
+    # Save combined datasets
+    Data_train_combined.to_csv(train_csv_path, index=False)
+    Data_test_combined.to_csv(test_csv_path, index=False)
+    print(f"Saved combined train and test datasets to {train_csv_path} and {test_csv_path}")
+    # print(Data_train_combined, Data_test_combined)
+
+    # # Save individual datasets
+    # Data_train_df_1.to_csv(train_csv_path, index=False)
+    # Data_test_df_1.to_csv(test_csv_path, index=False)
+    # print(f"Saved individual train and test datasets to {train_csv_path} and {test_csv_path}")
+    # # print(Data_train_df, Data_test_df)
 
     # # Compute Mutual Information (MI) Scores for each feature in train data only
     # X_train_mi = Data_train_df.iloc[:, :-1].values
@@ -736,21 +802,22 @@ if __name__ == "__main__":
     # plt.savefig("images/mi_scores.png")
     # plt.show()
     
-    # Run HPO otpimization with RS sampler and MedianPruner
-    print(f"\nStarting RS optimization...\n")
-    sampler = optuna.samplers.RandomSampler(seed=42)  # Use RandomSampler for simplicity
-    # pruner = optuna.pruners.MedianPruner(n_warmup_steps=1, n_startup_trials=10)
-    pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_rs = run_optimization(sampler, pruner, train_csv_path, n_trials=40)
+    # # Run HPO otpimization with RS sampler and MedianPruner
+    # print(f"\nStarting RS optimization...\n")
+    # sampler = optuna.samplers.RandomSampler(seed=42)  # Use RandomSampler for simplicity
+    # # pruner = optuna.pruners.MedianPruner(n_warmup_steps=1, n_startup_trials=10)
+    # pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
+    # best_trial_rs = run_optimization(sampler, pruner, train_csv_path, n_trials=40)
 
     # Run HPO otpimization with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
-    sampler = optuna.samplers.TPESampler(n_startup_trials=40, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
+    n_startup_trials = 40
+    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=100)
+    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=100, n_startup_trials=n_startup_trials)
 
     # Retrain the best models
-    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_trial_rs.params, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
 
     # Print total time taken
     end_time = time.time()
