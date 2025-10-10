@@ -674,86 +674,83 @@ if __name__ == "__main__":
     df_2 = pd.read_csv(csv_path_2)
     
     # Check if both datasets have 'shot' column
-    if 'shot' not in df_1.columns: #or 'shot' not in df_2.columns:
+    if 'shot' not in df_1.columns or 'shot' not in df_2.columns:
         raise ValueError("Both datasets must have 'shot' column for synchronized splitting")
     
+    print(f"Dataset P1: {len(df_1)} samples")
+    print(f"Dataset P2: {len(df_2)} samples")
+    
+    # Compute statistics for FULL dataset 1 (P1)
+    mean_w_full_1 = df_1['Product weight g'].mean()
+    std_dev_w_full_1 = df_1['Product weight g'].std()
+    print(f"Dataset P1 (full) - Product weight g: mean={mean_w_full_1:.4f}, std={std_dev_w_full_1:.4f}")
+    
+    # Compute statistics for FULL dataset 2 (P2)
+    mean_w_full_2 = df_2['Product weight g'].mean()
+    std_dev_w_full_2 = df_2['Product weight g'].std()
+    print(f"Dataset P2 (full) - Product weight g: mean={mean_w_full_2:.4f}, std={std_dev_w_full_2:.4f}")
+    
+    # Create Product_Goodness column for dataset 1 (P1) using its own statistics
+    df_1['Product_Goodness'] = (
+        (df_1['Product weight g'] >= mean_w_full_1 - std_dev_w_full_1) & 
+        (df_1['Product weight g'] <= mean_w_full_1 + std_dev_w_full_1)
+    ).astype(int)
+    
+    # Create Product_Goodness column for dataset 2 (P2) using its own statistics
+    df_2['Product_Goodness'] = (
+        (df_2['Product weight g'] >= mean_w_full_2 - std_dev_w_full_2) & 
+        (df_2['Product weight g'] <= mean_w_full_2 + std_dev_w_full_2)
+    ).astype(int)
+    
+    print(f"Created 'Product_Goodness' column for both datasets based on their own statistics")
+    
+    # Compute percentage of 0s in Product_Goodness column for both datasets
+    zero_pct_1 = (df_1['Product_Goodness'] == 0).sum() / len(df_1) * 100
+    zero_pct_2 = (df_2['Product_Goodness'] == 0).sum() / len(df_2) * 100
+    
+    print(f"Dataset P1 - Percentage of 0s in Product_Goodness: {zero_pct_1:.2f}%")
+    print(f"Dataset P2 - Percentage of 0s in Product_Goodness: {zero_pct_2:.2f}%")
+    
+    # Drop Product weight g column from both datasets (but KEEP 'shot' column for grouping)
+    df_1 = df_1.drop(columns=['Product weight g'])
+    df_2 = df_2.drop(columns=['Product weight g'])
+    
+    print(f"Removed 'Product weight g' columns from both datasets (kept 'shot' for group-based CV)")
+    
     # Split shot numbers into train and test (80/20)
+    unique_shots = df_1['shot'].unique()
     np.random.seed(41)
-    shuffled_shots = np.random.permutation(df_1['shot'].values)
+    shuffled_shots = np.random.permutation(unique_shots)
     split_idx = int(len(shuffled_shots) * 0.8)
     train_shots = shuffled_shots[:split_idx]
     test_shots = shuffled_shots[split_idx:]
-    
     print(f"Train shots: {len(train_shots)}, Test shots: {len(test_shots)}")
-    
+
     # Split df_1 based on shot numbers
     Data_train_df_1 = df_1[df_1['shot'].isin(train_shots)].copy()
     Data_test_df_1 = df_1[df_1['shot'].isin(test_shots)].copy()
+
+    print(f"Dataset P1 - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
     
-    # Split df_2 based on the same shot numbers
+    # Split df_2 based on shot numbers
     Data_train_df_2 = df_2[df_2['shot'].isin(train_shots)].copy()
     Data_test_df_2 = df_2[df_2['shot'].isin(test_shots)].copy()
     
-    print(f"Dataset 1 - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
-    # print(f"Dataset 2 - Train: {len(Data_train_df_2)} samples, Test: {len(Data_test_df_2)} samples")
+    print(f"Dataset P2 - Train: {len(Data_train_df_2)} samples, Test: {len(Data_test_df_2)} samples")
     
-    # Compute statistics for dataset 1
-    mean_w_train_1 = Data_train_df_1['Product weight g'].mean()
-    std_dev_w_train_1 = Data_train_df_1['Product weight g'].std()
-    print(f"Dataset 1 - Train Product weight g: mean={mean_w_train_1:.4f}, std={std_dev_w_train_1:.4f}")
-    
-    # Compute statistics for dataset 2
-    mean_w_train_2 = Data_train_df_2['Product weight g'].mean()
-    std_dev_w_train_2 = Data_train_df_2['Product weight g'].std()
-    print(f"Dataset 2 - Train Product weight g: mean={mean_w_train_2:.4f}, std={std_dev_w_train_2:.4f}")
-    
-    # Create Product_Goodness column for dataset 1 (train)
-    Data_train_df_1['Product_Goodness'] = (
-        (Data_train_df_1['Product weight g'] >= mean_w_train_1 - std_dev_w_train_1) & 
-        (Data_train_df_1['Product weight g'] <= mean_w_train_1 + std_dev_w_train_1)
-    ).astype(int)
-    
-    # Create Product_Goodness column for dataset 1 (test)
-    Data_test_df_1['Product_Goodness'] = (
-        (Data_test_df_1['Product weight g'] >= mean_w_train_1 - std_dev_w_train_1) & 
-        (Data_test_df_1['Product weight g'] <= mean_w_train_1 + std_dev_w_train_1)
-    ).astype(int)
-    
-    # Create Product_Goodness column for dataset 2 (train)
-    Data_train_df_2['Product_Goodness'] = (
-        (Data_train_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
-        (Data_train_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
-    ).astype(int)
-    
-    # Create Product_Goodness column for dataset 2 (test)
-    Data_test_df_2['Product_Goodness'] = (
-        (Data_test_df_2['Product weight g'] >= mean_w_train_2 - std_dev_w_train_2) & 
-        (Data_test_df_2['Product weight g'] <= mean_w_train_2 + std_dev_w_train_2)
-    ).astype(int)
-    
-    print(f"Created 'Product_Goodness' column for both datasets")
-    
-    # Compute percentage of 0s in Product_Goodness column for both datasets
-    train_zero_pct_1 = (Data_train_df_1['Product_Goodness'] == 0).sum() / len(Data_train_df_1) * 100
-    test_zero_pct_1 = (Data_test_df_1['Product_Goodness'] == 0).sum() / len(Data_test_df_1) * 100
-    train_zero_pct_2 = (Data_train_df_2['Product_Goodness'] == 0).sum() / len(Data_train_df_2) * 100
-    test_zero_pct_2 = (Data_test_df_2['Product_Goodness'] == 0).sum() / len(Data_test_df_2) * 100
-    
-    print(f"Dataset 1 - Percentage of 0s in Product_Goodness - Train: {train_zero_pct_1:.2f}%, Test: {test_zero_pct_1:.2f}%")
-    print(f"Dataset 2 - Percentage of 0s in Product_Goodness - Train: {train_zero_pct_2:.2f}%, Test: {test_zero_pct_2:.2f}%")
-    
-    # Drop Product weight g column from all datasets (but KEEP 'shot' column for grouping)
-    Data_train_df_1 = Data_train_df_1.drop(columns=['Product weight g'])
-    Data_test_df_1 = Data_test_df_1.drop(columns=['Product weight g'])
-    Data_train_df_2 = Data_train_df_2.drop(columns=['Product weight g'])
-    Data_test_df_2 = Data_test_df_2.drop(columns=['Product weight g'])
-    
-    print(f"Removed 'Product weight g' columns from all datasets (kept 'shot' for group-based CV)")
-    
-    # Combine datasets: train_1 + train_2, test_1 + test_2
-    # NOTE: We shuffle within groups, not breaking shot numbers apart
+    # Combine train datasets from P1 and P2
     Data_train_combined = pd.concat([Data_train_df_1, Data_train_df_2], axis=0, ignore_index=True)
+    
+    # Combine test datasets from P1 and P2
     Data_test_combined = pd.concat([Data_test_df_1, Data_test_df_2], axis=0, ignore_index=True)
+    
+    print(f"Combined - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
+    
+    # Compute percentage of 0s in Product_Goodness column for train/test
+    train_zero_pct = (Data_train_combined['Product_Goodness'] == 0).sum() / len(Data_train_combined) * 100
+    test_zero_pct = (Data_test_combined['Product_Goodness'] == 0).sum() / len(Data_test_combined) * 100
+    
+    print(f"Percentage of 0s in Product_Goodness - Train: {train_zero_pct:.2f}%, Test: {test_zero_pct:.2f}%")
     
     # Shuffle but keep shot groups together (shuffle at shot level, not row level)
     train_shots_order = Data_train_combined['shot'].unique()
@@ -766,11 +763,7 @@ if __name__ == "__main__":
     np.random.shuffle(test_shots_order)
     Data_test_combined = Data_test_combined.set_index('shot').loc[test_shots_order].reset_index()
 
-    # # Shuffle individual datasets
-    # Data_train_df_1 = Data_train_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
-    # Data_test_df_1 = Data_test_df_1.sample(frac=1, random_state=42).reset_index(drop=True)
-
-    print(f"Combined and shuffled datasets - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
+    print(f"Shuffled datasets (preserving shot groups) - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
 
     # print(f"Shuffled datasets - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
     
