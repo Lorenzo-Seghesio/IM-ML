@@ -36,10 +36,11 @@ best_model_RS_global = None
 best_params_RS_global = None
 
 batch_size = 32
+# gamma = 3.0
 dropout = 0.2
 # lr = 2.5e-3
 # n_layers = 1
-weight_decay = 1e-5
+# weight_decay = 5e-5
 
 test_csv_path = 'data/IM_Data_Test.csv'  # Path to the test dataset
 train_csv_path = 'data/IM_Data_Train.csv'  # Path to the training dataset
@@ -124,6 +125,7 @@ def load_dataset(csv_path, return_groups=False):
         return X, y, groups
     return X, y
 
+
 # === Weight Initialization with Prior ===
 def init_weights_with_prior(model: nn.Module, pos_prior: float | None = None, method: str = "kaiming"):
     """
@@ -158,6 +160,15 @@ def init_weights_with_prior(model: nn.Module, pos_prior: float | None = None, me
                     nn.init.zeros_(m.bias)
     model.apply(_init)
     return model
+
+# === Outlier Detection using IQR ===
+def detect_outliers_iqr(series, multiplier=1.5):
+    Q1 = series.quantile(0.25)
+    Q3 = series.quantile(0.75)
+    IQR = Q3 - Q1
+    lower_bound = Q1 - multiplier * IQR
+    upper_bound = Q3 + multiplier * IQR
+    return (series < lower_bound) | (series > upper_bound)
 
 
 # === Training Function ===
@@ -210,6 +221,9 @@ def train_one_fold_test(model, train_loader, val_loader, device, criterion, opti
             if print_early_stopping:
                 print(f"Early stopping at epoch {epoch + 1}")
             break
+
+    if print_early_stopping and not early_stopping.early_stop:
+        print(f"Training completed after {max_epochs} epochs without early stopping.")
 
     model.load_state_dict(early_stopping.best_model_state)
 
@@ -339,7 +353,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
         with torch.no_grad():
             test_outputs_presigmoid_rs = model_rs(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_rs = torch.sigmoid(test_outputs_presigmoid_rs).float().cpu().numpy()
-            thresholds_rs = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6]
+            thresholds_rs = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
             test_preds_rs = {threshold: (test_outputs_prob_rs > threshold).astype(float) for threshold in thresholds_rs}
 
         fpr_rs, tpr_rs, _ = roc_curve(y_test, test_outputs_prob_rs)
@@ -391,10 +405,11 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_startup_trials=
     global best_model_RS_global
     global best_params_RS_global
     global batch_size
+    # global gamma
     global dropout
     # global n_layers
     # global lr
-    global weight_decay
+    # global weight_decay
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -414,8 +429,9 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_startup_trials=
     alpha = trial.suggest_float("alpha", 0.1, 0.9)
     gamma = trial.suggest_float("gamma", 0.5, 5.0)
     # batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    n_layers = trial.suggest_int("n_layers", 1, 4)
     # dropout = trial.suggest_float("dropout", 0.0, 0.4)
+    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
+    n_layers = trial.suggest_int("n_layers", 1, 4)
     layers_dim = []
     for i in range(n_layers):
         size_layer = trial.suggest_int("size_layer{}".format(i), neuron_min_limit, neuron_max_limit, log=True)  # TODO Here I can start from 4 or mmaybe from X.shape[1] ??
@@ -486,12 +502,10 @@ def objective(trial, csv_path='data/DATA_ABS_&_PP_Binary.csv', n_startup_trials=
 def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train='data/IM_Data_Train.csv', csv_path_test='data/IM_Data_Test.csv'):
     global batch_size
     global dropout
+    # global gamma
     # global lr
     # global n_layers
-    global weight_decay
-
-    # batch_size = params["batch_size"]
-    # dropout = params["dropout"]
+    # global weight_decay
 
     print(f"\nTraining the best model TPE and RS...")
 
@@ -533,12 +547,12 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         # TPE
         model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
         criterion_tp = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
-        optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=params_tpe["lr"], weight_decay=weight_decay)
+        optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=params_tpe["lr"], weight_decay=params_tpe["weight_decay"])
         init_weights_with_prior(model_tp, pos_prior=float(y_train.mean()))
         #RS
         model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout).to(device)
         criterion_rs = BinaryFocalLoss(alpha=params_rs["alpha"], gamma=params_rs["gamma"])
-        optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=params_rs["lr"], weight_decay=weight_decay)
+        optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=params_rs["lr"], weight_decay=params_rs["weight_decay"])
         init_weights_with_prior(model_rs, pos_prior=float(y_train.mean()))
 
         # Prepare data loaders
@@ -552,6 +566,12 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=batch_size)
+        
+        # train_loader_tpe = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        # val_loader_tpe = DataLoader(val_ds, batch_size=batch_size)
+
+        # train_loader_rs = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        # val_loader_rs = DataLoader(val_ds, batch_size=batch_size)
 
         # Train TP and RS
         model_tp = train_one_fold_test(model_tp, train_loader, val_loader, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE")
@@ -597,7 +617,7 @@ def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv', 
 
     # Best trial overall (hoping is TPE)
     if sampler.__class__.__name__ == "TPESampler":
-        print("\n=== Best model after intial {} RS and {} TPE trials ===".format(n_startup_trials, (n_trials - n_startup_trials)))
+        print("\n=== Best model TPE - after initial {} RS and {} TPE trials ===".format(n_startup_trials, (n_trials - n_startup_trials)))
     elif sampler.__class__.__name__ == "RandomSampler":
         print("\n=== RandomSampler ===")
     print("Best trial:")
@@ -608,7 +628,7 @@ def run_optimization(sampler, pruner, csv_path='data/DATA_ABS_&_PP_Binary.csv', 
 
     # If TPE optimizer, Best trial RS
     if (sampler.__class__.__name__ == "TPESampler") and (n_startup_trials > 0) and (best_params_RS_global is not None):
-            print("\n=== Best model found with initial {} RS trials ===".format(n_startup_trials))
+            print("\n=== Best model RS - found with initial {} RS trials ===".format(n_startup_trials))
             print(f"  AUC Score: {best_auc_RS_global:.4f}")
             for key, value in best_params_RS_global.items():
                 print(f"  {key}: {value}")
@@ -679,37 +699,48 @@ if __name__ == "__main__":
     
     print(f"Dataset P1: {len(df_1)} samples")
     print(f"Dataset P2: {len(df_2)} samples")
-    
-    # Compute statistics for FULL dataset 1 (P1)
-    mean_w_full_1 = df_1['Product weight g'].mean()
-    std_dev_w_full_1 = df_1['Product weight g'].std()
-    print(f"Dataset P1 (full) - Product weight g: mean={mean_w_full_1:.4f}, std={std_dev_w_full_1:.4f}")
-    
-    # Compute statistics for FULL dataset 2 (P2)
-    mean_w_full_2 = df_2['Product weight g'].mean()
-    std_dev_w_full_2 = df_2['Product weight g'].std()
-    print(f"Dataset P2 (full) - Product weight g: mean={mean_w_full_2:.4f}, std={std_dev_w_full_2:.4f}")
-    
+
+    # Detect outliers in both datasets
+    outliers_p1 = detect_outliers_iqr(df_1['Product weight g'])
+    outliers_p2 = detect_outliers_iqr(df_2['Product weight g'])
+
+    print(f"Dataset P1 - Outliers detected: {outliers_p1.sum()}")
+    print(f"Dataset P2 - Outliers detected: {outliers_p2.sum()}")
+
+    # Remove outliers from both datasets just for statistics computation
+    df_1_clean = df_1[~outliers_p1].reset_index(drop=True)
+    df_2_clean = df_2[~outliers_p2].reset_index(drop=True)
+
+    # Compute statistics for clean dataset 1 (P1)
+    mean_w_clean_1 = df_1_clean['Product weight g'].mean()
+    std_dev_w_clean_1 = df_1_clean['Product weight g'].std()
+    print(f"Dataset P1 (clean from outlayers) - Product weight g: mean={mean_w_clean_1:.4f}, std={std_dev_w_clean_1:.4f}")
+
+    # Compute statistics for clean dataset 2 (P2)
+    mean_w_clean_2 = df_2_clean['Product weight g'].mean()
+    std_dev_w_clean_2 = df_2_clean['Product weight g'].std()
+    print(f"Dataset P2 (clean from outlayers) - Product weight g: mean={mean_w_clean_2:.4f}, std={std_dev_w_clean_2:.4f}")
+
     # Create Product_Goodness column for dataset 1 (P1) using its own statistics
     df_1['Product_Goodness'] = (
-        (df_1['Product weight g'] >= mean_w_full_1 - std_dev_w_full_1) & 
-        (df_1['Product weight g'] <= mean_w_full_1 + std_dev_w_full_1)
+        (df_1['Product weight g'] >= mean_w_clean_1 - std_dev_w_clean_1) & 
+        (df_1['Product weight g'] <= mean_w_clean_1 + std_dev_w_clean_1)
     ).astype(int)
     
     # Create Product_Goodness column for dataset 2 (P2) using its own statistics
     df_2['Product_Goodness'] = (
-        (df_2['Product weight g'] >= mean_w_full_2 - std_dev_w_full_2) & 
-        (df_2['Product weight g'] <= mean_w_full_2 + std_dev_w_full_2)
+        (df_2['Product weight g'] >= mean_w_clean_2 - std_dev_w_clean_2) & 
+        (df_2['Product weight g'] <= mean_w_clean_2 + std_dev_w_clean_2)
     ).astype(int)
     
     print(f"Created 'Product_Goodness' column for both datasets based on their own statistics")
-    
-    # Compute percentage of 0s in Product_Goodness column for both datasets
-    zero_pct_1 = (df_1['Product_Goodness'] == 0).sum() / len(df_1) * 100
-    zero_pct_2 = (df_2['Product_Goodness'] == 0).sum() / len(df_2) * 100
-    
-    print(f"Dataset P1 - Percentage of 0s in Product_Goodness: {zero_pct_1:.2f}%")
-    print(f"Dataset P2 - Percentage of 0s in Product_Goodness: {zero_pct_2:.2f}%")
+
+    # Compute percentage of good and bad parts and % of bad outlayers for both datasets
+    print("\n=== Labeling Statistics ===")
+    print(f"P1 - Total samples: {len(df_1)}, Good: {df_1['Product_Goodness'].sum()}, Bad: {(df_1['Product_Goodness'] == 0).sum()}")
+    print(f"P1 - Outliers that are labeled as BAD: {(outliers_p1 & (df_1['Product_Goodness'] == 0)).sum()} / {outliers_p1.sum()}")
+    print(f"P2 - Total samples: {len(df_2)}, Good: {df_2['Product_Goodness'].sum()}, Bad: {(df_2['Product_Goodness'] == 0).sum()}")
+    print(f"P2 - Outliers that are labeled as BAD: {(outliers_p2 & (df_2['Product_Goodness'] == 0)).sum()} / {outliers_p2.sum()}")
     
     # Drop Product weight g column from both datasets (but KEEP 'shot' column for grouping)
     df_1 = df_1.drop(columns=['Product weight g'])
@@ -804,10 +835,11 @@ if __name__ == "__main__":
 
     # Run HPO otpimization with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
-    n_startup_trials = 40
+    n_startup_trials = 100
+    n_trials = 200
     sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=100, n_startup_trials=n_startup_trials)
+    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials)
 
     # Retrain the best models
     train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
