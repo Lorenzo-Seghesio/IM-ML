@@ -325,83 +325,12 @@ def evaluate_model(model, loader, device, metric='f1'):
         return auc_score
 
 # === Evaluate Model and plot results ===
-def evaluate_and_plot_results(models_tp, models_rs, X_test, y_test, device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png"):
-        """
-        Evaluate all models from different folds on test set and select the best one based on test AUC.
+def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png"):
         
-        Parameters:
-        - models_tp: list of TPE models from each fold
-        - models_rs: list of RS models from each fold
-        - X_test: test features
-        - y_test: test labels
-        - device: torch device
-        """
-        
-        print("\n=== Evaluating TPE models on test set ===")
-        best_auc_tp = 0
-        best_model_tp = None
-        best_fold_tp = -1
-        test_aucs_tp = []
-        
-        for fold, model_tp in enumerate(models_tp):
-            model_tp.eval()
-            with torch.no_grad():
-                test_outputs_presigmoid = model_tp(torch.tensor(X_test, dtype=torch.float32).to(device))
-                test_outputs_prob = torch.sigmoid(test_outputs_presigmoid).float().cpu().numpy()
-            
-            fpr, tpr, _ = roc_curve(y_test, test_outputs_prob)
-            test_auc = auc(fpr, tpr)
-            test_aucs_tp.append(test_auc)
-            
-            print(f"Fold {fold+1} - Test AUC: {test_auc:.4f}")
-            
-            if test_auc > best_auc_tp:
-                best_auc_tp = test_auc
-                best_model_tp = model_tp
-                best_fold_tp = fold
-        
-        print(f"\nBest TPE model: Fold {best_fold_tp+1} with Test AUC: {best_auc_tp:.4f}")
-        print(f"TPE - Mean test AUC across folds: {np.mean(test_aucs_tp):.4f} ± {np.std(test_aucs_tp):.4f}")
-        
-        # Save best TPE model
-        torch.save(best_model_tp.state_dict(), f"models/best_model_AUC_TP_fold_{best_fold_tp+1}.pt")
-        
-        print("\n=== Evaluating RS models on test set ===")
-        best_auc_rs = 0
-        best_model_rs = None
-        best_fold_rs = -1
-        test_aucs_rs = []
-        
-        for fold, model_rs in enumerate(models_rs):
-            model_rs.eval()
-            with torch.no_grad():
-                test_outputs_presigmoid = model_rs(torch.tensor(X_test, dtype=torch.float32).to(device))
-                test_outputs_prob = torch.sigmoid(test_outputs_presigmoid).float().cpu().numpy()
-            
-            fpr, tpr, _ = roc_curve(y_test, test_outputs_prob)
-            test_auc = auc(fpr, tpr)
-            test_aucs_rs.append(test_auc)
-            
-            print(f"Fold {fold+1} - Test AUC: {test_auc:.4f}")
-            
-            if test_auc > best_auc_rs:
-                best_auc_rs = test_auc
-                best_model_rs = model_rs
-                best_fold_rs = fold
-        
-        print(f"\nBest RS model: Fold {best_fold_rs+1} with Test AUC: {best_auc_rs:.4f}")
-        print(f"RS - Mean test AUC across folds: {np.mean(test_aucs_rs):.4f} ± {np.std(test_aucs_rs):.4f}")
-        
-        # Save best RS model
-        torch.save(best_model_rs.state_dict(), f"models/best_model_AUC_RS_fold_{best_fold_rs+1}.pt")
-        
-        # Detailed evaluation of BEST models
-        print(f"\n=== Detailed evaluation of best models ===")
-        
-        # Evaluate best TPE model
-        best_model_tp.eval()
+        # Evaluate model_tp
+        model_tp.eval()
         with torch.no_grad():
-            test_outputs_presigmoid_tp = best_model_tp(torch.tensor(X_test, dtype=torch.float32).to(device))
+            test_outputs_presigmoid_tp = model_tp(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_tp = torch.sigmoid(test_outputs_presigmoid_tp).float().cpu().numpy()
             thresholds_tp = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
             test_preds_tp = {threshold: (test_outputs_prob_tp > threshold).astype(float) for threshold in thresholds_tp}
@@ -415,14 +344,14 @@ def evaluate_and_plot_results(models_tp, models_rs, X_test, y_test, device, save
             acc = accuracy_score(y_test, preds)
             results_tp[threshold] = {"f1": f1, "accuracy": acc}
 
-        print(f"\nBest TPE Model (Fold {best_fold_tp+1}) - ROC AUC on Test: {roc_auc_tp:.4f}")
+        print(f"ROC AUC on Test (TP): {roc_auc_tp:.4f}")
         for threshold, metrics in results_tp.items():
             print(f"Threshold {threshold} - F1 Score on Test (TP): {metrics['f1']:.4f}, Accuracy on Test (TP): {metrics['accuracy']:.4f}")
 
-        # Evaluate best RS model
-        best_model_rs.eval()
+        # Evaluate model_rs
+        model_rs.eval()
         with torch.no_grad():
-            test_outputs_presigmoid_rs = best_model_rs(torch.tensor(X_test, dtype=torch.float32).to(device))
+            test_outputs_presigmoid_rs = model_rs(torch.tensor(X_test, dtype=torch.float32).to(device))
             test_outputs_prob_rs = torch.sigmoid(test_outputs_presigmoid_rs).float().cpu().numpy()
             thresholds_rs = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]
             test_preds_rs = {threshold: (test_outputs_prob_rs > threshold).astype(float) for threshold in thresholds_rs}
@@ -436,26 +365,36 @@ def evaluate_and_plot_results(models_tp, models_rs, X_test, y_test, device, save
             acc = accuracy_score(y_test, preds)
             results_rs[threshold] = {"f1": f1, "accuracy": acc}
 
-        print(f"\nBest RS Model (Fold {best_fold_rs+1}) - ROC AUC on Test: {roc_auc_rs:.4f}")
+        print(f"ROC AUC on Test (RS): {roc_auc_rs:.4f}")
         for threshold, metrics in results_rs.items():
             print(f"Threshold {threshold} - F1 Score on Test (RS): {metrics['f1']:.4f}, Accuracy on Test (RS): {metrics['accuracy']:.4f}")
 
         # Plot ROC curves together
         plt.figure(figsize=(10, 6))
-        plt.plot(fpr_tp, tpr_tp, label=f'TPE Model Fold {best_fold_tp+1} (AUC = {roc_auc_tp:.4f})', color='red', linestyle='-', linewidth=2)
-        plt.plot(fpr_rs, tpr_rs, label=f'Random Search Model Fold {best_fold_rs+1} (AUC = {roc_auc_rs:.4f})', color='blue', linestyle='--', linewidth=2)
+        plt.plot(fpr_tp, tpr_tp, label=f'TPE Model (AUC = {roc_auc_tp:.4f})', color='red', linestyle='-', linewidth=2)
+        plt.plot(fpr_rs, tpr_rs, label=f'Random Searching Model (AUC = {roc_auc_rs:.4f})', color='blue', linestyle='--', linewidth=2)
         plt.plot([0, 1], [0, 1], color='gray', linestyle=':', label='Random Guess', linewidth=1)
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title('ROC Curves Comparison - Best Models Selected on Test Set')
+        plt.title('ROC Curves Comparison')
         plt.legend(loc='lower right')
         plt.grid(alpha=0.3)
         plt.savefig(roc_curve_path)
-        plt.close()
-        
-        print(f"\nROC curve saved to {roc_curve_path}")
-        
-        return best_model_tp, best_model_rs, best_fold_tp, best_fold_rs
+        # plt.xlim(0, 1)
+        # plt.ylim(0, 1)
+        # plt.show()
+
+        # # Plot test results
+        # plt.figure(figsize=(10, 6))
+        # for i, threshold in enumerate([0.3, 0.5, 0.6], start=1):
+        #     plt.subplot(3, 1, i)
+        #     plt.plot(y_test_tp, label='True Labels', color='green', alpha=0.6)
+        #     plt.plot(test_preds[threshold], label=f'Predicted Probabilities (Threshold {threshold})', alpha=0.6)
+        #     plt.legend()
+        #     plt.title(f'Threshold {threshold}')
+        # plt.tight_layout()
+        # plt.savefig(save_path)
+        # plt.show()
 
 
 # === Objective Function ===
@@ -584,12 +523,13 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
         print(f"Using StratifiedKFold (no shot grouping available)")
 
-    # Store ALL models from each fold
-    models_tp = []
-    val_auc_scores_tp = []
+    auc_scores_tp = []
+    best_auc_tp = 0
+    best_model_tp = None
 
-    models_rs = []
-    val_auc_scores_rs = []
+    auc_scores_rs = []
+    best_auc_rs = 0
+    best_model_rs = None
 
     # In final training I increase the patience of the early stopping to 20 and the numkber of epochs to 200
     early_stopping_patience = 20
@@ -626,38 +566,44 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=batch_size)
+        
+        # train_loader_tpe = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        # val_loader_tpe = DataLoader(val_ds, batch_size=batch_size)
+
+        # train_loader_rs = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        # val_loader_rs = DataLoader(val_ds, batch_size=batch_size)
 
         # Train TP and RS
         model_tp = train_one_fold_test(model_tp, train_loader, val_loader, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE")
         model_rs = train_one_fold_test(model_rs, train_loader, val_loader, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS")
 
-        # Evaluate on validation set (for reference only)
-        val_auc_tp = evaluate_model(model_tp, val_loader, device, 'auc')
-        val_auc_rs = evaluate_model(model_rs, val_loader, device, 'auc')
-        
-        print(f"Fold {fold+1} - TPE validation AUC: {val_auc_tp:.4f}, RS validation AUC: {val_auc_rs:.4f}")
-        
-        # Store ALL models and their validation scores
-        models_tp.append(model_tp)
-        val_auc_scores_tp.append(val_auc_tp)
-        
-        models_rs.append(model_rs)
-        val_auc_scores_rs.append(val_auc_rs)
-        
-        # Save each fold's model
-        torch.save(model_tp.state_dict(), f"models/model_AUC_TP_fold_{fold+1}.pt")
-        torch.save(model_rs.state_dict(), f"models/model_AUC_RS_fold_{fold+1}.pt")
+        # Evaluate TP
+        auc_score_tp = evaluate_model(model_tp, val_loader, device, 'auc')
+        auc_scores_tp.append(auc_score_tp)
+        if auc_score_tp > best_auc_tp:
+            best_auc_tp = auc_score_tp
+            best_model_tp = model_tp
+            # X_test_tp, y_test_tp = X_val_fold, y_val_fold  # Save the test set for final evaluation
 
-    print(f"\nTPE: Mean validation AUC across folds: {np.mean(val_auc_scores_tp):.4f} ± {np.std(val_auc_scores_tp):.4f}")
-    print(f"RS: Mean validation AUC across folds: {np.mean(val_auc_scores_rs):.4f} ± {np.std(val_auc_scores_rs):.4f}")
+        # Evaluate RS
+        auc_score_rs = evaluate_model(model_rs, val_loader, device, 'auc')
+        auc_scores_rs.append(auc_score_rs)
+        if auc_score_rs > best_auc_rs:
+            best_auc_rs = auc_score_rs
+            best_model_rs = model_rs
+            # X_test_rs, y_test_rs = X_val_fold, y_val_fold  # Save the test set for final evaluation
 
-    # Model evaluation on test set
-    print(f"\n=== Evaluating all models on test set ===")
+    print(f"TP: Best AUC Score across folds: {best_auc_tp:.4f} and mean AUC Score: {np.mean(auc_scores_tp):.4f}, after {len(auc_scores_tp)} folds.")
+    print(f"RS: Best AUC Score across folds: {best_auc_rs:.4f} and mean AUC Score: {np.mean(auc_scores_rs):.4f}, after {len(auc_scores_rs)} folds.")
+
+    torch.save(best_model_tp.state_dict(), "models/best_model_AUC_TP.pt")
+    torch.save(best_model_rs.state_dict(), "models/best_model_AUC_RS.pt")
+
+    # Model evaluation
+    print(f"\nRe-trained models evaluation")
     # Load test data (with return_groups=True to remove 'shot' column)
     X_test, y_test, _ = load_dataset(csv_path_test, return_groups=True)
-    best_model_tp, best_model_rs, best_fold_tp, best_fold_rs = evaluate_and_plot_results(models_tp, models_rs, X_test, y_test, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
-
-    return best_model_tp, best_model_rs, best_fold_tp, best_fold_rs
+    evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test, device=device, save_path="images/test_results_AUC.png", roc_curve_path="images/auc_opt_roc_curve.png")
 
 
 # === Run Optuna Optimization ===
@@ -896,7 +842,7 @@ if __name__ == "__main__":
     best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials)
 
     # Retrain the best models
-    _, _, _, _ = train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
 
     # Print total time taken
     end_time = time.time()
