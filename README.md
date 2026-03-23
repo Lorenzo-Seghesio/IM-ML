@@ -1,17 +1,18 @@
-# im-binclass  
-### Faulty parts binary recognition using machine parameters in Injection Moulding  
+# IM-ML  
+## Injection Moulding - Machine learning
+### Machine Learning models applied to Injction Moulding Datasets for produced parts quality prediciton
 
 Used Python 3.12.3  
 Needed packages are specified in requirements.txt  
 
 ### How to run the code  
-You can run the code with the following command  
+- Tune your configuration inside config folder (different config files for different .py files)
+
+- You can run the code with the following command  
 ```
-python IM_Binary_Quality_Recognition.py --arg1
+python src/[name_of_the_file_you_want_to_run].py
 ```
-The argument `arg1` can be:  
-- `--first_data` - to use the first dataset only with machine parameters
-- `--first_data_full` - to use the first dataset with machine parameters and sensor measurements
-- `--pp_data` - to use new dataset with only PP material data
-- `--abs_data` - to use new dataset with only ABS material data
-- If `arg1` is not used then by default the code uses the new dataset with both PP and ABS data 
+
+The available files are:
+ - `BC_MLP_IM.py` - Multy layer Perceptron for Binary classification of produced parts (binary label based on wieght)
+ - `Reg_MLP_IM.py` -  Multy layer Perceptron for regression, predicting scalar weight of produced parts

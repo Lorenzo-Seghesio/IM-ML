@@ -1,0 +1,21 @@
+{
+    "model_name": "RS",
+    "threshold": 0.39999999999999997,
+    "auc_roc": 0.8103266596417281,
+    "f1": 0.8024691358024691,
+    "accuracy": 0.7142857142857143,
+    "mean_score": 0.7756938365766373,
+    "timestamp": "2026-03-23 17:27:46",
+    "hyperparameters": {
+        "lr": 0.0009717775305059633,
+        "alpha": 0.34936886087152874,
+        "gamma": 2.8403060953001487,
+        "weight_decay": 0.00015375920235481777,
+        "n_layers": 2,
+        "size_layer0": 71,
+        "size_layer1": 23
+    },
+    "train_samples": 440,
+    "test_samples": 112,
+    "n_features": 16
+}

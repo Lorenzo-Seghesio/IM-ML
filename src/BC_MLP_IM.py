@@ -36,19 +36,16 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from any subfolder)
 
+# Ensure output directories exist
+(BASE_DIR / 'outputs/BC/models').mkdir(parents=True, exist_ok=True)
+(BASE_DIR / 'outputs/BC/images').mkdir(parents=True, exist_ok=True)
+
 # Global variables
 best_auc_global = 0
 best_model_global = None
 best_auc_RS_global = 0
 best_model_RS_global = None
 best_params_RS_global = None
-
-batch_size = 32
-# gamma = 3.0
-dropout = 0.2
-# lr = 2.5e-3
-# n_layers = 1
-# weight_decay = 5e-5
 
 test_csv_path = str(BASE_DIR / 'data/IM_Data_Test.csv')  # Path to the test dataset
 train_csv_path = str(BASE_DIR / 'data/IM_Data_Train.csv')  # Path to the training dataset
@@ -627,18 +624,12 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
 
 
 # === Objective Function ===
-def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n_startup_trials=10, sampler="RandomSampler"):
+def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n_startup_trials=10, sampler="RandomSampler", hparam_cfg=None):
     global best_auc_global
     global best_model_global
     global best_auc_RS_global
     global best_model_RS_global
     global best_params_RS_global
-    global batch_size
-    # global gamma
-    global dropout
-    # global n_layers
-    # global lr
-    # global weight_decay
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -650,23 +641,56 @@ def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n
     else:
         skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-    neuron_min_limit = int(1/6 * X.shape[1])
-    neuron_max_limit = 5 * X.shape[1]
+    hp = (hparam_cfg or {}).get('hyperparameters', {})
 
-    # Hyperparameters
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    alpha = trial.suggest_float("alpha", 0.1, 0.9)
-    gamma = trial.suggest_float("gamma", 0.5, 5.0)
-    # batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-    # dropout = trial.suggest_float("dropout", 0.0, 0.4)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    n_layers = trial.suggest_int("n_layers", 2, 4)
+    # Hyperparameters — scalar in config → fixed; [min, max] → optimized by Optuna
+    lr_cfg = hp.get('lr', [1e-5, 1e-2])
+    lr = trial.suggest_float("lr", lr_cfg[0], lr_cfg[1], log=True) if isinstance(lr_cfg, list) else float(lr_cfg)
+
+    alpha_cfg = hp.get('alpha', [0.1, 0.9])
+    alpha = trial.suggest_float("alpha", alpha_cfg[0], alpha_cfg[1]) if isinstance(alpha_cfg, list) else float(alpha_cfg)
+
+    gamma_cfg = hp.get('gamma', [0.5, 5.0])
+    gamma = trial.suggest_float("gamma", gamma_cfg[0], gamma_cfg[1]) if isinstance(gamma_cfg, list) else float(gamma_cfg)
+
+    bs_cfg = hp.get('batch_size', 32)
+    batch_size = trial.suggest_int("batch_size", bs_cfg[0], bs_cfg[1]) if isinstance(bs_cfg, list) else int(bs_cfg)
+
+    do_cfg = hp.get('dropout', 0.2)
+    dropout = trial.suggest_float("dropout", do_cfg[0], do_cfg[1]) if isinstance(do_cfg, list) else float(do_cfg)
+
+    wd_cfg = hp.get('weight_decay', [1e-6, 1e-2])
+    weight_decay = trial.suggest_float("weight_decay", wd_cfg[0], wd_cfg[1], log=True) if isinstance(wd_cfg, list) else float(wd_cfg)
+
+    nl_cfg = hp.get('n_layers', [2, 4])
+    n_layers = trial.suggest_int("n_layers", nl_cfg[0], nl_cfg[1]) if isinstance(nl_cfg, list) else int(nl_cfg)
+
+    sl_cfg = hp.get('size_1st_hidden_layer', None)
     layers_dim = []
-    for i in range(n_layers):
-        size_layer = trial.suggest_int("size_layer{}".format(i), neuron_min_limit, neuron_max_limit, log=True)  # TODO Here I can start from 4 or mmaybe from X.shape[1] ??
-        neuron_max_limit = size_layer  # Ensure next layer has less or equal neurons
-        neuron_min_limit = 1
-        layers_dim.append(size_layer)
+    if isinstance(sl_cfg, list) or sl_cfg is None:
+        if isinstance(sl_cfg, list):
+            # list: first layer size is optimized between these bounds; subsequent layers are optimized with dynamic bounds based on previous layer
+            neuron_max_limit = sl_cfg[1]
+            neuron_min_limit = sl_cfg[0]
+        else:
+            # None: Fallback - dynamic bounds from feature count
+            neuron_min_limit = int(1/6 * X.shape[1])
+            neuron_max_limit = 5 * X.shape[1]
+        for i in range(n_layers):
+            size_layer = trial.suggest_int("size_layer{}".format(i), neuron_min_limit, neuron_max_limit, log=True)
+            neuron_max_limit = size_layer
+            neuron_min_limit = 1
+            layers_dim.append(size_layer)
+    else:
+        # scalar: first layer is fixed at this exact size; subsequent layers are optimized with dynamic bounds based on this fixed size
+        fixed = int(sl_cfg)
+        trial.suggest_int("size_layer0", fixed, fixed)
+        layers_dim.append(fixed)
+        neuron_max_limit = fixed
+        for i in range(1, n_layers):
+            size_layer = trial.suggest_int("size_layer{}".format(i), 1, neuron_max_limit)
+            neuron_max_limit = size_layer
+            layers_dim.append(size_layer)
 
     auc_scores = []
     best_auc = 0
@@ -728,13 +752,21 @@ def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n
 
 
 # === Retrain Final Model ===
-def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=str(BASE_DIR / 'data/IM_Data_Train.csv'), csv_path_test=str(BASE_DIR / 'data/IM_Data_Test.csv')):
-    global batch_size
-    global dropout
-    # global gamma
-    # global lr
-    # global n_layers
-    # global weight_decay
+def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=str(BASE_DIR / 'data/IM_Data_Train.csv'), csv_path_test=str(BASE_DIR / 'data/IM_Data_Test.csv'), hparam_cfg=None):
+    hp = (hparam_cfg or {}).get('hyperparameters', {})
+    # hyperparameters: use trial value if optimized (present in params), else config/default
+    lr_tp = params_tpe.get('lr', 1e-3) if isinstance(hp.get('lr'), list) else hp.get('lr', 1e-3)
+    alpha_tp = params_tpe.get('alpha', 0.25) if isinstance(hp.get('alpha'), list) else hp.get('alpha', 0.25)
+    gamma_tp = params_tpe.get('gamma', 2.0) if isinstance(hp.get('gamma'), list) else hp.get('gamma', 2.0)
+    dropout_tp = params_tpe.get('dropout', 0.2) if isinstance(hp.get('dropout'), list) else hp.get('dropout', 0.2)
+    weight_decay_tp = params_tpe.get('weight_decay', 1e-4) if isinstance(hp.get('weight_decay'), list) else hp.get('weight_decay', 1e-4)
+    batch_size_tp = params_tpe.get('batch_size', 32) if isinstance(hp.get('batch_size'), list) else hp.get('batch_size', 32)
+    lr_rs = params_rs.get('lr', 1e-3) if isinstance(hp.get('lr'), list) else hp.get('lr', 1e-3)
+    alpha_rs = params_rs.get('alpha', 0.25) if isinstance(hp.get('alpha'), list) else hp.get('alpha', 0.25)
+    gamma_rs = params_rs.get('gamma', 2.0) if isinstance(hp.get('gamma'), list) else hp.get('gamma', 2.0)
+    dropout_rs = params_rs.get('dropout', 0.2) if isinstance(hp.get('dropout'), list) else hp.get('dropout', 0.2)
+    weight_decay_rs = params_rs.get('weight_decay', 1e-4) if isinstance(hp.get('weight_decay'), list) else hp.get('weight_decay', 1e-4)
+    batch_size_rs = params_rs.get('batch_size', 32) if isinstance(hp.get('batch_size'), list) else hp.get('batch_size', 32)
 
     print(f"\nTraining the best model TPE and RS...")
 
@@ -782,14 +814,14 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         
         # Initialize models for each fold
         # TPE
-        model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout).to(device)
-        criterion_tp = BinaryFocalLoss(alpha=params_tpe["alpha"], gamma=params_tpe["gamma"])
-        optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=params_tpe["lr"], weight_decay=params_tpe["weight_decay"])
+        model_tp = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout_tp).to(device)
+        criterion_tp = BinaryFocalLoss(alpha=alpha_tp, gamma=gamma_tp)
+        optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=lr_tp, weight_decay=weight_decay_tp)
         init_weights_with_prior(model_tp, pos_prior=float(y_train.mean()))
         #RS
-        model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout).to(device)
-        criterion_rs = BinaryFocalLoss(alpha=params_rs["alpha"], gamma=params_rs["gamma"])
-        optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=params_rs["lr"], weight_decay=params_rs["weight_decay"])
+        model_rs = BinaryClassifier(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout_rs).to(device)
+        criterion_rs = BinaryFocalLoss(alpha=alpha_rs, gamma=gamma_rs)
+        optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=lr_rs, weight_decay=weight_decay_rs)
         init_weights_with_prior(model_rs, pos_prior=float(y_train.mean()))
 
         # Prepare data loaders
@@ -800,23 +832,20 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
                                  torch.tensor(y_train_fold, dtype=torch.float32).unsqueeze(1))
         val_ds = TensorDataset(torch.tensor(X_val_fold, dtype=torch.float32),
                                torch.tensor(y_val_fold, dtype=torch.float32).unsqueeze(1))
-
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=batch_size)
         
-        # train_loader_tpe = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        # val_loader_tpe = DataLoader(val_ds, batch_size=batch_size)
+        train_loader_tpe = DataLoader(train_ds, batch_size=batch_size_tp, shuffle=True)
+        val_loader_tpe = DataLoader(val_ds, batch_size=batch_size_tp)
 
-        # train_loader_rs = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        # val_loader_rs = DataLoader(val_ds, batch_size=batch_size)
+        train_loader_rs = DataLoader(train_ds, batch_size=batch_size_rs, shuffle=True)
+        val_loader_rs = DataLoader(val_ds, batch_size=batch_size_rs)
 
         # Train TP and RS
-        model_tp = train_one_fold_test(model_tp, train_loader, val_loader, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE")
-        model_rs = train_one_fold_test(model_rs, train_loader, val_loader, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS")
+        model_tp = train_one_fold_test(model_tp, train_loader_tpe, val_loader_tpe, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE")
+        model_rs = train_one_fold_test(model_rs, train_loader_rs, val_loader_rs, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS")
 
         # Find best threshold on validation set for each fold
-        threshold_tp_fold, score_tp_fold = find_best_threshold(model_tp, val_loader, device, metric='balanced')
-        threshold_rs_fold, score_rs_fold = find_best_threshold(model_rs, val_loader, device, metric='balanced')
+        threshold_tp_fold, score_tp_fold = find_best_threshold(model_tp, val_loader_tpe, device, metric='balanced')
+        threshold_rs_fold, score_rs_fold = find_best_threshold(model_rs, val_loader_rs, device, metric='balanced')
         
         thresholds_tp.append(threshold_tp_fold)
         thresholds_rs.append(threshold_rs_fold)
@@ -825,22 +854,22 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         print(f"Fold {fold+1} - RS best threshold: {threshold_rs_fold:.2f} (balanced score: {score_rs_fold:.4f})")
 
         # Evaluate TP
-        auc_score_tp = evaluate_model(model_tp, val_loader, device, 'auc')
+        auc_score_tp = evaluate_model(model_tp, val_loader_tpe, device, 'auc')
         auc_scores_tp.append(auc_score_tp)
         if auc_score_tp > best_auc_tp:
             best_auc_tp = auc_score_tp
             best_model_tp = model_tp
             best_threshold_tp = threshold_tp_fold
-            best_val_loader_tp = val_loader
+            best_val_loader_tp = val_loader_tpe
 
         # Evaluate RS
-        auc_score_rs = evaluate_model(model_rs, val_loader, device, 'auc')
+        auc_score_rs = evaluate_model(model_rs, val_loader_rs, device, 'auc')
         auc_scores_rs.append(auc_score_rs)
         if auc_score_rs > best_auc_rs:
             best_auc_rs = auc_score_rs
             best_model_rs = model_rs
             best_threshold_rs = threshold_rs_fold
-            best_val_loader_rs = val_loader
+            best_val_loader_rs = val_loader_rs
 
     print(f"\nTP: Best AUC Score across folds: {best_auc_tp:.4f} and mean AUC Score: {np.mean(auc_scores_tp):.4f}, after {len(auc_scores_tp)} folds.")
     print(f"RS: Best AUC Score across folds: {best_auc_rs:.4f} and mean AUC Score: {np.mean(auc_scores_rs):.4f}, after {len(auc_scores_rs)} folds.")
@@ -903,13 +932,13 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
 
 
 # === Run Optuna Optimization ===
-def run_optimization(sampler, pruner, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n_trials=100, n_startup_trials=10):
+def run_optimization(sampler, pruner, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n_trials=100, n_startup_trials=10, hparam_cfg=None):
     global best_auc_RS_global
     global best_model_RS_global
     global best_params_RS_global
     
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
-    study.optimize(lambda trial: objective(trial, csv_path=csv_path, n_startup_trials=n_startup_trials, sampler=sampler.__class__.__name__), n_trials=n_trials, timeout=3600)
+    study.optimize(lambda trial: objective(trial, csv_path=csv_path, n_startup_trials=n_startup_trials, sampler=sampler.__class__.__name__, hparam_cfg=hparam_cfg), n_trials=n_trials, timeout=3600)
 
     # Best trial overall (hoping is TPE)
     if sampler.__class__.__name__ == "TPESampler":
@@ -946,44 +975,35 @@ def run_optimization(sampler, pruner, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_P
 
 
 if __name__ == "__main__":
-    start_time = time.time()
-    # # Argument parser
-    # parser = argparse.ArgumentParser(description="Train a binary classification model.")
-    # parser.add_argument('--first_data', action='store_true', help="Decide whether to use first dataset, if selected only the first dataset will be used")
-    # parser.add_argument('--first_data_full', action='store_true', help="Decide whether to use first dataset with also measurements, if selected only the first dataset with measurement will be used")
-    # parser.add_argument('--pp_data', action='store_true', help="Decide whether to use PP dataset, can be used together with ABS dataset")
-    # parser.add_argument('--abs_data', action='store_true', help="Decide whether to use the ABS dataset, can be used together with PP dataset")
-    # parser.add_argument('--pp_p1_data', action='store_true', help="Decide whether to use the PP Position 1 dataset")
-    # parser.add_argument('--pp_weight_data', action='store_true', help="Decide whether to use the PP Weight dataset")
-    # args = parser.parse_args()
-    # # Load data path
-    # if args.first_data:
-    #     print("\nUsing the first dataset.\n")
-    #     csv_path = 'data/IM_Data.csv'
-    # elif args.first_data_full:
-    #     print("\nUsing the first dataset with all measurments.\n")
-    #     csv_path = 'data/IM_Data_Full.csv'
-    # elif args.pp_p1_data:
-    #     print("\nUsing only the PP Position 1 dataset.\n")
-    #     csv_path = 'data/DATA_PP_P1_W.csv'
-    # else:
-    #     if args.pp_data:
-    #         if args.abs_data:
-    #             print("\nUsing the full dataset, both PP and ABS data.\n")
-    #             csv_path = 'data/DATA_ABS_&_PP_Binary.csv'
-    #         else:
-    #             print("\nUsing only the PP dataset.\n")
-    #             csv_path = 'data/DATA_PP_Binary.csv'
-    #     elif args.abs_data:
-    #         print("\nUsing only the ABS dataset.\n")
-    #         csv_path = 'data/DATA_ABS_Binary.csv'
-    #     else:
-    #         print("\nUsing by default the full dataset, both PP and ABS data.\n")
-    #         csv_path = 'data/DATA_ABS_&_PP_Binary.csv'
+    # Load config
+    parser = argparse.ArgumentParser(description="Train a binary classification model.")
+    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/BC_MLP_config.json'),
+                        help="Path to the JSON config file (default: config/BC_MLP_config.json)")
+    parser.add_argument('--dataset', type=str, choices=['pp', 'abs', 'PP', 'ABS'],
+                        help="Dataset to use: 'pp' or 'abs'. Overrides the value in the config file.")
+    args = parser.parse_args()
 
-    # CSV path
-    csv_path_1 = str(BASE_DIR / 'data/DATA_PP_P1_W.csv')
-    csv_path_2 = str(BASE_DIR / 'data/DATA_PP_P2_W.csv')
+    with open(args.config, 'r') as f:
+        cfg = json.load(f)
+
+    # CLI --dataset overrides config value
+    if args.dataset:
+        cfg['dataset'] = args.dataset
+        print(f"\n[CLI override] dataset set to '{args.dataset.upper()}'")
+
+    dataset = cfg.get('dataset', 'PP').upper()
+    if dataset == 'PP':
+        csv_path_1 = str(BASE_DIR / 'data/DATA_PP_P1_W.csv')
+        csv_path_2 = str(BASE_DIR / 'data/DATA_PP_P2_W.csv')
+        print(f"\nUsing PP dataset (DATA_PP_P1_W.csv + DATA_PP_P2_W.csv)\n")
+    elif dataset == 'ABS':
+        csv_path_1 = str(BASE_DIR / 'data/DATA_ABS_P1_W.csv')
+        csv_path_2 = str(BASE_DIR / 'data/DATA_ABS_P2_W.csv')
+        print(f"\nUsing ABS dataset (DATA_ABS_P1_W.csv + DATA_ABS_P2_W.csv)\n")
+    else:
+        raise ValueError(f"Unknown dataset '{dataset}' in config. Choose 'PP' or 'ABS'.")
+
+    start_time = time.time()
 
     # Read data
     df_1 = pd.read_csv(csv_path_1)
@@ -1131,14 +1151,16 @@ if __name__ == "__main__":
 
     # Run HPO otpimization with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
-    n_startup_trials = 100
-    n_trials = 200
+    optuna_trials = cfg.get('optuna_trials', {})
+    n_startup_trials = optuna_trials.get('n_startup_trials', 10)
+    n_trials = optuna_trials.get('tot_trials', 100)
+    print(f"Total Optuna trials: {n_trials} (with {n_startup_trials} startup trials for RS)")
     sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
     pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials)
+    best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials, hparam_cfg=cfg)
 
     # Retrain the best models
-    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path)
+    train_and_save_best_model(params_tpe=best_trial_tpe.params, params_rs=best_params_RS_global, epochs=200, csv_path_train=train_csv_path, csv_path_test=test_csv_path, hparam_cfg=cfg)
 
     # Print total time taken
     end_time = time.time()

@@ -1,4 +1,4 @@
-shot,shot position,Clamping force,Peak value plasticizing screw,Transfer volume,Maximum injection pressure,Transfer injection pressure,Injection time,Cushion mass,Dosing time,Cylinder heating zone 1,Cylinder heating zone 2,Cylinder heating zone 3,Cylinder heating zone 4,Cylinder heating zone 5,Nozzle temperature,Mold protection time,Product weight g
+shot,shot_position,Clamping force,Peak value plasticizing screw,Transfer volume,Maximum injection pressure,Transfer injection pressure,Injection time,Cushion mass,Dosing time,Cylinder heating zone 1,Cylinder heating zone 2,Cylinder heating zone 3,Cylinder heating zone 4,Cylinder heating zone 5,Nozzle temperature,Mold protection time,Product weight g
 2,2,800.85986,0.62800,28.24119,567.70630,567.70630,0.36000,19.96404,1.92400,187.50000,193.30000,199.50000,204.80000,209.80000,44.20000,0.66400,14.596
 3,2,800.67542,0.78200,28.24119,600.05505,600.05505,0.36000,19.95385,1.92800,187.10001,192.60001,199.10001,204.80000,209.80000,43.90000,0.66600,14.602
 4,2,800.67542,0.68200,28.24119,623.95233,623.95233,0.36000,19.98443,1.94600,187.10001,191.80000,198.80000,204.80000,209.80000,43.50000,0.66000,14.607

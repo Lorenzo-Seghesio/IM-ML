@@ -1,0 +1,21 @@
+{
+    "model_name": "RS",
+    "mae": 0.0018198413977461106,
+    "rmse": 0.0022235826136504273,
+    "r2": -0.03781042704102311,
+    "mape": 0.010205099668817963,
+    "max_error": 0.005214901733399557,
+    "timestamp": "2026-03-23 18:17:27",
+    "hyperparameters": {
+        "lr": 0.0001329291894316216,
+        "dropout": 0.3802857225639665,
+        "weight_decay": 0.007319939418114051,
+        "n_layers": 3,
+        "size_layer0": 31,
+        "size_layer1": 1,
+        "size_layer2": 1
+    },
+    "train_samples": 355,
+    "test_samples": 89,
+    "n_features": 20
+}
