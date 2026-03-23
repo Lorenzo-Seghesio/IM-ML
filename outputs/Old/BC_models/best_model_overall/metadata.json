@@ -1,0 +1,20 @@
+{
+    "model_name": "TPE",
+    "threshold": 0.35,
+    "auc_roc": 0.8461538461538461,
+    "f1": 0.8571428571428571,
+    "accuracy": 0.8035714285714286,
+    "mean_score": 0.8356227106227107,
+    "timestamp": "2025-12-15 10:01:51",
+    "hyperparameters": {
+        "lr": 0.002833654687379806,
+        "alpha": 0.25819065450451373,
+        "gamma": 1.0006236986902814,
+        "weight_decay": 7.659560039290795e-06,
+        "n_layers": 1,
+        "size_layer0": 29
+    },
+    "train_samples": 440,
+    "test_samples": 112,
+    "n_features": 16
+}
