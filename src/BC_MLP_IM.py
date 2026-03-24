@@ -36,9 +36,8 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from any subfolder)
 
-# Ensure output directories exist
-(BASE_DIR / 'outputs/BC/models').mkdir(parents=True, exist_ok=True)
-(BASE_DIR / 'outputs/BC/images').mkdir(parents=True, exist_ok=True)
+# Output root — overridden at runtime in __main__ based on dataset choice
+OUT_DIR = BASE_DIR / 'outputs/BC'
 
 # Global variables
 best_auc_global = 0
@@ -113,19 +112,18 @@ class EarlyStopping:
 # === Data Loader ===
 def load_dataset(csv_path, return_groups=False):
     df = pd.read_csv(csv_path)
-    
-    # Check if 'shot' column exists for grouping
+    target_col = 'Product_Goodness'
+
     if 'shot' in df.columns and return_groups:
         groups = df['shot'].values
-        X = df.drop(columns=['shot']).iloc[:, :-1].values
     else:
         groups = None
-        X = df.iloc[:, :-1].values
-    
-    y = df.iloc[:, -1].values
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
-    
+
+    drop_cols = [c for c in ['shot', 'cavity'] if c in df.columns]
+    y = df[target_col].values
+    X = df.drop(columns=drop_cols + [target_col]).values
+    X = StandardScaler().fit_transform(X)
+
     if return_groups:
         return X, y, groups
     return X, y
@@ -255,7 +253,7 @@ def train_one_fold_test(model, train_loader, val_loader, device, criterion, opti
         ax2.grid(alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(str(BASE_DIR / 'outputs/BC/images/{}_training_curves_fold_{}.png'.format(sampler, fold + 1)))
+        plt.savefig(str(OUT_DIR / 'images/{}_training_curves_fold_{}.png'.format(sampler, fold + 1)))
         plt.close()
 
     return model
@@ -400,7 +398,7 @@ def save_best_overall_model(model, model_name, threshold, auc_roc, f1, accuracy,
     Returns:
     - saved: True if model was saved (better than previous), False otherwise
     """
-    best_model_dir = str(BASE_DIR / 'outputs/BC/models/best_model_overall')
+    best_model_dir = str(OUT_DIR / 'models/best_model_overall')
     metadata_file = os.path.join(best_model_dir, 'metadata.json')
     
     # Calculate mean score
@@ -466,13 +464,13 @@ def save_best_overall_model(model, model_name, threshold, auc_roc, f1, accuracy,
             json.dump(metadata, f, indent=4)
         
         # Copy confusion matrix for the best model
-        confusion_matrix_src = str(BASE_DIR / f'outputs/BC/images/confusion_matrix_{model_name}.png')
+        confusion_matrix_src = str(OUT_DIR / f'images/confusion_matrix_{model_name}.png')
         confusion_matrix_dst = os.path.join(best_model_dir, 'confusion_matrix.png')
         if os.path.exists(confusion_matrix_src):
             shutil.copy2(confusion_matrix_src, confusion_matrix_dst)
         
         # Copy ROC curve comparison (with both TPE and RS)
-        roc_curve_src = str(BASE_DIR / 'outputs/BC/images/auc_opt_roc_curve.png')
+        roc_curve_src = str(OUT_DIR / 'images/auc_opt_roc_curve.png')
         roc_curve_dst = os.path.join(best_model_dir, 'roc_curve_comparison.png')
         if os.path.exists(roc_curve_src):
             shutil.copy2(roc_curve_src, roc_curve_dst)
@@ -488,7 +486,7 @@ def save_best_overall_model(model, model_name, threshold, auc_roc, f1, accuracy,
     return should_save
 
 # === Evaluate Model and plot results ===
-def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, threshold_tp=0.5, threshold_rs=0.5, save_path=str(BASE_DIR / "outputs/BC/images/test_results_AUC.png"), roc_curve_path=str(BASE_DIR / "outputs/BC/images/auc_opt_roc_curve.png")):
+def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, threshold_tp=0.5, threshold_rs=0.5, save_path=None, roc_curve_path=None):
         
         # Evaluate model_tp
         model_tp.eval()
@@ -561,7 +559,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
         disp_tp.plot(cmap='Blues', values_format='d')
         plt.title(f'TPE Model - Confusion Matrix\n(Threshold = {threshold_tp:.2f}, AUC = {roc_auc_tp:.4f})')
         plt.tight_layout()
-        plt.savefig(str(BASE_DIR / 'outputs/BC/images/confusion_matrix_TPE.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(str(OUT_DIR / 'images/confusion_matrix_TPE.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         # RS confusion matrix
@@ -570,7 +568,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
         disp_rs.plot(cmap='Greens', values_format='d')
         plt.title(f'RS Model - Confusion Matrix\n(Threshold = {threshold_rs:.2f}, AUC = {roc_auc_rs:.4f})')
         plt.tight_layout()
-        plt.savefig(str(BASE_DIR / 'outputs/BC/images/confusion_matrix_RS.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(str(OUT_DIR / 'images/confusion_matrix_RS.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         # Plot both confusion matrices together
@@ -585,13 +583,13 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
         ax2.set_title(f'RS Model - Confusion Matrix\n(Threshold = {threshold_rs:.2f}, AUC = {roc_auc_rs:.4f})')
         
         plt.tight_layout()
-        plt.savefig(str(BASE_DIR / 'outputs/BC/images/confusion_matrices_combined.png'), dpi=300, bbox_inches='tight')
+        plt.savefig(str(OUT_DIR / 'images/confusion_matrices_combined.png'), dpi=300, bbox_inches='tight')
         plt.close()
         
         print(f"\nConfusion matrices saved:")
-        print(f"  - outputs/BC/images/confusion_matrix_TPE.png")
-        print(f"  - outputs/BC/images/confusion_matrix_RS.png")
-        print(f"  - outputs/BC/images/confusion_matrices_combined.png")
+        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_TPE.png")
+        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrix_RS.png")
+        print(f"  - outputs/{OUT_DIR.relative_to(BASE_DIR)}/images/confusion_matrices_combined.png")
 
         # Plot ROC curves together
         plt.figure(figsize=(10, 6))
@@ -603,7 +601,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
         plt.title('ROC Curves Comparison')
         plt.legend(loc='lower right')
         plt.grid(alpha=0.3)
-        plt.savefig(roc_curve_path)
+        plt.savefig(roc_curve_path or str(OUT_DIR / 'images/auc_opt_roc_curve.png'))
         plt.close()
         
         # Get metrics at validation-selected thresholds for return
@@ -621,6 +619,48 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, thresh
             'tp': {'auc': roc_auc_tp, 'f1': f1_tp_selected, 'accuracy': acc_tp_selected, 'threshold': threshold_tp},
             'rs': {'auc': roc_auc_rs, 'f1': f1_rs_selected, 'accuracy': acc_rs_selected, 'threshold': threshold_rs}
         }
+
+
+# === Per-Cavity Metrics (double-cavity datasets only) ===
+def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device):
+    """Print per-cavity classification metrics and ROC curve for the best model only.
+    No-op when test CSV has no 'cavity' column (single-cavity datasets)."""
+    df_raw = pd.read_csv(test_csv_path)
+    if 'cavity' not in df_raw.columns:
+        return
+    X_test, y_test, _ = load_dataset(test_csv_path, return_groups=True)
+    cavities = sorted(df_raw['cavity'].unique())
+    print("\n" + "="*55)
+    print(f"=== Per-Cavity Test Set Evaluation ({model_name}) ===")
+    best_model.eval()
+    plt.figure(figsize=(8, 6))
+    for cav in cavities:
+        mask = (df_raw['cavity'] == cav).values
+        X_cav, y_cav = X_test[mask], y_test[mask]
+        with torch.no_grad():
+            logits = best_model(torch.tensor(X_cav, dtype=torch.float32).to(device))
+            y_prob = torch.sigmoid(logits).cpu().numpy().flatten()
+        thresh, _ = find_best_threshold(best_model,
+                                        DataLoader(TensorDataset(
+                                            torch.tensor(X_cav, dtype=torch.float32),
+                                            torch.tensor(y_cav, dtype=torch.float32).unsqueeze(1)),
+                                            batch_size=64), device)
+        y_pred = (y_prob >= thresh).astype(int)
+        auc_cav  = float(roc_auc_score(y_cav, y_prob))
+        f1_cav   = float(f1_score(y_cav, y_pred, zero_division=0))
+        acc_cav  = float(accuracy_score(y_cav, y_pred))
+        print(f"\n--- Cavity {cav} ({mask.sum()} samples) ---")
+        print(f"  AUC: {auc_cav:.4f}  F1: {f1_cav:.4f}  Acc: {acc_cav:.4f}  Thresh: {thresh:.2f}")
+        fpr, tpr, _ = roc_curve(y_cav, y_prob)
+        plt.plot(fpr, tpr, lw=2, label=f'Cavity {cav} (AUC={auc_cav:.4f})')
+    plt.plot([0, 1], [0, 1], 'k--', lw=1, label='Random guess')
+    plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+    plt.title(f'{model_name} \u2014 Per-Cavity ROC Curves')
+    plt.legend(loc='lower right'); plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(OUT_DIR / f'images/per_cavity_roc_{model_name}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Per-cavity ROC plot saved: per_cavity_roc_{model_name}.png")
 
 
 # === Objective Function ===
@@ -741,12 +781,12 @@ def objective(trial, csv_path=str(BASE_DIR / 'data/DATA_ABS_&_PP_Binary.csv'), n
         if best_model_global is None or np.mean(auc_scores) > best_auc_global:
             best_auc_global = np.mean(auc_scores)
             best_model_global = best_model
-            torch.save(best_model_global.state_dict(), str(BASE_DIR / "outputs/BC/models/best_model_AUC_global.pt"))
+            torch.save(best_model_global.state_dict(), str(OUT_DIR / "models/best_model_AUC_global.pt"))
             if (sampler == "TPESampler") and (trial.number < n_startup_trials):
                     best_auc_RS_global = best_auc_global
                     best_model_RS_global = best_model_global
                     best_params_RS_global = trial.params  # Store the TRIAL parameters (hyperparameters), not model weights
-                    torch.save(best_model_RS_global.state_dict(), str(BASE_DIR / "outputs/BC/models/best_model_AUC_RS.pt"))
+                    torch.save(best_model_RS_global.state_dict(), str(OUT_DIR / "models/best_model_AUC_RS.pt"))
 
     return np.mean(auc_scores)
 
@@ -879,8 +919,8 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     print(f"TPE - Mean threshold: {np.mean(thresholds_tp):.2f} ± {np.std(thresholds_tp):.2f}, Best fold threshold: {best_threshold_tp:.2f}")
     print(f"RS  - Mean threshold: {np.mean(thresholds_rs):.2f} ± {np.std(thresholds_rs):.2f}, Best fold threshold: {best_threshold_rs:.2f}")
 
-    torch.save(best_model_tp.state_dict(), str(BASE_DIR / "outputs/BC/models/best_model_AUC_TP.pt"))
-    torch.save(best_model_rs.state_dict(), str(BASE_DIR / "outputs/BC/models/best_model_AUC_RS.pt"))
+    torch.save(best_model_tp.state_dict(), str(OUT_DIR / "models/best_model_AUC_TP.pt"))
+    torch.save(best_model_rs.state_dict(), str(OUT_DIR / "models/best_model_AUC_RS.pt"))
 
     # Model evaluation
     print(f"\n=== Final Test Set Evaluation ===")
@@ -888,7 +928,7 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     X_test, y_test, _ = load_dataset(csv_path_test, return_groups=True)
     metrics = evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test, device=device, 
                             threshold_tp=best_threshold_tp, threshold_rs=best_threshold_rs,
-                            save_path=str(BASE_DIR / "outputs/BC/images/test_results_AUC.png"), roc_curve_path=str(BASE_DIR / "outputs/BC/images/auc_opt_roc_curve.png"))
+                            save_path=str(OUT_DIR / "images/test_results_AUC.png"), roc_curve_path=str(OUT_DIR / "images/auc_opt_roc_curve.png"))
     
     # Determine which model is better
     mean_score_tp = (metrics['tp']['auc'] + metrics['tp']['f1'] + metrics['tp']['accuracy']) / 3
@@ -929,6 +969,126 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
             y_test=y_test,
             params=params_rs
         )
+
+    # Per-cavity evaluation on the best (winning) model only
+    best_winner = best_model_tp if mean_score_tp >= mean_score_rs else best_model_rs
+    winner_name = 'TPE' if mean_score_tp >= mean_score_rs else 'RS'
+    _report_per_cavity_metrics(best_winner, winner_name, csv_path_test, device)
+
+
+# === Process Double Cavity Dataset (with label creation) ===
+def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path):
+    df_1 = pd.read_csv(csv_path_1)
+    df_2 = pd.read_csv(csv_path_2)
+    if 'shot' not in df_1.columns or 'shot' not in df_2.columns:
+        raise ValueError("Both datasets must have 'shot' column for synchronized splitting")
+
+    print(f"Dataset P1: {len(df_1)} samples | Dataset P2: {len(df_2)} samples")
+
+    outliers_p1 = detect_outliers_iqr(df_1['Product weight g'])
+    outliers_p2 = detect_outliers_iqr(df_2['Product weight g'])
+    print(f"Outliers — P1: {outliers_p1.sum()}, P2: {outliers_p2.sum()}")
+
+    df_1_clean = df_1[~outliers_p1].reset_index(drop=True)
+    df_2_clean = df_2[~outliers_p2].reset_index(drop=True)
+    mean_1, std_1 = df_1_clean['Product weight g'].mean(), df_1_clean['Product weight g'].std()
+    mean_2, std_2 = df_2_clean['Product weight g'].mean(), df_2_clean['Product weight g'].std()
+    print(f"P1 (clean) weight → mean={mean_1:.4f}, std={std_1:.4f}")
+    print(f"P2 (clean) weight → mean={mean_2:.4f}, std={std_2:.4f}")
+
+    df_1['Product_Goodness'] = (
+        (df_1['Product weight g'] >= mean_1 - std_1) &
+        (df_1['Product weight g'] <= mean_1 + std_1)
+    ).astype(int)
+    df_2['Product_Goodness'] = (
+        (df_2['Product weight g'] >= mean_2 - std_2) &
+        (df_2['Product weight g'] <= mean_2 + std_2)
+    ).astype(int)
+
+    print("\n=== Labeling Statistics ===")
+    print(f"P1 — Total: {len(df_1)}, Good: {df_1['Product_Goodness'].sum()}, "
+          f"Bad: {(df_1['Product_Goodness'] == 0).sum()}")
+    print(f"P1 — Outliers labeled BAD: {(outliers_p1 & (df_1['Product_Goodness'] == 0)).sum()} / {outliers_p1.sum()}")
+    print(f"P2 — Total: {len(df_2)}, Good: {df_2['Product_Goodness'].sum()}, "
+          f"Bad: {(df_2['Product_Goodness'] == 0).sum()}")
+    print(f"P2 — Outliers labeled BAD: {(outliers_p2 & (df_2['Product_Goodness'] == 0)).sum()} / {outliers_p2.sum()}")
+
+    df_1 = df_1.drop(columns=['Product weight g'])
+    df_2 = df_2.drop(columns=['Product weight g'])
+    print("Removed 'Product weight g' columns (kept 'shot' for group-based CV)")
+
+    unique_shots = df_1['shot'].unique()
+    np.random.seed(41)
+    shuffled_shots = np.random.permutation(unique_shots)
+    split_idx   = int(len(shuffled_shots) * 0.8)
+    train_shots = shuffled_shots[:split_idx]
+    test_shots  = shuffled_shots[split_idx:]
+    print(f"Train shots: {len(train_shots)}, Test shots: {len(test_shots)}")
+
+    tr1 = df_1[df_1['shot'].isin(train_shots)].copy()
+    te1 = df_1[df_1['shot'].isin(test_shots)].copy()
+    tr2 = df_2[df_2['shot'].isin(train_shots)].copy()
+    te2 = df_2[df_2['shot'].isin(test_shots)].copy()
+    print(f"P1 — Train: {len(tr1)}, Test: {len(te1)} | P2 — Train: {len(tr2)}, Test: {len(te2)}")
+
+    tr1['cavity'] = 'P1'; te1['cavity'] = 'P1'
+    tr2['cavity'] = 'P2'; te2['cavity'] = 'P2'
+
+    Data_train = pd.concat([tr1, tr2], axis=0, ignore_index=True)
+    Data_test  = pd.concat([te1, te2], axis=0, ignore_index=True)
+
+    train_bad_pct = (Data_train['Product_Goodness'] == 0).sum() / len(Data_train) * 100
+    test_bad_pct  = (Data_test['Product_Goodness']  == 0).sum() / len(Data_test)  * 100
+    print(f"Combined — Train: {len(Data_train)}, Test: {len(Data_test)}")
+    print(f"Bad% — Train: {train_bad_pct:.2f}%, Test: {test_bad_pct:.2f}%")
+
+    # Shuffle preserving shot groups
+    train_shot_order = Data_train['shot'].unique()
+    np.random.seed(42); np.random.shuffle(train_shot_order)
+    Data_train = Data_train.set_index('shot').loc[train_shot_order].reset_index()
+    test_shot_order = Data_test['shot'].unique()
+    np.random.seed(42); np.random.shuffle(test_shot_order)
+    Data_test = Data_test.set_index('shot').loc[test_shot_order].reset_index()
+
+    Data_train.to_csv(train_csv_path, index=False)
+    Data_test.to_csv(test_csv_path, index=False)
+    print(f"Saved to {train_csv_path} and {test_csv_path}")
+
+
+# === Process Single Cavity Dataset (with label creation) ===
+def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
+    df = pd.read_csv(csv_path)
+    print(f"Dataset: {len(df)} samples, {df.shape[1]} columns")
+
+    outliers = detect_outliers_iqr(df['Product weight g'])
+    print(f"Outliers detected: {outliers.sum()}")
+
+    df_clean = df[~outliers].reset_index(drop=True)
+    mean_w, std_w = df_clean['Product weight g'].mean(), df_clean['Product weight g'].std()
+    print(f"Weight (clean) → mean={mean_w:.4f}, std={std_w:.4f}")
+
+    df['Product_Goodness'] = (
+        (df['Product weight g'] >= mean_w - std_w) &
+        (df['Product weight g'] <= mean_w + std_w)
+    ).astype(int)
+
+    print(f"Total: {len(df)}, Good: {df['Product_Goodness'].sum()}, Bad: {(df['Product_Goodness'] == 0).sum()}")
+    print(f"Outliers labeled BAD: {(outliers & (df['Product_Goodness'] == 0)).sum()} / {outliers.sum()}")
+
+    df = df.drop(columns=['Product weight g'])
+
+    cols_to_drop = [c for c in ['shot', 'shot_position'] if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+        print(f"Dropped columns: {cols_to_drop}")
+
+    np.random.seed(41)
+    idx = np.random.permutation(len(df))
+    split_idx = int(len(idx) * 0.8)
+    df.iloc[idx[:split_idx]].reset_index(drop=True).to_csv(train_csv_path, index=False)
+    df.iloc[idx[split_idx:]].reset_index(drop=True).to_csv(test_csv_path,  index=False)
+    print(f"Train: {split_idx} samples, Test: {len(idx) - split_idx} samples")
+    print(f"Saved to {train_csv_path} and {test_csv_path}")
 
 
 # === Run Optuna Optimization ===
@@ -979,8 +1139,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a binary classification model.")
     parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/BC_MLP_config.json'),
                         help="Path to the JSON config file (default: config/BC_MLP_config.json)")
-    parser.add_argument('--dataset', type=str, choices=['pp', 'abs', 'PP', 'ABS'],
-                        help="Dataset to use: 'pp' or 'abs'. Overrides the value in the config file.")
+    parser.add_argument('--dataset', type=str,
+                        choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2',
+                                 'pp_1', 'pp_2', 'abs_1', 'abs_2'],
+                        help="Dataset to use. Overrides the value in the config file.")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -992,171 +1154,43 @@ if __name__ == "__main__":
         print(f"\n[CLI override] dataset set to '{args.dataset.upper()}'")
 
     dataset = cfg.get('dataset', 'PP').upper()
-    if dataset == 'PP':
-        csv_path_1 = str(BASE_DIR / 'data/DATA_PP_P1_W.csv')
-        csv_path_2 = str(BASE_DIR / 'data/DATA_PP_P2_W.csv')
-        print(f"\nUsing PP dataset (DATA_PP_P1_W.csv + DATA_PP_P2_W.csv)\n")
-    elif dataset == 'ABS':
-        csv_path_1 = str(BASE_DIR / 'data/DATA_ABS_P1_W.csv')
-        csv_path_2 = str(BASE_DIR / 'data/DATA_ABS_P2_W.csv')
-        print(f"\nUsing ABS dataset (DATA_ABS_P1_W.csv + DATA_ABS_P2_W.csv)\n")
+    if dataset in ['PP', 'ABS']:
+        double_cavity = True
+        csv_path_1 = str(BASE_DIR / f'data/DATA_{dataset}_P1_W.csv')
+        csv_path_2 = str(BASE_DIR / f'data/DATA_{dataset}_P2_W.csv')
+        print(f"\nUsing {dataset} dataset (P1 + P2)\n")
+    elif dataset in ['PP_1', 'PP_2', 'ABS_1', 'ABS_2']:
+        double_cavity = False
+        mat, cav = dataset.split('_')
+        csv_path_1 = str(BASE_DIR / f'data/DATA_{mat}_P{cav}_W.csv')
+        csv_path_2 = None
+        print(f"\nUsing {dataset} dataset\n")
     else:
-        raise ValueError(f"Unknown dataset '{dataset}' in config. Choose 'PP' or 'ABS'.")
+        raise ValueError(f"Unknown dataset '{dataset}'. Choose PP, ABS, PP_1, PP_2, ABS_1, or ABS_2.")
+
+    OUT_DIR = BASE_DIR / f'outputs/BC/MLP/{dataset}'
+    (OUT_DIR / 'models').mkdir(parents=True, exist_ok=True)
+    (OUT_DIR / 'images').mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {OUT_DIR}")
+
+    train_csv_path = str(OUT_DIR / 'train_data.csv')
+    test_csv_path  = str(OUT_DIR / 'test_data.csv')
 
     start_time = time.time()
 
-    # Read data
-    df_1 = pd.read_csv(csv_path_1)
-    df_2 = pd.read_csv(csv_path_2)
-    
-    # Check if both datasets have 'shot' column
-    if 'shot' not in df_1.columns or 'shot' not in df_2.columns:
-        raise ValueError("Both datasets must have 'shot' column for synchronized splitting")
-    
-    print(f"Dataset P1: {len(df_1)} samples")
-    print(f"Dataset P2: {len(df_2)} samples")
+    if double_cavity:
+        process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path)
+    else:
+        process_single_cavity_dataset(csv_path_1, train_csv_path, test_csv_path)
 
-    # Detect outliers in both datasets
-    outliers_p1 = detect_outliers_iqr(df_1['Product weight g'])
-    outliers_p2 = detect_outliers_iqr(df_2['Product weight g'])
-
-    print(f"Dataset P1 - Outliers detected: {outliers_p1.sum()}")
-    print(f"Dataset P2 - Outliers detected: {outliers_p2.sum()}")
-
-    # Remove outliers from both datasets just for statistics computation
-    df_1_clean = df_1[~outliers_p1].reset_index(drop=True)
-    df_2_clean = df_2[~outliers_p2].reset_index(drop=True)
-
-    # Compute statistics for clean dataset 1 (P1)
-    mean_w_clean_1 = df_1_clean['Product weight g'].mean()
-    std_dev_w_clean_1 = df_1_clean['Product weight g'].std()
-    print(f"Dataset P1 (clean from outlayers) - Product weight g: mean={mean_w_clean_1:.4f}, std={std_dev_w_clean_1:.4f}")
-
-    # Compute statistics for clean dataset 2 (P2)
-    mean_w_clean_2 = df_2_clean['Product weight g'].mean()
-    std_dev_w_clean_2 = df_2_clean['Product weight g'].std()
-    print(f"Dataset P2 (clean from outlayers) - Product weight g: mean={mean_w_clean_2:.4f}, std={std_dev_w_clean_2:.4f}")
-
-    # Create Product_Goodness column for dataset 1 (P1) using its own statistics
-    df_1['Product_Goodness'] = (
-        (df_1['Product weight g'] >= mean_w_clean_1 - std_dev_w_clean_1) & 
-        (df_1['Product weight g'] <= mean_w_clean_1 + std_dev_w_clean_1)
-    ).astype(int)
-    
-    # Create Product_Goodness column for dataset 2 (P2) using its own statistics
-    df_2['Product_Goodness'] = (
-        (df_2['Product weight g'] >= mean_w_clean_2 - std_dev_w_clean_2) & 
-        (df_2['Product weight g'] <= mean_w_clean_2 + std_dev_w_clean_2)
-    ).astype(int)
-    
-    print(f"Created 'Product_Goodness' column for both datasets based on their own statistics")
-
-    # Compute percentage of good and bad parts and % of bad outlayers for both datasets
-    print("\n=== Labeling Statistics ===")
-    print(f"P1 - Total samples: {len(df_1)}, Good: {df_1['Product_Goodness'].sum()}, Bad: {(df_1['Product_Goodness'] == 0).sum()}")
-    print(f"P1 - Outliers that are labeled as BAD: {(outliers_p1 & (df_1['Product_Goodness'] == 0)).sum()} / {outliers_p1.sum()}")
-    print(f"P2 - Total samples: {len(df_2)}, Good: {df_2['Product_Goodness'].sum()}, Bad: {(df_2['Product_Goodness'] == 0).sum()}")
-    print(f"P2 - Outliers that are labeled as BAD: {(outliers_p2 & (df_2['Product_Goodness'] == 0)).sum()} / {outliers_p2.sum()}")
-    
-    # Drop Product weight g column from both datasets (but KEEP 'shot' column for grouping)
-    df_1 = df_1.drop(columns=['Product weight g'])
-    df_2 = df_2.drop(columns=['Product weight g'])
-    
-    print(f"Removed 'Product weight g' columns from both datasets (kept 'shot' for group-based CV)")
-    
-    # Split shot numbers into train and test (80/20)
-    unique_shots = df_1['shot'].unique()
-    np.random.seed(41)
-    shuffled_shots = np.random.permutation(unique_shots)
-    split_idx = int(len(shuffled_shots) * 0.8)
-    train_shots = shuffled_shots[:split_idx]
-    test_shots = shuffled_shots[split_idx:]
-    print(f"Train shots: {len(train_shots)}, Test shots: {len(test_shots)}")
-
-    # Split df_1 based on shot numbers
-    Data_train_df_1 = df_1[df_1['shot'].isin(train_shots)].copy()
-    Data_test_df_1 = df_1[df_1['shot'].isin(test_shots)].copy()
-
-    print(f"Dataset P1 - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
-    
-    # Split df_2 based on shot numbers
-    Data_train_df_2 = df_2[df_2['shot'].isin(train_shots)].copy()
-    Data_test_df_2 = df_2[df_2['shot'].isin(test_shots)].copy()
-    
-    print(f"Dataset P2 - Train: {len(Data_train_df_2)} samples, Test: {len(Data_test_df_2)} samples")
-    
-    # Combine train datasets from P1 and P2
-    Data_train_combined = pd.concat([Data_train_df_1, Data_train_df_2], axis=0, ignore_index=True)
-    
-    # Combine test datasets from P1 and P2
-    Data_test_combined = pd.concat([Data_test_df_1, Data_test_df_2], axis=0, ignore_index=True)
-    
-    print(f"Combined - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
-    
-    # Compute percentage of 0s in Product_Goodness column for train/test
-    train_zero_pct = (Data_train_combined['Product_Goodness'] == 0).sum() / len(Data_train_combined) * 100
-    test_zero_pct = (Data_test_combined['Product_Goodness'] == 0).sum() / len(Data_test_combined) * 100
-    
-    print(f"Percentage of 0s in Product_Goodness - Train: {train_zero_pct:.2f}%, Test: {test_zero_pct:.2f}%")
-    
-    # Shuffle but keep shot groups together (shuffle at shot level, not row level)
-    train_shots_order = Data_train_combined['shot'].unique()
-    np.random.seed(42)
-    np.random.shuffle(train_shots_order)
-    Data_train_combined = Data_train_combined.set_index('shot').loc[train_shots_order].reset_index()
-    
-    test_shots_order = Data_test_combined['shot'].unique()
-    np.random.seed(42)
-    np.random.shuffle(test_shots_order)
-    Data_test_combined = Data_test_combined.set_index('shot').loc[test_shots_order].reset_index()
-
-    print(f"Shuffled datasets (preserving shot groups) - Train: {len(Data_train_combined)} samples, Test: {len(Data_test_combined)} samples")
-
-    # print(f"Shuffled datasets - Train: {len(Data_train_df_1)} samples, Test: {len(Data_test_df_1)} samples")
-    
-    # Save combined datasets
-    Data_train_combined.to_csv(train_csv_path, index=False)
-    Data_test_combined.to_csv(test_csv_path, index=False)
-    print(f"Saved combined train and test datasets to {train_csv_path} and {test_csv_path}")
-    # print(Data_train_combined, Data_test_combined)
-
-    # # Save individual datasets
-    # Data_train_df_1.to_csv(train_csv_path, index=False)
-    # Data_test_df_1.to_csv(test_csv_path, index=False)
-    # print(f"Saved individual train and test datasets to {train_csv_path} and {test_csv_path}")
-    # # print(Data_train_df, Data_test_df)
-
-    # # Compute Mutual Information (MI) Scores for each feature in train data only
-    # X_train_mi = Data_train_df.iloc[:, :-1].values
-    # y_train_mi = Data_train_df.iloc[:, -1].values
-    # MI_scores = mutual_info_classif(X_train_mi, y_train_mi, random_state=42)
-    # for i, score in enumerate(MI_scores):
-    #     print(f"Feature {i}: MI Score = {score:.4f}")
-    # plt.figure(figsize=(10, 6))
-    # plt.bar(range(len(MI_scores)), MI_scores, color='skyblue')
-    # plt.xlabel('Feature Index')
-    # plt.ylabel('Mutual Information Score')
-    # plt.title('Mutual Information Scores for Features')
-    # plt.xticks(range(len(MI_scores)), df.columns[:-1], rotation=45, ha='right')
-    # plt.tight_layout()
-    # plt.savefig("outputs/BC/images/mi_scores.png")
-    # plt.show()
-    
-    # # Run HPO otpimization with RS sampler and MedianPruner
-    # print(f"\nStarting RS optimization...\n")
-    # sampler = optuna.samplers.RandomSampler(seed=42)  # Use RandomSampler for simplicity
-    # # pruner = optuna.pruners.MedianPruner(n_warmup_steps=1, n_startup_trials=10)
-    # pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
-    # best_trial_rs = run_optimization(sampler, pruner, train_csv_path, n_trials=40)
-
-    # Run HPO otpimization with TPE sampler and HyperbandPruner
+    # Run HPO optimisation with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
-    optuna_trials = cfg.get('optuna_trials', {})
+    optuna_trials    = cfg.get('optuna_trials', {})
     n_startup_trials = optuna_trials.get('n_startup_trials', 10)
-    n_trials = optuna_trials.get('tot_trials', 100)
+    n_trials         = optuna_trials.get('tot_trials', 100)
     print(f"Total Optuna trials: {n_trials} (with {n_startup_trials} startup trials for RS)")
-    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
-    pruner = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
+    sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42)
+    pruner  = optuna.pruners.HyperbandPruner(min_resource=1, max_resource=80, reduction_factor=3)
     best_trial_tpe = run_optimization(sampler, pruner, train_csv_path, n_trials=n_trials, n_startup_trials=n_startup_trials, hparam_cfg=cfg)
 
     # Retrain the best models

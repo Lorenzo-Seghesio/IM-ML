@@ -1,0 +1,21 @@
+{
+    "model_name": "TPE",
+    "opt_metric": "mae",
+    "opt_score": 0.008751379816872826,
+    "mae": 0.008751379816872826,
+    "rmse": 0.010790655005475536,
+    "r2": 0.9965088115088299,
+    "mape": 0.06061672810024345,
+    "max_error": 0.028244113159178852,
+    "timestamp": "2026-03-24 12:40:21",
+    "hyperparameters": {
+        "lr": 0.0020505928597030587,
+        "dropout": 0.046183108997977916,
+        "weight_decay": 0.009481269439927765,
+        "n_layers": 1,
+        "size_layer0": 18
+    },
+    "train_samples": 440,
+    "test_samples": 112,
+    "n_features": 16
+}

@@ -30,9 +30,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent  # project root (works from an
 OUT_DIR = BASE_DIR / 'outputs/Reg'
 
 # Global variables
-best_mae_global = float('inf')
+best_metric_global = float('inf')
 best_model_global = None
-best_mae_RS_global = float('inf')
+best_metric_RS_global = float('inf')
 best_model_RS_global = None
 best_params_RS_global = None
 
@@ -87,7 +87,7 @@ def load_dataset(csv_path, return_groups=False):
     df = pd.read_csv(csv_path)
     
     target_col = 'Product weight g'
-    drop_cols = [c for c in ['shot', target_col] if c in df.columns]
+    drop_cols = [c for c in ['shot', 'cavity', target_col] if c in df.columns]
 
     # Check if 'shot' column exists for grouping
     if 'shot' in df.columns and return_groups:
@@ -156,7 +156,7 @@ def detect_outliers_iqr(series, multiplier=1.5):
 
 
 # === Training Function ===
-def train_one_fold_test(model, train_loader, val_loader, device, criterion, optimizer, patience=5, max_epochs=100, plot_metrics=False, print_early_stopping=False, fold=0, sampler=""):
+def train_one_fold_test(model, train_loader, val_loader, device, criterion, optimizer, patience=5, max_epochs=100, plot_metrics=False, print_early_stopping=False, fold=0, sampler="", opt_metric='mae'):
     
     early_stopping = EarlyStopping(patience)
 
@@ -198,7 +198,7 @@ def train_one_fold_test(model, train_loader, val_loader, device, criterion, opti
         r2 = r2_score(all_targets, all_preds)
         val_r2_scores.append(r2)
 
-        early_stopping(-avg_val_loss, model)
+        early_stopping(-compute_optuna_metric(all_targets, all_preds, opt_metric), model)
         if early_stopping.early_stop:
             if print_early_stopping:
                 print(f"Early stopping at epoch {epoch + 1}")
@@ -239,7 +239,7 @@ def train_one_fold_test(model, train_loader, val_loader, device, criterion, opti
 
 
 # === Training Function ===
-def train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optimizer, patience=5, max_epochs=100):
+def train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optimizer, patience=5, max_epochs=100, opt_metric='mae'):
     
     early_stopping = EarlyStopping(patience)
 
@@ -256,16 +256,16 @@ def train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optim
 
         # Validation
         model.eval()
-        epoch_val_loss = 0
+        all_preds, all_targets = [], []
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 outputs = model(xb)
-                epoch_val_loss += criterion(outputs, yb).item()
+                all_preds.extend(outputs.cpu().numpy().flatten())
+                all_targets.extend(yb.cpu().numpy().flatten())
 
-        avg_val_loss = epoch_val_loss / len(val_loader)
-
-        early_stopping(-avg_val_loss, model)
+        # Early stopping: negate optuna metric so higher score = better model
+        early_stopping(-compute_optuna_metric(all_targets, all_preds, opt_metric), model)
         if early_stopping.early_stop:
             break
 
@@ -274,32 +274,46 @@ def train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optim
     return model
 
 
+# === Optimization metric helper ===
+# All metrics are returned as a value to MINIMIZE (lower = better).
+# R2 is stored as 1-R2 so it also follows "lower is better".
+VALID_OPT_METRICS = ['mae', 'rmse', 'r2', 'mape', 'max_error']
+
+def compute_optuna_metric(y_true, y_pred, metric):
+    """Returns a value to MINIMIZE. Lower = better for all. R2 → 1-R2."""
+    y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
+    if metric == 'mae':
+        return float(mean_absolute_error(y_true, y_pred))
+    elif metric == 'rmse':
+        return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    elif metric == 'r2':
+        return float(1.0 - r2_score(y_true, y_pred))
+    elif metric == 'mape':
+        return float(np.mean(np.abs((y_true - y_pred) / np.clip(np.abs(y_true), 1e-8, None))) * 100)
+    elif metric == 'max_error':
+        return float(np.max(np.abs(y_true - y_pred)))
+    else:
+        raise ValueError(f"Unknown opt_metric '{metric}'. Choose from {VALID_OPT_METRICS}")
+
+
 # === Evaluate Model ===
 def evaluate_model(model, loader, device, metric='mae'):
-    if metric not in ['mae', 'rmse', 'r2']:
-        raise ValueError("Metric must be 'mae' or 'rmse' or 'r2'")
+    """Run inference on a DataLoader and return the Optuna-minimize metric (lower = better; R2 → 1-R2)."""
+    if metric not in VALID_OPT_METRICS:
+        raise ValueError(f"metric must be one of {VALID_OPT_METRICS}")
     model.eval()
-    all_preds, all_probs, all_labels = [], [], []
+    all_preds, all_labels = [], []
     with torch.no_grad():
         for inputs, labels in loader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             all_preds.extend(outputs.cpu().numpy().flatten())
             all_labels.extend(labels.cpu().numpy().flatten())
-    if metric == 'mae':
-        mae = mean_absolute_error(all_labels, all_preds)
-        return mae
-    elif metric == 'rmse':
-        rmse = mean_squared_error(all_labels, all_preds, squared=False)
-        return rmse
-    elif metric == 'r2':
-        r2 = r2_score(all_labels, all_preds)
-        return r2
-    return None
+    return compute_optuna_metric(all_labels, all_preds, metric)
 
 
 # === Save Best Overall Model ===
-def save_best_overall_model(model, model_name, mae, rmse, r2, mape, max_error, X_train, y_train, X_test, y_test, params):
+def save_best_overall_model(model, model_name, mae, rmse, r2, mape, max_error, X_train, y_train, X_test, y_test, params, opt_metric='mae'):
     """
     Save the best overall model with its metadata, data, and hyperparameters.
     Only saves if the current model is better than the previously saved one.
@@ -322,19 +336,23 @@ def save_best_overall_model(model, model_name, mae, rmse, r2, mape, max_error, X
     best_model_dir = str(OUT_DIR / 'models/best_model_overall')
     metadata_file = os.path.join(best_model_dir, 'metadata.json')
     
+    # Map all metrics to an optuna score (always lower = better; R2 → 1-R2)
+    _scores = {'mae': mae, 'rmse': rmse, 'r2': 1.0 - r2, 'mape': mape, 'max_error': max_error}
+    curr_score = _scores[opt_metric]
+
     # Check if there's a previous best model
     should_save = True
     if os.path.exists(metadata_file):
         with open(metadata_file, 'r') as f:
             prev_metadata = json.load(f)
         
-        prev_mae = prev_metadata['mae']
+        prev_score = prev_metadata.get('opt_score', prev_metadata.get('mae'))
         
-        print(f"\n=== Comparing with previous best model ===")
-        print(f"Previous best: {prev_metadata['model_name']} - MAE: {prev_mae:.4f}, RMSE: {prev_metadata['rmse']:.4f}, R²: {prev_metadata['r2']:.4f}")
-        print(f"Current model: {model_name} - MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}")
+        print(f"\n=== Comparing with previous best model ({opt_metric.upper()}) ===")
+        print(f"Previous best: {prev_metadata['model_name']} - {opt_metric.upper()}: {prev_score:.4f}")
+        print(f"Current model: {model_name} - {opt_metric.upper()}: {curr_score:.4f}")
         
-        if mae >= prev_mae:
+        if curr_score >= prev_score:
             print(f"Current model is not better than previous best. Not saving.")
             should_save = False
         else:
@@ -366,6 +384,8 @@ def save_best_overall_model(model, model_name, mae, rmse, r2, mape, max_error, X
         # Save metadata
         metadata = {
             'model_name': model_name,
+            'opt_metric': opt_metric,
+            'opt_score': float(curr_score),
             'mae': float(mae),
             'rmse': float(rmse),
             'r2': float(r2),
@@ -410,25 +430,30 @@ def save_best_overall_model(model, model_name, mae, rmse, r2, mape, max_error, X
     return should_save
 
 # === Evaluate Model and plot results ===
-def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_path=None):
+def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_path=None,
+                               y_mean=0.0, y_std=1.0):
     """
     Evaluate regression models and create visualizations.
-    
+
     Parameters:
     - model_tp: TPE optimized model
     - model_rs: Random search optimized model
     - X_test: test features
-    - y_test: test targets
+    - y_test: normalised test targets (pass y_mean/y_std to recover original scale)
     - device: torch device
+    - y_mean, y_std: target normalisation parameters; predictions are inverse-transformed before metrics
     - save_path: path to save comparison plot
-    
+
     Returns:
-    - Dictionary with metrics for both models
+    - Dictionary with metrics for both models (all in original scale)
     """
     # Evaluate model_tp
     model_tp.eval()
     with torch.no_grad():
         y_pred_tp = model_tp(torch.tensor(X_test, dtype=torch.float32).to(device)).cpu().numpy().flatten()
+    # Inverse-transform to original scale
+    y_pred_tp = y_pred_tp * y_std + y_mean
+    y_test    = y_test * y_std + y_mean  # rebind once — all subsequent code uses original-scale values
 
     mae_tp = mean_absolute_error(y_test, y_pred_tp)
     rmse_tp = np.sqrt(mean_squared_error(y_test, y_pred_tp))
@@ -447,6 +472,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     model_rs.eval()
     with torch.no_grad():
         y_pred_rs = model_rs(torch.tensor(X_test, dtype=torch.float32).to(device)).cpu().numpy().flatten()
+    y_pred_rs = y_pred_rs * y_std + y_mean  # inverse-transform
 
     mae_rs = mean_absolute_error(y_test, y_pred_rs)
     rmse_rs = np.sqrt(mean_squared_error(y_test, y_pred_rs))
@@ -618,16 +644,17 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
 
 # === Objective Function ===
 def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hparam_cfg=None):
-    global best_mae_global
+    global best_metric_global
     global best_model_global
-    global best_mae_RS_global
+    global best_metric_RS_global
     global best_model_RS_global
     global best_params_RS_global
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     X, y, groups = load_dataset(csv_path, return_groups=True)
-    
+    # y is normalised per fold inside the loop (train-fold stats only applied to val).
+
     # Use GroupKFold if groups are available, otherwise use KFold
     if groups is not None:
         skf = GroupKFold(n_splits=5)
@@ -635,7 +662,7 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
         skf = KFold(n_splits=5, shuffle=True, random_state=42)
 
     hp = (hparam_cfg or {}).get('hyperparameters', {})
-
+    opt_metric = (hparam_cfg or {}).get('opt_metric', 'mae')
     # Hyperparameters — scalar in config → fixed; [min, max] → optimized by Optuna
     lr_cfg = hp.get('lr', [1e-5, 1e-2])
     lr = trial.suggest_float("lr", lr_cfg[0], lr_cfg[1], log=True) if isinstance(lr_cfg, list) else float(lr_cfg)
@@ -678,8 +705,8 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
             neuron_max_limit = size_layer
             layers_dim.append(size_layer)
 
-    mae_values = []
-    best_mae = float('inf')
+    metric_values = []
+    best_metric = float('inf')
     best_model = None
 
     # Split with groups if available
@@ -690,7 +717,12 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
     
     for fold, (train_idx, val_idx) in enumerate(fold_iterator):
         X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
+        y_train_raw, y_val_raw = y[train_idx], y[val_idx]
+        # Normalise target using train-fold statistics only (no leakage from val)
+        _y_mean = float(y_train_raw.mean())
+        _y_std  = max(float(y_train_raw.std()), 1e-8)
+        y_train = (y_train_raw - _y_mean) / _y_std
+        y_val   = (y_val_raw   - _y_mean) / _y_std
 
         train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                  torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
@@ -701,46 +733,46 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
         val_loader = DataLoader(val_ds, batch_size=batch_size)
 
         model = MLPRegression(input_size=X.shape[1], layers_dim=layers_dim, dropout=dropout).to(device)
-        # Initialize using training fold positive prior
-        init_weights_with_prior(model, pos_prior=float(y_train.mean()))
-        criterion = nn.L1Loss()
+        init_weights_with_prior(model, pos_prior=0.0)  # y is normalised → output bias starts at 0
+        criterion = nn.MSELoss()  # MSE penalises deviations from the trend; L1 predicts the median # TODO: Check if using MSE is better than using L1
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         # Train
-        model = train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optimizer)
+        model = train_one_fold_hpo(model, train_loader, val_loader, device, criterion, optimizer, opt_metric=opt_metric)
 
         # Evaluate
-        mae_value = evaluate_model(model, val_loader, device, 'mae')
-        mae_values.append(mae_value)
+        metric_value = evaluate_model(model, val_loader, device, opt_metric)
+        metric_values.append(metric_value)
 
-        if mae_value < best_mae:
-            best_mae = mae_value
+        if metric_value < best_metric:
+            best_metric = metric_value
             best_model = model
         
-        trial.report(np.mean(mae_values), fold)
+        trial.report(np.mean(metric_values), fold)
 
         if trial.should_prune():
             raise optuna.TrialPruned()
 
-    mae_mean = np.mean(mae_values)
+    metric_mean = np.mean(metric_values)
 
     if best_model is not None:
-        if best_model_global is None or mae_mean < best_mae_global:
-            best_mae_global = mae_mean
+        if best_model_global is None or metric_mean < best_metric_global:
+            best_metric_global = metric_mean
             best_model_global = best_model
-            torch.save(best_model_global.state_dict(), str(OUT_DIR / "models/best_model_MAE_global.pt"))
+            torch.save(best_model_global.state_dict(), str(OUT_DIR / f"models/best_model_{opt_metric.upper()}_global.pt"))
             if (sampler == "TPESampler") and (trial.number < n_startup_trials):
-                    best_mae_RS_global = best_mae_global
+                    best_metric_RS_global = best_metric_global
                     best_model_RS_global = best_model_global
                     best_params_RS_global = trial.params  # Store the TRIAL parameters (hyperparameters), not model weights
-                    torch.save(best_model_RS_global.state_dict(), str(OUT_DIR / "models/best_model_MAE_RS.pt"))
+                    torch.save(best_model_RS_global.state_dict(), str(OUT_DIR / f"models/best_model_{opt_metric.upper()}_RS.pt"))
 
-    return mae_mean
+    return metric_mean
 
 
 # === Retrain Final Model ===
 def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=str(BASE_DIR / 'data/IM_Data_Train.csv'), csv_path_test=str(BASE_DIR / 'data/IM_Data_Test.csv'), hparam_cfg=None):
     hp = (hparam_cfg or {}).get('hyperparameters', {})
+    opt_metric = (hparam_cfg or {}).get('opt_metric', 'mae')
     # hyperparameters: use trial value if optimized (present in params), else config/default
     lr_tp = params_tpe.get('lr', 1e-3) if isinstance(hp.get('lr'), list) else hp.get('lr', 1e-3)
     dropout_tp = params_tpe.get('dropout', 0.2) if isinstance(hp.get('dropout'), list) else hp.get('dropout', 0.2)
@@ -759,6 +791,15 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     # Train data
     X_train, y_train, groups = load_dataset(csv_path_train, return_groups=True)
     print(f"The Data has {X_train.shape[0]} samples and {X_train.shape[1]} features.")
+    # Normalise target using training set statistics — prevents the MLP from collapsing to
+    # predicting the mean when target variance is small relative to the mean.
+    y_mean_train = float(y_train.mean())
+    y_std_train  = max(float(y_train.std()), 1e-8)
+    cv_pct = y_std_train / abs(y_mean_train) * 100
+    print(f"Target — mean: {y_mean_train:.4f} g, std: {y_std_train:.4f} g, CV: {cv_pct:.2f}%")
+    if cv_pct < 1.0:
+        print("  [!] Low variance target (CV < 1%). Setting opt_metric='r2' in config is strongly recommended.")
+    y_train_n = (y_train - y_mean_train) / y_std_train
 
     # Use GroupKFold if groups are available, otherwise use KFold
     if groups is not None:
@@ -768,17 +809,17 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         skf = KFold(n_splits=5, shuffle=True, random_state=42)
         print(f"Using KFold (no shot grouping available)")
 
-    mae_values_tp = []
-    best_mae_tp = float('inf')
+    metric_values_tp = []
+    best_metric_tp = float('inf')
     best_model_tp = None
     best_val_loader_tp = None
 
-    mae_values_rs = []
-    best_mae_rs = float('inf')
+    metric_values_rs = []
+    best_metric_rs = float('inf')
     best_model_rs = None
     best_val_loader_rs = None
 
-    # In final training I increase the patience of the early stopping to 20 and the numkber of epochs to 200
+    # In final training I increase the patience of the early stopping to 20 and the number of epochs to 200
     early_stopping_patience = 20
     num_epochs = 200
 
@@ -793,18 +834,18 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         # Initialize models for each fold
         # TPE
         model_tp = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout_tp).to(device)
-        criterion_tp = nn.L1Loss()
+        criterion_tp = nn.MSELoss() # TODO: Check if using MSE is better than using L1
         optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=lr_tp, weight_decay=weight_decay_tp)
-        init_weights_with_prior(model_tp, pos_prior=float(y_train.mean()))
+        init_weights_with_prior(model_tp, pos_prior=0.0)  # y is normalised
         #RS
         model_rs = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout_rs).to(device)
-        criterion_rs = nn.L1Loss()
+        criterion_rs = nn.MSELoss()
         optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=lr_rs, weight_decay=weight_decay_rs)
-        init_weights_with_prior(model_rs, pos_prior=float(y_train.mean()))
+        init_weights_with_prior(model_rs, pos_prior=0.0)
 
         # Prepare data loaders
         X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
-        y_train_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+        y_train_fold, y_val_fold = y_train_n[train_idx], y_train_n[val_idx]  # use normalised targets
 
         train_ds = TensorDataset(torch.tensor(X_train_fold, dtype=torch.float32),
                                  torch.tensor(y_train_fold, dtype=torch.float32).unsqueeze(1))
@@ -818,48 +859,53 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         val_loader_rs = DataLoader(val_ds, batch_size=batch_size_rs)
 
         # Train TP and RS
-        model_tp = train_one_fold_test(model_tp, train_loader_tpe, val_loader_tpe, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE")
-        model_rs = train_one_fold_test(model_rs, train_loader_rs, val_loader_rs, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS")
+        model_tp = train_one_fold_test(model_tp, train_loader_tpe, val_loader_tpe, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE", opt_metric=opt_metric)
+        model_rs = train_one_fold_test(model_rs, train_loader_rs, val_loader_rs, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS", opt_metric=opt_metric)
 
         # Evaluate TP
-        mae_tp = evaluate_model(model_tp, val_loader_tpe, device, 'mae')
-        mae_values_tp.append(mae_tp)
-        if mae_tp < best_mae_tp:
-            best_mae_tp = mae_tp
+        metric_tp = evaluate_model(model_tp, val_loader_tpe, device, opt_metric)
+        metric_values_tp.append(metric_tp)
+        if metric_tp < best_metric_tp:
+            best_metric_tp = metric_tp
             best_model_tp = model_tp
             best_val_loader_tp = val_loader_tpe
 
         # Evaluate RS
-        mae_rs = evaluate_model(model_rs, val_loader_rs, device, 'mae')
-        mae_values_rs.append(mae_rs)
-        if mae_rs < best_mae_rs:
-            best_mae_rs = mae_rs
+        metric_rs = evaluate_model(model_rs, val_loader_rs, device, opt_metric)
+        metric_values_rs.append(metric_rs)
+        if metric_rs < best_metric_rs:
+            best_metric_rs = metric_rs
             best_model_rs = model_rs
             best_val_loader_rs = val_loader_rs
 
-    print(f"\nTP: Best MAE across folds: {best_mae_tp:.4f} and mean MAE: {np.mean(mae_values_tp):.4f}, after {len(mae_values_tp)} folds.")
-    print(f"RS: Best MAE across folds: {best_mae_rs:.4f} and mean MAE: {np.mean(mae_values_rs):.4f}, after {len(mae_values_rs)} folds.")
+    metric_label = opt_metric.upper()
+    print(f"\nTP: Best {metric_label} across folds: {best_metric_tp:.4f} and mean {metric_label}: {np.mean(metric_values_tp):.4f}, after {len(metric_values_tp)} folds.")
+    print(f"RS: Best {metric_label} across folds: {best_metric_rs:.4f} and mean {metric_label}: {np.mean(metric_values_rs):.4f}, after {len(metric_values_rs)} folds.")
+    if opt_metric in ('mae', 'rmse', 'max_error'):
+        print(f"  (fold {metric_label} is in normalised units; multiply by {y_std_train:.4f} to convert to grams)")
 
-    torch.save(best_model_tp.state_dict(), str(OUT_DIR / "models/best_model_MAE_TP.pt"))
-    torch.save(best_model_rs.state_dict(), str(OUT_DIR / "models/best_model_MAE_RS.pt"))
+    torch.save(best_model_tp.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_TP.pt"))
+    torch.save(best_model_rs.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_RS.pt"))
 
     # Model evaluation
     print(f"\n=== Final Test Set Evaluation ===")
     # Load test data (with return_groups=True to remove 'shot' column)
     X_test, y_test, _ = load_dataset(csv_path_test, return_groups=True)
-    metrics = evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test, device=device)
-    
-    # Determine which model is better (based on MAE - lower is better)
-    mae_tp = metrics['tp']['mae']
-    mae_rs = metrics['rs']['mae']
-    
-    print(f"\n=== Final Model Comparison ===")
-    print(f"TPE Model - MAE: {mae_tp:.4f}, RMSE: {metrics['tp']['rmse']:.4f}, R²: {metrics['tp']['r2']:.4f}")
-    print(f"RS Model  - MAE: {mae_rs:.4f}, RMSE: {metrics['rs']['rmse']:.4f}, R²: {metrics['rs']['r2']:.4f}")
-    
+    # Normalise test targets with TRAINING statistics (no data leakage)
+    y_test_n = (y_test - y_mean_train) / y_std_train
+    metrics = evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test_n, device=device,
+                                        y_mean=y_mean_train, y_std=y_std_train)
+
+    tp_opt_val = (1 - metrics['tp']['r2']) if opt_metric == 'r2' else metrics['tp'][opt_metric]
+    rs_opt_val = (1 - metrics['rs']['r2']) if opt_metric == 'r2' else metrics['rs'][opt_metric]
+
+    print(f"\n=== Final Model Comparison (opt_metric={opt_metric}) ===")
+    print(f"TPE Model - MAE: {metrics['tp']['mae']:.4f}, RMSE: {metrics['tp']['rmse']:.4f}, R²: {metrics['tp']['r2']:.4f}")
+    print(f"RS Model  - MAE: {metrics['rs']['mae']:.4f}, RMSE: {metrics['rs']['rmse']:.4f}, R²: {metrics['rs']['r2']:.4f}")
+
     # Save the better model as best overall
-    if mae_tp <= mae_rs:
-        print(f"\nTPE model performs better (lower MAE). Checking if it should be saved as best overall...")
+    if tp_opt_val <= rs_opt_val:
+        print(f"\nTPE model performs better ({opt_metric.upper()}: {tp_opt_val:.4f}). Checking if it should be saved as best overall...")
         save_best_overall_model(
             model=best_model_tp,
             model_name='TPE',
@@ -872,10 +918,11 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
             y_train=y_train,
             X_test=X_test,
             y_test=y_test,
-            params=params_tpe
+            params=params_tpe,
+            opt_metric=opt_metric
         )
     else:
-        print(f"\nRS model performs better (lower MAE). Checking if it should be saved as best overall...")
+        print(f"\nRS model performs better ({opt_metric.upper()}: {rs_opt_val:.4f}). Checking if it should be saved as best overall...")
         save_best_overall_model(
             model=best_model_rs,
             model_name='RS',
@@ -888,19 +935,27 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
             y_train=y_train,
             X_test=X_test,
             y_test=y_test,
-            params=params_rs
+            params=params_rs,
+            opt_metric=opt_metric
         )
+
+    # Per-cavity evaluation on the best (winning) model only
+    best_winner = best_model_tp if tp_opt_val <= rs_opt_val else best_model_rs
+    winner_name = 'TPE' if tp_opt_val <= rs_opt_val else 'RS'
+    _report_per_cavity_metrics(best_winner, winner_name, csv_path_test, device,
+                               y_mean=y_mean_train, y_std=y_std_train)
 
 
 # === Run Optuna Optimization ===
 def run_optimization(sampler, pruner, csv_path, n_trials=100, n_startup_trials=10, hparam_cfg=None):
-    global best_mae_RS_global
+    global best_metric_RS_global
     global best_model_RS_global
     global best_params_RS_global
     
     study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner)
     study.optimize(lambda trial: objective(trial, csv_path=csv_path, n_startup_trials=n_startup_trials, sampler=sampler.__class__.__name__, hparam_cfg=hparam_cfg), n_trials=n_trials, timeout=3600)
 
+    opt_metric = (hparam_cfg or {}).get('opt_metric', 'mae')
     # Best trial overall (hoping is TPE)
     if sampler.__class__.__name__ == "TPESampler":
         print("\n=== Best model TPE - after initial {} RS and {} TPE trials ===".format(n_startup_trials, (n_trials - n_startup_trials)))
@@ -908,14 +963,17 @@ def run_optimization(sampler, pruner, csv_path, n_trials=100, n_startup_trials=1
         print("\n=== RandomSampler ===")
     print("Best trial:")
     trial = study.best_trial
-    print(f"  MAE: {trial.value:.4f}")
+    if opt_metric.upper() == 'R2':
+        print(f"  {opt_metric.upper()}: {1 - trial.value:.4f}")
+    else:
+        print(f"  {opt_metric.upper()}: {trial.value:.4f}")
     for key, value in trial.params.items():
         print(f"  {key}: {value}")
 
     # If TPE optimizer, Best trial RS
     if (sampler.__class__.__name__ == "TPESampler") and (n_startup_trials > 0) and (best_params_RS_global is not None):
             print("\n=== Best model RS - found with initial {} RS trials ===".format(n_startup_trials))
-            print(f"  MAE: {best_mae_RS_global:.4f}")
+            print(f"  {opt_metric.upper()}: {best_metric_RS_global:.4f}")
             for key, value in best_params_RS_global.items():
                 print(f"  {key}: {value}")
 
@@ -933,6 +991,46 @@ def run_optimization(sampler, pruner, csv_path, n_trials=100, n_startup_trials=1
     # plt.show()
 
     return trial
+
+# === Per-Cavity Metrics (double-cavity datasets only) ===
+def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, y_mean=0.0, y_std=1.0):
+    """Print per-cavity regression metrics and scatter plot for the best model only.
+    No-op when test CSV has no 'cavity' column (single-cavity datasets).
+    y_mean/y_std: target normalisation parameters for inverse-transforming model outputs."""
+    df_raw = pd.read_csv(test_csv_path)
+    if 'cavity' not in df_raw.columns:
+        return
+    X_test, y_test, _ = load_dataset(test_csv_path, return_groups=True)
+    cavities = sorted(df_raw['cavity'].unique())
+    print("\n" + "="*55)
+    print(f"=== Per-Cavity Test Set Evaluation ({model_name}) ===")
+    fig, axes = plt.subplots(1, len(cavities), figsize=(6 * len(cavities), 5))
+    if len(cavities) == 1:
+        axes = [axes]
+    for ax, cav in zip(axes, cavities):
+        mask = (df_raw['cavity'] == cav).values
+        X_cav, y_cav = X_test[mask], y_test[mask]
+        best_model.eval()
+        with torch.no_grad():
+            y_pred = best_model(torch.tensor(X_cav, dtype=torch.float32).to(device)).cpu().numpy().flatten()
+        y_pred = y_pred * y_std + y_mean  # inverse-transform to original scale
+        mae  = float(mean_absolute_error(y_cav, y_pred))
+        rmse = float(np.sqrt(mean_squared_error(y_cav, y_pred)))
+        r2   = float(r2_score(y_cav, y_pred))
+        mape = float(np.mean(np.abs((y_cav - y_pred) / np.clip(np.abs(y_cav), 1e-8, None))) * 100)
+        print(f"\n--- Cavity {cav} ({mask.sum()} samples) ---")
+        print(f"  MAE: {mae:.4f}  RMSE: {rmse:.4f}  R\u00b2: {r2:.4f}  MAPE: {mape:.2f}%")
+        lims = [min(y_cav.min(), y_pred.min()), max(y_cav.max(), y_pred.max())]
+        ax.scatter(y_cav, y_pred, alpha=0.5, s=30)
+        ax.plot(lims, lims, 'r--', lw=2, label='Perfect prediction')
+        ax.set_xlabel('True Values'); ax.set_ylabel('Predictions')
+        ax.set_title(f'{model_name} \u2014 Cavity {cav}\nMAE={mae:.4f}, R\u00b2={r2:.4f}')
+        ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(OUT_DIR / f'images/per_cavity_scatter_{model_name}.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Per-cavity scatter plot saved: per_cavity_scatter_{model_name}.png")
+
 
 # === Process double cavity dataset ===
 def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_csv_path):
@@ -980,6 +1078,10 @@ def process_double_cavity_dataset(csv_path_1, csv_path_2, train_csv_path, test_c
     
     print(f"Dataset P2 - Train: {len(Data_train_df_2)} samples, Test: {len(Data_test_df_2)} samples")
     
+    # Add cavity labels before combining
+    Data_train_df_1['cavity'] = 'P1'; Data_test_df_1['cavity'] = 'P1'
+    Data_train_df_2['cavity'] = 'P2'; Data_test_df_2['cavity'] = 'P2'
+
     # Combine train datasets from P1 and P2
     Data_train_combined = pd.concat([Data_train_df_1, Data_train_df_2], axis=0, ignore_index=True)
     
@@ -1050,10 +1152,12 @@ def process_single_cavity_dataset(csv_path, train_csv_path, test_csv_path):
 if __name__ == "__main__":
     # Load config
     parser = argparse.ArgumentParser(description="Train a regression model.")
-    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/Reg_config.json'),
-                        help="Path to the JSON config file (default: config/Reg_config.json)")
+    parser.add_argument('--config', type=str, default=str(BASE_DIR / 'config/Reg_MLP_config.json'),
+                        help="Path to the JSON config file (default: config/Reg_MLP_config.json)")
     parser.add_argument('--dataset', type=str, choices=['pp', 'abs', 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', 'ABS_2', 'pp_1', 'pp_2', 'abs_1', 'abs_2'],
                         help="Dataset to use: pp (both 1 and 2 cavities), abs (both 1 and 2 cavities), pp_1, pp_2, abs_1, abs_2. Overrides the value in the config file.")
+    parser.add_argument('--opt_metric', type=str, choices=['mae', 'rmse', 'r2', 'mape', 'max_error'],
+                        help="Metric to optimize: mae, rmse, r2, mape, or max_error. Overrides the value in the config file.")
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
@@ -1062,7 +1166,13 @@ if __name__ == "__main__":
     # CLI --dataset overrides config value
     if args.dataset:
         cfg['dataset'] = args.dataset
-        print(f"\n[CLI override] dataset set to '{args.dataset.upper()}'")
+        print(f"\n[CLI override] dataset")
+
+    # CLI --opt_metric overrides config value
+    if args.opt_metric:
+        cfg['opt_metric'] = args.opt_metric
+        print(f"\n[CLI override] optimization metric")
+    print(f"\nOptimization metric: {cfg['opt_metric'].upper()}")
 
     dataset = cfg.get('dataset', 'ABS').upper()
     if dataset in ['PP', 'ABS']:
@@ -1094,7 +1204,7 @@ if __name__ == "__main__":
                          f"Choose 'PP', 'ABS', 'PP_1', 'PP_2', 'ABS_1', or 'ABS_2'.")
 
     # Set dataset-specific output directory and create subdirectories
-    OUT_DIR = BASE_DIR / f'outputs/Reg/{dataset}'
+    OUT_DIR = BASE_DIR / f'outputs/Reg/MLP/{dataset}'
     (OUT_DIR / 'models').mkdir(parents=True, exist_ok=True)
     (OUT_DIR / 'images').mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {OUT_DIR}")
@@ -1135,7 +1245,7 @@ if __name__ == "__main__":
     # Run HPO otpimization with TPE sampler and HyperbandPruner
     print(f"\nStarting TPE optimization...\n")
     optuna_trials = cfg.get('optuna_trials', {})
-    n_startup_trials = optuna_trials.get('n_startup_trials', 10)
+    n_startup_trials = optuna_trials.get('startup_trials', 10)
     n_trials = optuna_trials.get('tot_trials', 100)
     print(f"Total Optuna trials: {n_trials} (with {n_startup_trials} startup trials for RS)")
     sampler = optuna.samplers.TPESampler(n_startup_trials=n_startup_trials, seed=42) #(n_startup_trials=10, seed=31) # Here tried to add some startup trials
