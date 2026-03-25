@@ -83,7 +83,7 @@ class EarlyStopping:
 
 
 # === Data Loader ===
-def load_dataset(csv_path, return_groups=False):
+def load_dataset(csv_path, return_groups=False, return_cavity=False):
     df = pd.read_csv(csv_path)
     
     target_col = 'Product weight g'
@@ -95,14 +95,71 @@ def load_dataset(csv_path, return_groups=False):
     else:
         groups = None
 
+    # Extract cavity labels (from shot_position) BEFORE building X.
+    # shot_position stays as a feature in X so the model can learn the per-cavity offset.
+    if return_cavity:
+        cavity_labels = df['shot_position'].values if 'shot_position' in df.columns else None
+    
     y = df[target_col].values
     X = df.drop(columns=drop_cols).values
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
     
+    if return_groups and return_cavity:
+        return X, y, groups, cavity_labels
     if return_groups:
         return X, y, groups
+    if return_cavity:
+        return X, y, cavity_labels
     return X, y
+
+
+# === Per-cavity target normalisation helpers ===
+def _compute_cavity_stats(y, cavity_labels):
+    """Compute per-cavity (mean, std) from y.
+    Returns a dict {cavity_id: (mean, std)}.
+    Falls back to {None: (mean, std)} when cavity_labels is None or single-valued.
+    """
+    if cavity_labels is None or len(np.unique(cavity_labels)) <= 1:
+        return {None: (float(y.mean()), max(float(y.std()), 1e-8))}
+    stats = {}
+    for cav in np.unique(cavity_labels):
+        ys = y[cavity_labels == cav]
+        stats[int(cav)] = (float(ys.mean()), max(float(ys.std()), 1e-8))
+    return stats
+
+
+def _normalize_y(y, cavity_labels, cavity_stats):
+    """Normalise y using per-cavity stats (works on any train/val/test subset)."""
+    y_norm = np.empty(len(y), dtype=float)
+    if None in cavity_stats:
+        m, s = cavity_stats[None]
+        y_norm[:] = (y - m) / s
+    else:
+        for cav, (m, s) in cavity_stats.items():
+            mask = cavity_labels == cav
+            y_norm[mask] = (y[mask] - m) / s
+    return y_norm
+
+
+def _build_inv_arrays(cavity_labels, cavity_stats, n=None):
+    """Build per-sample y_mean and y_std arrays for inverse-transform:
+    y_orig = y_norm * y_std_arr + y_mean_arr  (element-wise numpy broadcast).
+    cavity_labels may be None for single-cavity datasets; pass n=len(y) in that case."""
+    if cavity_labels is not None:
+        n = len(cavity_labels)
+    y_mean_arr = np.empty(n, dtype=float)
+    y_std_arr  = np.empty(n, dtype=float)
+    if None in cavity_stats:
+        m, s = cavity_stats[None]
+        y_mean_arr[:] = m
+        y_std_arr[:]  = s
+    else:
+        for cav, (m, s) in cavity_stats.items():
+            mask = cavity_labels == cav
+            y_mean_arr[mask] = m
+            y_std_arr[mask]  = s
+    return y_mean_arr, y_std_arr
 
 
 # === Weight Initialization for Regression ===
@@ -493,8 +550,8 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     # TPE scatter plot
     ax1.scatter(y_test, y_pred_tp, alpha=0.5, s=30)
     ax1.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
-    ax1.set_xlabel('True Values')
-    ax1.set_ylabel('Predictions')
+    ax1.set_xlabel('True Values [g]')
+    ax1.set_ylabel('Predictions [g]')
     ax1.set_title(f'TPE Model: Predicted vs True\nMAE={mae_tp:.4f}, R²={r2_tp:.4f}')
     ax1.legend()
     ax1.grid(alpha=0.3)
@@ -502,8 +559,8 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     # RS scatter plot
     ax2.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color='green')
     ax2.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
-    ax2.set_xlabel('True Values')
-    ax2.set_ylabel('Predictions')
+    ax2.set_xlabel('True Values [g]')
+    ax2.set_ylabel('Predictions [g]')
     ax2.set_title(f'RS Model: Predicted vs True\nMAE={mae_rs:.4f}, R²={r2_rs:.4f}')
     ax2.legend()
     ax2.grid(alpha=0.3)
@@ -516,8 +573,8 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     plt.figure(figsize=(8, 6))
     plt.scatter(y_test, y_pred_tp, alpha=0.5, s=30)
     plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
-    plt.xlabel('True Values')
-    plt.ylabel('Predictions')
+    plt.xlabel('True Values [g]')
+    plt.ylabel('Predictions [g]')
     plt.title(f'TPE Model: Predicted vs True\nMAE={mae_tp:.4f}, R²={r2_tp:.4f}')
     plt.legend()
     plt.grid(alpha=0.3)
@@ -527,8 +584,8 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     plt.figure(figsize=(8, 6))
     plt.scatter(y_test, y_pred_rs, alpha=0.5, s=30, color='green')
     plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'r--', lw=2, label='Perfect prediction')
-    plt.xlabel('True Values')
-    plt.ylabel('Predictions')
+    plt.xlabel('True Values [g]')
+    plt.ylabel('Predictions [g]')
     plt.title(f'RS Model: Predicted vs True\nMAE={mae_rs:.4f}, R²={r2_rs:.4f}')
     plt.legend()
     plt.grid(alpha=0.3)
@@ -544,7 +601,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     # TPE residual plot
     ax1.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30)
     ax1.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax1.set_xlabel('Predicted Values')
+    ax1.set_xlabel('Predicted Values [g]')
     ax1.set_ylabel('Residuals')
     ax1.set_title(f'TPE Model: Residual Plot\nMAE={mae_tp:.4f}')
     ax1.grid(alpha=0.3)
@@ -552,7 +609,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     # RS residual plot
     ax2.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color='green')
     ax2.axhline(y=0, color='r', linestyle='--', lw=2)
-    ax2.set_xlabel('Predicted Values')
+    ax2.set_xlabel('Predicted Values [g]')
     ax2.set_ylabel('Residuals')
     ax2.set_title(f'RS Model: Residual Plot\nMAE={mae_rs:.4f}')
     ax2.grid(alpha=0.3)
@@ -565,7 +622,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     plt.figure(figsize=(8, 6))
     plt.scatter(y_pred_tp, residuals_tp, alpha=0.5, s=30)
     plt.axhline(y=0, color='r', linestyle='--', lw=2)
-    plt.xlabel('Predicted Values')
+    plt.xlabel('Predicted Values [g]')
     plt.ylabel('Residuals')
     plt.title(f'TPE Model: Residual Plot\nMAE={mae_tp:.4f}')
     plt.grid(alpha=0.3)
@@ -575,7 +632,7 @@ def evaluate_and_plot_results(model_tp, model_rs, X_test, y_test, device, save_p
     plt.figure(figsize=(8, 6))
     plt.scatter(y_pred_rs, residuals_rs, alpha=0.5, s=30, color='green')
     plt.axhline(y=0, color='r', linestyle='--', lw=2)
-    plt.xlabel('Predicted Values')
+    plt.xlabel('Predicted Values [g]')
     plt.ylabel('Residuals')
     plt.title(f'RS Model: Residual Plot\nMAE={mae_rs:.4f}')
     plt.grid(alpha=0.3)
@@ -652,8 +709,8 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X, y, groups = load_dataset(csv_path, return_groups=True)
-    # y is normalised per fold inside the loop (train-fold stats only applied to val).
+    X, y, groups, cavity_labels = load_dataset(csv_path, return_groups=True, return_cavity=True)
+    # y is normalised per fold inside the loop (per-cavity, train-fold stats only — no leakage).
 
     # Use GroupKFold if groups are available, otherwise use KFold
     if groups is not None:
@@ -718,11 +775,13 @@ def objective(trial, csv_path, n_startup_trials=10, sampler="RandomSampler", hpa
     for fold, (train_idx, val_idx) in enumerate(fold_iterator):
         X_train, X_val = X[train_idx], X[val_idx]
         y_train_raw, y_val_raw = y[train_idx], y[val_idx]
-        # Normalise target using train-fold statistics only (no leakage from val)
-        _y_mean = float(y_train_raw.mean())
-        _y_std  = max(float(y_train_raw.std()), 1e-8)
-        y_train = (y_train_raw - _y_mean) / _y_std
-        y_val   = (y_val_raw   - _y_mean) / _y_std
+        # Per-cavity normalisation using train-fold statistics only (no leakage from val).
+        # For single-cavity datasets cavity_labels is None → falls back to global stats.
+        cav_train = cavity_labels[train_idx] if cavity_labels is not None else None
+        cav_val   = cavity_labels[val_idx]   if cavity_labels is not None else None
+        fold_stats = _compute_cavity_stats(y_train_raw, cav_train)
+        y_train = _normalize_y(y_train_raw, cav_train, fold_stats)
+        y_val   = _normalize_y(y_val_raw,   cav_val,   fold_stats)
 
         train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
                                  torch.tensor(y_train, dtype=torch.float32).unsqueeze(1))
@@ -789,17 +848,24 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Train data
-    X_train, y_train, groups = load_dataset(csv_path_train, return_groups=True)
+    X_train, y_train, groups, cavity_labels_train = load_dataset(csv_path_train, return_groups=True, return_cavity=True)
     print(f"The Data has {X_train.shape[0]} samples and {X_train.shape[1]} features.")
-    # Normalise target using training set statistics — prevents the MLP from collapsing to
-    # predicting the mean when target variance is small relative to the mean.
-    y_mean_train = float(y_train.mean())
-    y_std_train  = max(float(y_train.std()), 1e-8)
-    cv_pct = y_std_train / abs(y_mean_train) * 100
-    print(f"Target — mean: {y_mean_train:.4f} g, std: {y_std_train:.4f} g, CV: {cv_pct:.2f}%")
-    if cv_pct < 1.0:
-        print("  [!] Low variance target (CV < 1%). Setting opt_metric='r2' in config is strongly recommended.")
-    y_train_n = (y_train - y_mean_train) / y_std_train
+    # Per-cavity normalisation stats from the full training set.
+    # y_mean_arr / y_std_arr are per-sample arrays used for inverse-transform on the test set.
+    # Inside the CV loop, per-fold-per-cavity stats are recomputed from train indices only.
+    cavity_stats_train = _compute_cavity_stats(y_train, cavity_labels_train)
+    if None in cavity_stats_train:
+        m, s = cavity_stats_train[None]
+        cv_pct = s / abs(m) * 100
+        print(f"Target — mean: {m:.4f} g, std: {s:.4f} g, CV: {cv_pct:.2f}%")
+        if cv_pct < 1.0:
+            print("  [!] Low variance target (CV < 1%). Setting opt_metric='r2' in config is strongly recommended.")
+    else:
+        for cav, (m, s) in sorted(cavity_stats_train.items()):
+            cv_pct = s / abs(m) * 100
+            print(f"  Cavity {cav} — mean: {m:.4f} g, std: {s:.4f} g, CV: {cv_pct:.2f}%")
+            if cv_pct < 1.0:
+                print(f"    [!] Cavity {cav}: low variance target (CV < 1%). Setting opt_metric='r2' is recommended.")
 
     # Use GroupKFold if groups are available, otherwise use KFold
     if groups is not None:
@@ -810,16 +876,9 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         print(f"Using KFold (no shot grouping available)")
 
     metric_values_tp = []
-    best_metric_tp = float('inf')
-    best_model_tp = None
-    best_val_loader_tp = None
-
     metric_values_rs = []
-    best_metric_rs = float('inf')
-    best_model_rs = None
-    best_val_loader_rs = None
 
-    # In final training I increase the patience of the early stopping to 20 and the number of epochs to 200
+    # Increased patience and epochs for the final training phase
     early_stopping_patience = 20
     num_epochs = 200
 
@@ -830,22 +889,27 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         fold_iterator = skf.split(X_train, y_train)
 
     for fold, (train_idx, val_idx) in enumerate(fold_iterator):
-        
+
+        # Per-fold per-cavity normalisation — train-fold statistics only, no leakage from val fold.
+        X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+        y_train_fold_raw, y_val_fold_raw = y_train[train_idx], y_train[val_idx]
+        cav_train_fold = cavity_labels_train[train_idx] if cavity_labels_train is not None else None
+        cav_val_fold   = cavity_labels_train[val_idx]   if cavity_labels_train is not None else None
+        fold_stats = _compute_cavity_stats(y_train_fold_raw, cav_train_fold)
+        y_train_fold = _normalize_y(y_train_fold_raw, cav_train_fold, fold_stats)
+        y_val_fold   = _normalize_y(y_val_fold_raw,   cav_val_fold,   fold_stats)
+
         # Initialize models for each fold
         # TPE
         model_tp = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout_tp).to(device)
-        criterion_tp = nn.MSELoss() # TODO: Check if using MSE is better than using L1
+        criterion_tp = nn.MSELoss()
         optimizer_tp = torch.optim.AdamW(model_tp.parameters(), lr=lr_tp, weight_decay=weight_decay_tp)
         init_weights_with_prior(model_tp, pos_prior=0.0)  # y is normalised
-        #RS
+        # RS
         model_rs = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout_rs).to(device)
         criterion_rs = nn.MSELoss()
         optimizer_rs = torch.optim.AdamW(model_rs.parameters(), lr=lr_rs, weight_decay=weight_decay_rs)
         init_weights_with_prior(model_rs, pos_prior=0.0)
-
-        # Prepare data loaders
-        X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
-        y_train_fold, y_val_fold = y_train_n[train_idx], y_train_n[val_idx]  # use normalised targets
 
         train_ds = TensorDataset(torch.tensor(X_train_fold, dtype=torch.float32),
                                  torch.tensor(y_train_fold, dtype=torch.float32).unsqueeze(1))
@@ -862,39 +926,60 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         model_tp = train_one_fold_test(model_tp, train_loader_tpe, val_loader_tpe, device, criterion_tp, optimizer_tp, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="TPE", opt_metric=opt_metric)
         model_rs = train_one_fold_test(model_rs, train_loader_rs, val_loader_rs, device, criterion_rs, optimizer_rs, early_stopping_patience, num_epochs, plot_metrics=True, print_early_stopping=True, fold=fold, sampler="RS", opt_metric=opt_metric)
 
-        # Evaluate TP
-        metric_tp = evaluate_model(model_tp, val_loader_tpe, device, opt_metric)
-        metric_values_tp.append(metric_tp)
-        if metric_tp < best_metric_tp:
-            best_metric_tp = metric_tp
-            best_model_tp = model_tp
-            best_val_loader_tp = val_loader_tpe
-
-        # Evaluate RS
-        metric_rs = evaluate_model(model_rs, val_loader_rs, device, opt_metric)
-        metric_values_rs.append(metric_rs)
-        if metric_rs < best_metric_rs:
-            best_metric_rs = metric_rs
-            best_model_rs = model_rs
-            best_val_loader_rs = val_loader_rs
+        # Collect CV metrics (fold scores only — fold models are discarded afterwards)
+        metric_values_tp.append(evaluate_model(model_tp, val_loader_tpe, device, opt_metric))
+        metric_values_rs.append(evaluate_model(model_rs, val_loader_rs, device, opt_metric))
 
     metric_label = opt_metric.upper()
-    print(f"\nTP: Best {metric_label} across folds: {best_metric_tp:.4f} and mean {metric_label}: {np.mean(metric_values_tp):.4f}, after {len(metric_values_tp)} folds.")
-    print(f"RS: Best {metric_label} across folds: {best_metric_rs:.4f} and mean {metric_label}: {np.mean(metric_values_rs):.4f}, after {len(metric_values_rs)} folds.")
+    print(f"\nCV {metric_label} — TPE: {np.mean(metric_values_tp):.4f} ± {np.std(metric_values_tp):.4f}")
+    print(f"CV {metric_label} — RS:  {np.mean(metric_values_rs):.4f} ± {np.std(metric_values_rs):.4f}")
     if opt_metric in ('mae', 'rmse', 'max_error'):
-        print(f"  (fold {metric_label} is in normalised units; multiply by {y_std_train:.4f} to convert to grams)")
+        print(f"  (fold {metric_label} is in normalised units; multiply by the cavity std to convert to grams)")
 
-    torch.save(best_model_tp.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_TP.pt"))
-    torch.save(best_model_rs.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_RS.pt"))
+    # Retrain final models on ALL training data.
+    # cavity_stats_train comes from the full training CSV — correct, no test leakage.
+    print(f"\nRetraining final TPE and RS models on all training data...")
+    y_train_n = _normalize_y(y_train, cavity_labels_train, cavity_stats_train)
+
+    final_model_tp = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_tpe["size_layer{}".format(i)] for i in range(params_tpe["n_layers"])], dropout=dropout_tp).to(device)
+    init_weights_with_prior(final_model_tp, pos_prior=0.0)
+    optimizer_final_tp = torch.optim.AdamW(final_model_tp.parameters(), lr=lr_tp, weight_decay=weight_decay_tp)
+
+    final_model_rs = MLPRegression(input_size=X_train.shape[1], layers_dim=[params_rs["size_layer{}".format(i)] for i in range(params_rs["n_layers"])], dropout=dropout_rs).to(device)
+    init_weights_with_prior(final_model_rs, pos_prior=0.0)
+    optimizer_final_rs = torch.optim.AdamW(final_model_rs.parameters(), lr=lr_rs, weight_decay=weight_decay_rs)
+
+    all_train_ds = TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                 torch.tensor(y_train_n, dtype=torch.float32).unsqueeze(1))
+    criterion_final = nn.MSELoss()
+
+    for name_f, model_f, optimizer_f, bs_f in [
+        ("TPE", final_model_tp, optimizer_final_tp, batch_size_tp),
+        ("RS",  final_model_rs, optimizer_final_rs, batch_size_rs),
+    ]:
+        loader_f = DataLoader(all_train_ds, batch_size=bs_f, shuffle=True)
+        print(f"  {name_f}: training for {num_epochs} epochs on {len(y_train_n)} samples...")
+        for epoch in range(num_epochs):
+            model_f.train()
+            for xb, yb in loader_f:
+                xb, yb = xb.to(device), yb.to(device)
+                optimizer_f.zero_grad()
+                criterion_final(model_f(xb), yb).backward()
+                optimizer_f.step()
+
+    torch.save(final_model_tp.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_TP.pt"))
+    torch.save(final_model_rs.state_dict(), str(OUT_DIR / f"models/best_model_{metric_label}_RS.pt"))
 
     # Model evaluation
     print(f"\n=== Final Test Set Evaluation ===")
-    # Load test data (with return_groups=True to remove 'shot' column)
-    X_test, y_test, _ = load_dataset(csv_path_test, return_groups=True)
-    # Normalise test targets with TRAINING statistics (no data leakage)
-    y_test_n = (y_test - y_mean_train) / y_std_train
-    metrics = evaluate_and_plot_results(best_model_tp, best_model_rs, X_test, y_test_n, device=device,
-                                        y_mean=y_mean_train, y_std=y_std_train)
+    # Load test data — use cavity labels so per-sample inverse-transform works correctly
+    X_test, y_test, _, cavity_labels_test = load_dataset(csv_path_test, return_groups=True, return_cavity=True)
+    # Normalise test targets with TRAINING cavity statistics (no data leakage)
+    y_test_n = _normalize_y(y_test, cavity_labels_test, cavity_stats_train)
+    # Build per-sample arrays for element-wise inverse-transform in evaluate/plot
+    y_mean_test_arr, y_std_test_arr = _build_inv_arrays(cavity_labels_test, cavity_stats_train, n=len(y_test))
+    metrics = evaluate_and_plot_results(final_model_tp, final_model_rs, X_test, y_test_n, device=device,
+                                        y_mean=y_mean_test_arr, y_std=y_std_test_arr)
 
     tp_opt_val = (1 - metrics['tp']['r2']) if opt_metric == 'r2' else metrics['tp'][opt_metric]
     rs_opt_val = (1 - metrics['rs']['r2']) if opt_metric == 'r2' else metrics['rs'][opt_metric]
@@ -907,7 +992,7 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     if tp_opt_val <= rs_opt_val:
         print(f"\nTPE model performs better ({opt_metric.upper()}: {tp_opt_val:.4f}). Checking if it should be saved as best overall...")
         save_best_overall_model(
-            model=best_model_tp,
+            model=final_model_tp,
             model_name='TPE',
             mae=metrics['tp']['mae'],
             rmse=metrics['tp']['rmse'],
@@ -924,7 +1009,7 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
     else:
         print(f"\nRS model performs better ({opt_metric.upper()}: {rs_opt_val:.4f}). Checking if it should be saved as best overall...")
         save_best_overall_model(
-            model=best_model_rs,
+            model=final_model_rs,
             model_name='RS',
             mae=metrics['rs']['mae'],
             rmse=metrics['rs']['rmse'],
@@ -940,10 +1025,10 @@ def train_and_save_best_model(params_tpe, params_rs, epochs=100, csv_path_train=
         )
 
     # Per-cavity evaluation on the best (winning) model only
-    best_winner = best_model_tp if tp_opt_val <= rs_opt_val else best_model_rs
+    best_winner = final_model_tp if tp_opt_val <= rs_opt_val else final_model_rs
     winner_name = 'TPE' if tp_opt_val <= rs_opt_val else 'RS'
     _report_per_cavity_metrics(best_winner, winner_name, csv_path_test, device,
-                               y_mean=y_mean_train, y_std=y_std_train)
+                               cavity_stats=cavity_stats_train)
 
 
 # === Run Optuna Optimization ===
@@ -993,14 +1078,16 @@ def run_optimization(sampler, pruner, csv_path, n_trials=100, n_startup_trials=1
     return trial
 
 # === Per-Cavity Metrics (double-cavity datasets only) ===
-def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, y_mean=0.0, y_std=1.0):
+def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, cavity_stats=None):
     """Print per-cavity regression metrics and scatter plot for the best model only.
     No-op when test CSV has no 'cavity' column (single-cavity datasets).
-    y_mean/y_std: target normalisation parameters for inverse-transforming model outputs."""
+    cavity_stats: dict returned by _compute_cavity_stats() from the training set."""
     df_raw = pd.read_csv(test_csv_path)
     if 'cavity' not in df_raw.columns:
         return
-    X_test, y_test, _ = load_dataset(test_csv_path, return_groups=True)
+    X_test, y_test, _, cavity_labels_test = load_dataset(test_csv_path, return_groups=True, return_cavity=True)
+    # Build per-sample inverse-transform arrays using training cavity stats
+    y_mean_arr, y_std_arr = _build_inv_arrays(cavity_labels_test, cavity_stats or {None: (0.0, 1.0)}, n=len(y_test))
     cavities = sorted(df_raw['cavity'].unique())
     print("\n" + "="*55)
     print(f"=== Per-Cavity Test Set Evaluation ({model_name}) ===")
@@ -1009,11 +1096,14 @@ def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, y_
         axes = [axes]
     for ax, cav in zip(axes, cavities):
         mask = (df_raw['cavity'] == cav).values
-        X_cav, y_cav = X_test[mask], y_test[mask]
+        X_cav, y_cav = X_test[mask], y_test[mask] # y_cav_n
+        y_mean_cav, y_std_cav = y_mean_arr[mask], y_std_arr[mask]
         best_model.eval()
         with torch.no_grad():
             y_pred = best_model(torch.tensor(X_cav, dtype=torch.float32).to(device)).cpu().numpy().flatten()
-        y_pred = y_pred * y_std + y_mean  # inverse-transform to original scale
+        # Inverse-transform both prediction and true values to original scale
+        y_pred = y_pred * y_std_cav + y_mean_cav
+        #y_cav  = y_cav_n * y_std_cav + y_mean_cav
         mae  = float(mean_absolute_error(y_cav, y_pred))
         rmse = float(np.sqrt(mean_squared_error(y_cav, y_pred)))
         r2   = float(r2_score(y_cav, y_pred))
@@ -1023,7 +1113,7 @@ def _report_per_cavity_metrics(best_model, model_name, test_csv_path, device, y_
         lims = [min(y_cav.min(), y_pred.min()), max(y_cav.max(), y_pred.max())]
         ax.scatter(y_cav, y_pred, alpha=0.5, s=30)
         ax.plot(lims, lims, 'r--', lw=2, label='Perfect prediction')
-        ax.set_xlabel('True Values'); ax.set_ylabel('Predictions')
+        ax.set_xlabel('True Values [g]'); ax.set_ylabel('Predictions [g]')
         ax.set_title(f'{model_name} \u2014 Cavity {cav}\nMAE={mae:.4f}, R\u00b2={r2:.4f}')
         ax.legend(); ax.grid(alpha=0.3)
     plt.tight_layout()

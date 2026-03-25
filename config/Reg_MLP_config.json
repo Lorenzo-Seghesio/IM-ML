@@ -1,8 +1,8 @@
 {
     "_comment": "Hyperparameter config for Reg_MLP_IM.py. Scalar value = fixed. Array [min, max] = optimized by Optuna.",
 
-    "dataset": "ABS",
-    "opt_metric": "mae",
+    "dataset": "PP_1",
+    "opt_metric": "rmse",
 
     "hyperparameters": {
         "lr":                     [1e-5, 1e-2],
@@ -13,7 +13,7 @@
     },
 
     "optuna_trials": {
-        "startup_trials": 100,
-        "tot_trials": 200
+        "startup_trials": 20,
+        "tot_trials": 50
     }
 }
