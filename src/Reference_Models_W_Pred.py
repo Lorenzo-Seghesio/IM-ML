@@ -51,18 +51,24 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 try:
     from Utility.group_splitting import (
-        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, validate_group_disjoint,
-        validate_protected_excluded,
+        validate_protected_excluded, edge_group_policy_metadata,
+        validate_edge_groups_excluded, group_split_required,
     )
     from Utility.optuna_seeding import resolve_optuna_seed
+    from Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
+    from Utility.cv_diagnostics import save_cv_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
-        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, validate_group_disjoint,
-        validate_protected_excluded,
+        validate_protected_excluded, edge_group_policy_metadata,
+        validate_edge_groups_excluded, group_split_required,
     )
     from src.Utility.optuna_seeding import resolve_optuna_seed
+    from src.Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
+    from src.Utility.cv_diagnostics import save_cv_diagnostics
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -158,13 +164,15 @@ def _count_params(model: nn.Module) -> int:
 
 
 def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
-                   group_values=None, group_cfg=None):
+                   group_values=None, group_cfg=None, edge_values=None,
+                   edge_cfg=None):
     """One-time deterministic train/test split performed before HPO or CV.
     Returns (dev_idx, test_idx) as np.intp arrays.
     """
-    if grouping_enabled(group_cfg):
+    if group_split_required(group_cfg, edge_cfg, "test"):
         return grouped_train_test_split(n, test_frac, seed, group_values,
-                                        group_cfg, strat_labels)
+                                        group_cfg, strat_labels,
+                                        edge_values, edge_cfg)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_frac, random_state=seed)
         dev_rel, test_rel = next(sss.split(np.zeros(n), strat_labels))
@@ -270,13 +278,29 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": y_pred}
 
 
-def load_data(data_cfg: dict, prep_cfg: dict):
+def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
     """Join scalar + pressure CSVs; clean; return (part_ids, X_pp, X_pt, y, strat_labels)."""
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
-    group_col = data_cfg.get("group_col")
+    if material.upper() == "DOE1":
+        df_scalar = rename_doe1_scalar_columns(df_scalar)
+        target_col = doe1_column_name(data_cfg["target_col"])
+        group_col = doe1_column_name(data_cfg.get("group_col"))
+        drop_cols = [doe1_column_name(c) for c in data_cfg.get("drop_cols", [])]
+    else:
+        target_col = data_cfg["target_col"]
+        group_col = data_cfg.get("group_col")
+        drop_cols = data_cfg.get("drop_cols", [])
     group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
-    df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
+    edge_cfg = data_cfg.get("edge_group_split", {})
+    edge_cols = list(edge_cfg.get("columns", []))
+    missing_edge_cols = [col for col in edge_cols if col not in df_scalar.columns]
+    if edge_cfg.get("enabled", False) and missing_edge_cols:
+        raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
+    edge_values = (df_scalar[edge_cols].copy()
+                   if edge_cols and all(c in df_scalar.columns for c in edge_cols) else None)
+    drop_cols = list(dict.fromkeys([*drop_cols, *edge_cols]))
+    df_scalar = df_scalar.drop(columns=drop_cols, errors="ignore")
     pressure_sources = data_cfg.get("pressure_csvs")
     if pressure_sources is None:
         pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
@@ -291,7 +315,6 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         df_curve.columns = [f"{curve_name}__{c}" for c in df_curve.columns]
         pressure_frames.append(df_curve)
 
-    target_col = data_cfg["target_col"]
     mat_col    = data_cfg.get("material_col")
 
     if mat_col:
@@ -329,6 +352,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         df = df[y_mask].copy()
         if group_values is not None:
             group_values = group_values.loc[df.index]
+        if edge_values is not None:
+            edge_values = edge_values.loc[df.index]
         print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining")
     else:
         print("y-outlier removal disabled by config (preprocessing.remove_target_outliers=false)")
@@ -344,14 +369,17 @@ def load_data(data_cfg: dict, prep_cfg: dict):
           f"min={y.min():.3f}  max={y.max():.3f}")
     group_ids = (group_values.reindex(df.index).to_numpy()
                  if group_values is not None else None)
-    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols, group_ids
+    edge_array = (edge_values.reindex(df.index).to_numpy(dtype=np.float64)
+                  if edge_values is not None else None)
+    return part_ids, X_pp, X_pt, y, strat_labels, pp_cols, group_ids, edge_array
 
 
 def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray,
-                group_values=None, group_cfg=None) -> list:
-    if grouping_enabled(group_cfg):
+                group_values=None, group_cfg=None, edge_values=None,
+                edge_cfg=None) -> list:
+    if group_split_required(group_cfg, edge_cfg, "validation"):
         return grouped_kfold(np.arange(len(X)), K, seed, group_values,
-                             group_cfg, strat_labels)
+                             group_cfg, strat_labels, edge_values, edge_cfg)
     if strat_labels is not None:
         kf = StratifiedKFold(n_splits=K, shuffle=True, random_state=seed)
         return list(kf.split(X, strat_labels))
@@ -360,11 +388,12 @@ def _split_iter(K: int, seed: int, strat_labels, X: np.ndarray,
 
 
 def _inner_split(tv_idx: np.ndarray, train_cfg: dict, seed: int, fold: int,
-                 strat_labels, group_values=None, group_cfg=None) -> tuple:
-    if grouping_enabled(group_cfg):
+                 strat_labels, group_values=None, group_cfg=None,
+                 edge_values=None, edge_cfg=None) -> tuple:
+    if group_split_required(group_cfg, edge_cfg, "validation"):
         return grouped_train_val_split(
             tv_idx, train_cfg["val_fraction"], seed + fold,
-            group_values, group_cfg, strat_labels)
+            group_values, group_cfg, strat_labels, edge_values, edge_cfg)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
                                      test_size=train_cfg["val_fraction"],
@@ -600,6 +629,8 @@ def _copy_artefacts(run_best_dir: Path, overall_best_dir: Path):
         src = run_best_dir / fname
         if src.exists():
             shutil.copy2(src, overall_best_dir / fname)
+    for src in run_best_dir.glob("cv_*diagnostics*.png"):
+        shutil.copy2(src, overall_best_dir / src.name)
 
 
 # ── XAI helpers ───────────────────────────────────────────────────────────────
@@ -693,7 +724,7 @@ def _xai_shap_mlp(model: nn.Module, X_bg_sc: np.ndarray, X_test_sc: np.ndarray,
             ax = plt.gca()
             ax.set_xlabel("mean(|SHAP value|)")
             # TODO: here remove manual ocnfig
-            ax.set_xlim(0, 3)
+            # ax.set_xlim(0, 3)
             ax.xaxis.grid(True, color="#d0d0d0", linewidth=0.8, zorder=0)
             ax.set_axisbelow(True)
             plt.savefig(out_dir / "xai_shap_bar.png", bbox_inches="tight", dpi=300)
@@ -845,23 +876,26 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
 
 def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
                    dropout, train_cfg, device, seed, strat_labels=None,
-                   group_values=None, group_cfg=None):
+                   group_values=None, group_cfg=None, edge_values=None,
+                   edge_cfg=None):
     """K-fold CV for Encoder on dev data only (indicative). Scales pressure curves per-fold."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pt, group_values, group_cfg)
+    splits = _split_iter(K, seed, strat_labels, X_pt, group_values, group_cfg,
+                         edge_values, edge_cfg)
 
     _dummy = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout)
     print(f"\n[Encoder] Parameters : {_count_params(_dummy):,}")
     del _dummy
 
     fold_results  = []
+    fold_predictions = []
     best_fold_mae = float("inf")
     best_fold_idx = -1
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ Encoder CV Fold {fold + 1}/{K} ════════════════════════════════")
         tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
         pt_min = float(X_pt[tr_idx].min())
@@ -876,6 +910,8 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
 
         res = evaluate_nn(model, _enc_prepare, X_te_s, y[test_idx], device)
         fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
+                     "y_pred": res["pred"].copy()})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -883,27 +919,30 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
             best_fold_mae = res["MAE"]
             best_fold_idx = fold
 
-    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae
+    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae, fold_predictions
 
 
 def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
-               device, seed, strat_labels=None, group_values=None, group_cfg=None):
+               device, seed, strat_labels=None, group_values=None, group_cfg=None,
+               edge_values=None, edge_cfg=None):
     """K-fold CV for MLP on dev data only (indicative). Applies MinMaxScaler per-fold."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg)
+    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg,
+                         edge_values, edge_cfg)
 
     _dummy = MLPModel(n_in, hidden_dims, dropout)
     print(f"\n[MLP] Parameters : {_count_params(_dummy):,}")
     del _dummy
 
     fold_results  = []
+    fold_predictions = []
     best_fold_mae = float("inf")
     best_fold_idx = -1
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ MLP CV Fold {fold + 1}/{K} ══════════════════════════════════════")
         tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
         sc = MinMaxScaler().fit(X_pp[tr_idx])
@@ -918,6 +957,8 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
 
         res = evaluate_nn(model, _mlp_prepare, X_te_s, y[test_idx], device)
         fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
+                     "y_pred": res["pred"].copy()})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -925,24 +966,26 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
             best_fold_mae = res["MAE"]
             best_fold_idx = fold
 
-    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae
+    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae, fold_predictions
 
 
 def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
                 seed, strat_labels=None, label="GBDT", group_values=None,
-                group_cfg=None):
+                group_cfg=None, edge_values=None, edge_cfg=None):
     """K-fold CV for GBDT on dev data only (indicative). Trains on full tv split."""
     K      = train_cfg["k_folds"]
-    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg)
+    splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg,
+                         edge_values, edge_cfg)
 
     fold_results  = []
+    fold_predictions = []
     best_fold_mae = float("inf")
     best_fold_idx = -1
 
     for fold, (tv_idx, test_idx) in enumerate(splits):
         print(f"\n══ {label} CV Fold {fold + 1}/{K} ═══════════════════════════════════")
         tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
         train_idx = np.concatenate([tr_idx, val_idx])
         print(f"  Train={len(train_idx)}  Test={len(test_idx)}")
 
@@ -951,6 +994,8 @@ def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
 
         res = evaluate_gbdt(model, X_pp[test_idx], y[test_idx])
         fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
+                     "y_pred": res["pred"].copy()})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -958,7 +1003,7 @@ def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
             best_fold_mae = res["MAE"]
             best_fold_idx = fold
 
-    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae
+    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae, fold_predictions
 
 
 # ── Final-train functions ─────────────────────────────────────────────────────
@@ -968,7 +1013,8 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
                         dropout, train_cfg: dict, device: torch.device,
                         seed: int, strat_labels=None, group_values=None,
                         group_cfg=None, fixed_train_idx=None,
-                        fixed_val_idx=None):
+                        fixed_val_idx=None, edge_values=None,
+                        edge_cfg=None):
     """Train the final Encoder on all dev data.
     Val split from dev used for early stopping only.
     Returns (model, (pt_min, pt_max)).
@@ -977,7 +1023,7 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
         tr_idx, val_idx = fixed_train_idx, fixed_val_idx
     else:
         tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
-                                       group_values, group_cfg)
+                                       group_values, group_cfg, edge_values, edge_cfg)
     print(f"\n══ Final Encoder Training ══════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
     pt_min = float(X_pt[tr_idx].min())
@@ -1001,7 +1047,8 @@ def final_train_mlp(X_pp, y, dev_idx: np.ndarray,
                     n_in: int, hidden_dims: list, dropout: float,
                     train_cfg: dict, device: torch.device,
                     seed: int, strat_labels=None, group_values=None,
-                    group_cfg=None, fixed_train_idx=None, fixed_val_idx=None):
+                    group_cfg=None, fixed_train_idx=None, fixed_val_idx=None,
+                    edge_values=None, edge_cfg=None):
     """Train the final MLP on all dev data.
     Val split from dev used for early stopping only.
     Returns (model, sc).
@@ -1010,7 +1057,7 @@ def final_train_mlp(X_pp, y, dev_idx: np.ndarray,
         tr_idx, val_idx = fixed_train_idx, fixed_val_idx
     else:
         tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
-                                       group_values, group_cfg)
+                                       group_values, group_cfg, edge_values, edge_cfg)
     print(f"\n══ Final MLP Training ══════════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
     sc = MinMaxScaler().fit(X_pp[tr_idx])
@@ -1141,7 +1188,8 @@ def suggest_xgb_params(trial, ss: dict) -> dict:
 # ── Optuna objectives ─────────────────────────────────────────────────────────
 
 def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
-                 group_values=None, group_cfg=None):
+                 group_values=None, group_cfg=None, edge_values=None,
+                 edge_cfg=None):
     ss = hpo_cfg["search_space"]
     mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
@@ -1155,11 +1203,11 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
     dropout      = mcfg_upd.get("dropout",       base_tcfg.get("dropout", 0.2))
 
     splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pt,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
         tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
         pt_min = float(X_pt[tr_idx].min())
         pt_max = float(X_pt[tr_idx].max())
         scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
@@ -1178,7 +1226,8 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
 
 
 def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
-             group_values=None, group_cfg=None):
+             group_values=None, group_cfg=None, edge_values=None,
+             edge_cfg=None):
     ss = hpo_cfg["search_space"]
     mcfg_upd, tcfg_upd = suggest_mlp_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
@@ -1190,11 +1239,11 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
     dropout     = mcfg_upd.get("dropout",     base_tcfg.get("dropout", 0.2))
 
     splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
         tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
         sc = MinMaxScaler().fit(X_pp[tr_idx])
         X_tr_s  = sc.transform(X_pp[tr_idx]).astype(np.float32)
         X_val_s = sc.transform(X_pp[val_idx]).astype(np.float32)
@@ -1213,12 +1262,13 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
 
 
 def _obj_gbdt(trial, X_pp, y, hpo_cfg, model_class, suggest_fn, seed, strat_labels,
-              group_values=None, group_cfg=None):
+              group_values=None, group_cfg=None, edge_values=None,
+              edge_cfg=None):
     ss     = hpo_cfg["search_space"]
     params = suggest_fn(trial, ss)
 
     splits   = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
-                           group_values, group_cfg)
+                           group_values, group_cfg, edge_values, edge_cfg)
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(splits):
         model = model_class(**params)
@@ -1271,7 +1321,7 @@ def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed
 def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray,
                 group_values=None, group_cfg=None, fixed_train_idx=None,
-                fixed_val_idx=None):
+                fixed_val_idx=None, edge_values=None, edge_cfg=None):
     hpo_cfg   = cfg["encoder_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
@@ -1292,7 +1342,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         objective_fn=lambda t: _obj_encoder(t, X_pt[dev_idx], y[dev_idx], hpo_cfg,
                                             train_cfg, seed, device, dev_strat,
                                             group_values[dev_idx] if group_values is not None else None,
-                                            group_cfg),
+                                            group_cfg,
+                                            edge_values[dev_idx] if edge_values is not None else None,
+                                            edge_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="hyperband", n_folds=hpo_cfg["n_folds"],
         sampler_seed=sampler_seed)
@@ -1315,22 +1367,25 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
     # Indicative CV on dev data
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds, {train_cfg['epochs']} epochs")
-    metrics_df, best_fold_idx, best_fold_mae = run_cv_encoder(
+    metrics_df, best_fold_idx, best_fold_mae, cv_predictions = run_cv_encoder(
         X_pt[dev_idx], y[dev_idx], channels, kernels, pool_kernels, head_hidden,
         dropout, train_cfg, device, seed, dev_strat,
-        group_values[dev_idx] if group_values is not None else None, group_cfg)
+        group_values[dev_idx] if group_values is not None else None, group_cfg,
+        edge_values[dev_idx] if edge_values is not None else None, edge_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(rb_dir / "cv_fold_metrics.csv")
     print_summary(metrics_df, best_fold_idx, best_fold_mae, K, "Encoder")
     save_cv_plots(metrics_df, K, mat, rb_dir, "Encoder")
+    save_cv_diagnostics(cv_predictions, rb_dir,
+                        f"[{mat} | Encoder] Indicative K-fold CV on dev set")
 
     # Final training on all dev; evaluate on held-out test
     final_model, (pt_min, pt_max) = final_train_encoder(
         X_pt, y, dev_idx, channels, kernels, pool_kernels, head_hidden,
         dropout, train_cfg, device, seed, dev_strat, group_values, group_cfg,
-        fixed_train_idx, fixed_val_idx)
+        fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
     scale = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
     res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[test_idx]), y[test_idx], device)
@@ -1360,7 +1415,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
 def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
             dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
             group_values=None, group_cfg=None, fixed_train_idx=None,
-            fixed_val_idx=None):
+            fixed_val_idx=None, edge_values=None, edge_cfg=None):
     hpo_cfg   = cfg["mlp_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
@@ -1382,7 +1437,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         objective_fn=lambda t: _obj_mlp(t, X_pp[dev_idx], y[dev_idx], hpo_cfg,
                                         train_cfg, seed, device, dev_strat,
                                         group_values[dev_idx] if group_values is not None else None,
-                                        group_cfg),
+                                        group_cfg,
+                                        edge_values[dev_idx] if edge_values is not None else None,
+                                        edge_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="hyperband", n_folds=hpo_cfg["n_folds"],
         sampler_seed=sampler_seed)
@@ -1401,22 +1458,25 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
     # Indicative CV on dev data
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds, {train_cfg['epochs']} epochs")
-    metrics_df, best_fold_idx, best_fold_mae = run_cv_mlp(
+    metrics_df, best_fold_idx, best_fold_mae, cv_predictions = run_cv_mlp(
         X_pp[dev_idx], y[dev_idx], n_in, hidden_dims, dropout,
         train_cfg, device, seed, dev_strat,
-        group_values[dev_idx] if group_values is not None else None, group_cfg)
+        group_values[dev_idx] if group_values is not None else None, group_cfg,
+        edge_values[dev_idx] if edge_values is not None else None, edge_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(rb_dir / "cv_fold_metrics.csv")
     print_summary(metrics_df, best_fold_idx, best_fold_mae, K, "MLP")
     save_cv_plots(metrics_df, K, mat, rb_dir, "MLP")
+    save_cv_diagnostics(cv_predictions, rb_dir,
+                        f"[{mat} | MLP] Indicative K-fold CV on dev set")
 
     # Final training on all dev; evaluate on held-out test
     final_model, sc = final_train_mlp(
         X_pp, y, dev_idx, n_in, hidden_dims, dropout,
         train_cfg, device, seed, dev_strat, group_values, group_cfg,
-        fixed_train_idx, fixed_val_idx)
+        fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
     X_te_s = sc.transform(X_pp[test_idx]).astype(np.float32)
     res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[test_idx], device)
@@ -1446,7 +1506,8 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
 def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
              dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
-             group_values=None, group_cfg=None):
+             group_values=None, group_cfg=None, edge_values=None,
+             edge_cfg=None):
     hpo_cfg   = cfg["lgbm_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
@@ -1468,7 +1529,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                          lgb.LGBMRegressor, suggest_lgbm_params,
                                          seed, dev_strat,
                                          group_values[dev_idx] if group_values is not None else None,
-                                         group_cfg),
+                                         group_cfg,
+                                         edge_values[dev_idx] if edge_values is not None else None,
+                                         edge_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="median", n_folds=hpo_cfg["n_folds"],
         sampler_seed=sampler_seed)
@@ -1483,17 +1546,21 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
     # Indicative CV on dev data
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds")
-    metrics_df, best_fold_idx, best_fold_mae = run_cv_gbdt(
+    metrics_df, best_fold_idx, best_fold_mae, cv_predictions = run_cv_gbdt(
         lgb.LGBMRegressor, best_params, X_pp[dev_idx], y[dev_idx],
         train_cfg, seed, dev_strat, label="LightGBM",
         group_values=group_values[dev_idx] if group_values is not None else None,
-        group_cfg=group_cfg)
+        group_cfg=group_cfg,
+        edge_values=edge_values[dev_idx] if edge_values is not None else None,
+        edge_cfg=edge_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(rb_dir / "cv_fold_metrics.csv")
     print_summary(metrics_df, best_fold_idx, best_fold_mae, K, "LightGBM")
     save_cv_plots(metrics_df, K, mat, rb_dir, "LightGBM")
+    save_cv_diagnostics(cv_predictions, rb_dir,
+                        f"[{mat} | LightGBM] Indicative K-fold CV on dev set")
 
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(lgb.LGBMRegressor, best_params,
@@ -1523,7 +1590,8 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
 def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
-                group_values=None, group_cfg=None):
+                group_values=None, group_cfg=None, edge_values=None,
+                edge_cfg=None):
     hpo_cfg   = cfg["xgboost_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
@@ -1545,7 +1613,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                          xgb.XGBRegressor, suggest_xgb_params,
                                          seed, dev_strat,
                                          group_values[dev_idx] if group_values is not None else None,
-                                         group_cfg),
+                                         group_cfg,
+                                         edge_values[dev_idx] if edge_values is not None else None,
+                                         edge_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="median", n_folds=hpo_cfg["n_folds"],
         sampler_seed=sampler_seed)
@@ -1560,17 +1630,21 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
     # Indicative CV on dev data
     print(f"\nIndicative CV: {train_cfg['k_folds']} folds")
-    metrics_df, best_fold_idx, best_fold_mae = run_cv_gbdt(
+    metrics_df, best_fold_idx, best_fold_mae, cv_predictions = run_cv_gbdt(
         xgb.XGBRegressor, best_params, X_pp[dev_idx], y[dev_idx],
         train_cfg, seed, dev_strat, label="XGBoost",
         group_values=group_values[dev_idx] if group_values is not None else None,
-        group_cfg=group_cfg)
+        group_cfg=group_cfg,
+        edge_values=edge_values[dev_idx] if edge_values is not None else None,
+        edge_cfg=edge_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(rb_dir / "cv_fold_metrics.csv")
     print_summary(metrics_df, best_fold_idx, best_fold_mae, K, "XGBoost")
     save_cv_plots(metrics_df, K, mat, rb_dir, "XGBoost")
+    save_cv_diagnostics(cv_predictions, rb_dir,
+                        f"[{mat} | XGBoost] Indicative K-fold CV on dev set")
 
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(xgb.XGBRegressor, best_params,
@@ -1634,8 +1708,9 @@ def main():
     print(f"Output   : {BASE_OUT}")
 
     (part_ids, X_pp, X_pt, y, strat_labels,
-     pp_cols, group_ids) = load_data(cfg["data"], prep_cfg)
+    pp_cols, group_ids, edge_values) = load_data(cfg["data"], prep_cfg, mat)
     group_cfg = cfg["data"].get("group_split", {})
+    edge_cfg = cfg["data"].get("edge_group_split", {})
 
     # ── One-time initial split (dev / held-out test) ──────────────────────────
     test_frac = prep_cfg.get("test_fraction", 0.2)
@@ -1646,6 +1721,15 @@ def main():
     m1_train_idx = m1_val_idx = None
     if dp_path is not None and dp_path.exists():
         dp = json.loads(dp_path.read_text())
+        m1_edge_policy = dp.get("edge_group_split")
+        expected_edge_policy = edge_group_policy_metadata(
+            edge_values, group_ids, edge_cfg, group_cfg)
+        if edge_cfg.get("enabled", False):
+            if (not m1_edge_policy
+                    or m1_edge_policy.get("policy_hash") != expected_edge_policy["policy_hash"]):
+                raise ValueError(
+                    "M1 split edge-group policy is missing or differs from Reference Models "
+                    "config; rerun M1 with the matching edge_group_split configuration.")
         id_to_idx = {pid: i for i, pid in enumerate(part_ids.tolist())}
         tr_idx = np.array([id_to_idx[p] for p in dp["train_part_ids"]
                            if p in id_to_idx], dtype=np.intp)
@@ -1655,12 +1739,16 @@ def main():
                              if p in id_to_idx], dtype=np.intp)
         dev_idx = np.concatenate([tr_idx, val_idx])
         m1_train_idx, m1_val_idx = tr_idx, val_idx
+        edge_scope_idx = np.concatenate([tr_idx, val_idx, test_idx])
         print(f"M1 data_processing.json reused  →  train={len(tr_idx)}  "
               f"val={len(val_idx)}  test={len(test_idx)}")
     else:
         dev_idx, test_idx = _initial_split(
-            len(y), test_frac, seed, strat_labels, group_ids, group_cfg)
-    if grouping_enabled(group_cfg) and group_ids is not None:
+            len(y), test_frac, seed, strat_labels, group_ids, group_cfg,
+            edge_values, edge_cfg)
+        m1_edge_policy = None
+        edge_scope_idx = np.arange(len(y), dtype=np.intp)
+    if group_split_required(group_cfg, edge_cfg, "test") and group_ids is not None:
         if m1_train_idx is not None:
             validate_group_disjoint(m1_train_idx, m1_val_idx, test_idx,
                                     group_values=group_ids, config=group_cfg)
@@ -1669,6 +1757,15 @@ def main():
             validate_group_disjoint(dev_idx, test_idx,
                                     group_values=group_ids, config=group_cfg)
             validate_protected_excluded(test_idx, group_ids, group_cfg)
+    if edge_values is not None:
+        validate_edge_groups_excluded(
+            test_idx, edge_values, group_ids, edge_cfg, group_cfg,
+            scope_indices=edge_scope_idx, partition="test")
+        if m1_train_idx is not None and len(m1_val_idx):
+            validate_edge_groups_excluded(
+                m1_val_idx, edge_values, group_ids, edge_cfg, group_cfg,
+                scope_indices=np.concatenate([m1_train_idx, m1_val_idx]),
+                partition="validation")
     print(f"\nDev/test split  →  dev={len(dev_idx)}  test={len(test_idx)}")
 
     # ── Active-model gates (default: all on) ──────────────────────────────────
@@ -1682,26 +1779,28 @@ def main():
     if enc_on:
         run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                  dev_idx, test_idx, group_ids, group_cfg,
-                 m1_train_idx, m1_val_idx)
+                 m1_train_idx, m1_val_idx, edge_values, edge_cfg)
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
 
     if mlp_on:
         run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx, test_idx, pp_cols, group_ids, group_cfg,
-                m1_train_idx, m1_val_idx)
+            m1_train_idx, m1_val_idx, edge_values, edge_cfg)
     else:
         print("\n[mlp]      skipped (active_models.mlp = 0)")
 
     if lgbm_on:
         run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-                dev_idx, test_idx, pp_cols, group_ids, group_cfg)
+            dev_idx, test_idx, pp_cols, group_ids, group_cfg,
+            edge_values, edge_cfg)
     else:
         print("\n[lgbm]     skipped (active_models.lgbm = 0)")
 
     if xgb_on:
         run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
-                 dev_idx, test_idx, pp_cols, group_ids, group_cfg)
+                 dev_idx, test_idx, pp_cols, group_ids, group_cfg,
+                 edge_values, edge_cfg)
     else:
         print("\n[xgboost]  skipped (active_models.xgboost = 0)")
 

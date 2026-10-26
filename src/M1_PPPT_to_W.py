@@ -113,18 +113,22 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from pathlib import Path
 try:
     from Utility.group_splitting import (
-        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, group_assignments, validate_group_disjoint,
-        validate_protected_excluded,
+        validate_protected_excluded, edge_group_policy_metadata,
+        validate_edge_groups_excluded, group_split_required,
     )
     from Utility.optuna_seeding import resolve_optuna_seed
+    from Utility.cv_diagnostics import save_cv_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
-        grouping_enabled, grouped_kfold, grouped_train_test_split,
+        grouped_kfold, grouped_train_test_split,
         grouped_train_val_split, group_assignments, validate_group_disjoint,
-        validate_protected_excluded,
+        validate_protected_excluded, edge_group_policy_metadata,
+        validate_edge_groups_excluded, group_split_required,
     )
     from src.Utility.optuna_seeding import resolve_optuna_seed
+    from src.Utility.cv_diagnostics import save_cv_diagnostics
 
 warnings.filterwarnings("ignore")
 
@@ -177,7 +181,7 @@ class PressureEncoder(nn.Module):
         self.convs = nn.Sequential(*conv_layers)
         self.pool  = nn.AdaptiveAvgPool1d(1)           # global average pooling
         self.fc    = nn.Linear(channels[-1], n_f)
-        self.act   = nn.ReLU()
+        # self.act   = nn.ReLU()
         self._init_weights()
 
     def _init_weights(self):
@@ -189,8 +193,8 @@ class PressureEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.convs(x)              # (B, C_last, T)
         x = self.pool(x).squeeze(-1)   # (B, C_last)
-        return self.act(self.fc(x))    # (B, n_f)
-
+        # return self.act(self.fc(x))    # (B, n_f)
+        return self.fc(x)              # (B, n_f)  — no activation on features
 
 class PPMLP(nn.Module):
     """
@@ -322,15 +326,17 @@ def _count_params(model: nn.Module) -> int:
 
 
 def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
-                   group_values=None, group_cfg=None):
+                   group_values=None, group_cfg=None, edge_values=None,
+                   edge_cfg=None):
     """One-time deterministic train/test split performed before HPO or CV.
     Returns (dev_idx, test_idx) as np.intp arrays.
     Uses StratifiedShuffleSplit when strat_labels is provided (ALL mode)
     so that material proportions are balanced in both splits.
     """
-    if grouping_enabled(group_cfg):
+    if group_split_required(group_cfg, edge_cfg, "test"):
         return grouped_train_test_split(n, test_frac, seed, group_values,
-                                        group_cfg, strat_labels)
+                                        group_cfg, strat_labels,
+                                        edge_values, edge_cfg)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1, test_size=test_frac,
                                      random_state=seed)
@@ -340,6 +346,37 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
     perm   = rng.permutation(n)
     n_test = max(1, int(n * test_frac))
     return perm[n_test:].astype(np.intp), perm[:n_test].astype(np.intp)
+
+
+def _dev_y_outlier_keep_mask(y: np.ndarray, part_ids: np.ndarray,
+                             dev_idx: np.ndarray, prep_cfg: dict):
+    """Return a row mask that removes configured y-outliers from dev only."""
+    keep_mask = np.ones(len(y), dtype=bool)
+    if prep_cfg.get("remove_target_outliers", False) is not True:
+        print("y-outlier removal disabled by config "
+              "(preprocessing.remove_target_outliers=false)")
+        return keep_mask, []
+    if len(dev_idx) == 0:
+        raise ValueError("Cannot calculate y-outlier thresholds from an empty dev set.")
+
+    dev_y = y[dev_idx]
+    q1, q3 = pd.Series(dev_y).quantile([0.25, 0.75]).to_numpy()
+    iqr = q3 - q1
+    if iqr > 0:
+        iqr_k = prep_cfg["iqr_multiplier"]
+        lower = q1 - iqr_k * iqr
+        upper = q3 + iqr_k * iqr
+        dev_keep = (dev_y >= lower) & (dev_y <= upper)
+        removed_idx = dev_idx[~dev_keep]
+        keep_mask[removed_idx] = False
+    else:
+        removed_idx = np.empty(0, dtype=np.intp)
+
+    removed_ids = part_ids[removed_idx].tolist()
+    print(f"Development y-outliers removed: {len(removed_ids)}  "
+          f"→ {len(dev_idx) - len(removed_ids)} dev parts remaining"
+          + (f"  (IDs: {removed_ids})" if removed_ids else ""))
+    return keep_mask, removed_ids
 
 
 # ── Scaling utilities ─────────────────────────────────────────────────────────
@@ -462,8 +499,8 @@ def evaluate_model(model: M1Model,
 
 # ── Pipeline functions ────────────────────────────────────────────────────────
 
-def load_data(data_cfg: dict, prep_cfg: dict):
-    """Load CSVs, join, impute, remove outliers.
+def load_data(data_cfg: dict):
+    """Load CSVs, join, impute, and prepare aligned model arrays.
 
     Returns
     -------
@@ -492,7 +529,15 @@ def load_data(data_cfg: dict, prep_cfg: dict):
 
     group_col = data_cfg.get("group_col")
     group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
-    df_scalar = df_scalar.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
+    edge_cfg = data_cfg.get("edge_group_split", {})
+    edge_cols = list(edge_cfg.get("columns", []))
+    missing_edge_cols = [col for col in edge_cols if col not in df_scalar.columns]
+    if edge_cfg.get("enabled", False) and missing_edge_cols:
+        raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
+    edge_values = (df_scalar[edge_cols].copy()
+                   if edge_cols and all(c in df_scalar.columns for c in edge_cols) else None)
+    forced_drop_cols = list(dict.fromkeys([*data_cfg.get("drop_cols", []), *edge_cols]))
+    df_scalar = df_scalar.drop(columns=forced_drop_cols, errors="ignore")
     df        = df_scalar.copy()
     for df_curve in pressure_frames:
         df = df.join(df_curve, how="inner")
@@ -514,27 +559,6 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         if df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    remove_target_outliers = bool(prep_cfg.get("remove_target_outliers", True))
-    y_removed_ids = []
-    if remove_target_outliers:
-        iqr_k  = prep_cfg["iqr_multiplier"]
-        col    = target_col
-        q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-        iqr    = q3 - q1
-        if iqr > 0:
-            y_mask = (df[col] >= q1 - iqr_k * iqr) & (df[col] <= q3 + iqr_k * iqr)
-        else:
-            y_mask = pd.Series(True, index=df.index)
-        y_removed_ids = df.index[~y_mask].tolist()
-        n_removed = int((~y_mask).sum())
-        df = df[y_mask].copy()
-        if group_values is not None:
-            group_values = group_values.loc[df.index]
-        print(f"y-outliers removed: {n_removed}  →  {len(df)} parts remaining"
-              + (f"  (IDs: {y_removed_ids})" if y_removed_ids else ""))
-    else:
-        print("y-outlier removal disabled by config (preprocessing.remove_target_outliers=false)")
-
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
     X_pt_list    = [df[cols].to_numpy(dtype=np.float32) for _, cols in pressure_cols_by_curve]
@@ -546,12 +570,16 @@ def load_data(data_cfg: dict, prep_cfg: dict):
           f"min={y.min():.3f}  max={y.max():.3f}")
     group_ids = (group_values.reindex(df.index).to_numpy()
                  if group_values is not None else None)
-    return part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols, y_removed_ids, group_ids
+    edge_array = (edge_values.reindex(df.index).to_numpy(dtype=np.float64)
+                  if edge_values is not None else None)
+    return (part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols,
+            group_ids, edge_array)
 
 
 def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
            device: torch.device, seed: int, strat_labels=None,
-           group_values=None, group_cfg=None):
+           group_values=None, group_cfg=None, edge_values=None,
+           edge_cfg=None):
     """Run K-fold CV on dev data (indicative); return metrics DataFrame.
 
     All data passed in must already be the dev subset — test data must
@@ -561,9 +589,9 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
     K    = train_cfg["k_folds"]
     n_pp = X_pp.shape[1]
 
-    if grouping_enabled(group_cfg):
+    if group_split_required(group_cfg, edge_cfg, "validation"):
         split_iter = grouped_kfold(np.arange(len(y)), K, seed, group_values,
-                                   group_cfg, strat_labels)
+                                   group_cfg, strat_labels, edge_values, edge_cfg)
     elif strat_labels is not None:
         kf         = StratifiedKFold(n_splits=K, shuffle=True, random_state=seed)
         split_iter = kf.split(X_pp, strat_labels)
@@ -576,16 +604,17 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
     del _dummy
 
     fold_results  = []
+    fold_predictions = []
     best_fold_mae = float("inf")
     best_fold_idx = -1
 
     for fold, (tv_idx, test_idx) in enumerate(split_iter):
         print(f"\n══ CV Fold {fold + 1}/{K} ════════════════════════════════════════")
 
-        if grouping_enabled(group_cfg):
+        if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
                 tv_idx, train_cfg["val_fraction"], seed + fold,
-                group_values, group_cfg, strat_labels)
+                group_values, group_cfg, strat_labels, edge_values, edge_cfg)
         elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
                                         test_size=train_cfg["val_fraction"],
@@ -617,6 +646,11 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
 
         res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device)
         fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        fold_predictions.append({
+            "fold": fold,
+            "y_true": y[test_idx].copy(),
+            "y_pred": res["pred"].copy(),
+        })
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -624,7 +658,7 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
             best_fold_mae = res["MAE"]
             best_fold_idx = fold
 
-    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae
+    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae, fold_predictions
 
 
 def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
@@ -712,8 +746,13 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
 
 def save_models(final_model: M1Model, final_metrics: dict,
                 n_pp: int, T_list: list[int], model_cfg: dict,
-                run_best_dir: Path, overall_best_dir: Path) -> bool:
+                run_best_dir: Path, overall_best_dir: Path,
+                force_update: bool = False) -> bool:
     """Save final model weights + test metrics; update overall_best if improved.
+
+    ``force_update`` is used when the split-policy contract changes, because
+    metrics from models evaluated on different held-out partitions are not
+    directly comparable.
     best_metrics.json always contains the held-out test set metrics (primary).
     """
     run_info = {
@@ -735,10 +774,11 @@ def save_models(final_model: M1Model, final_metrics: dict,
     if overall_path.exists():
         prev_mae = json.loads(overall_path.read_text()).get("MAE", float("inf"))
 
-    if final_metrics["MAE"] < prev_mae:
+    if final_metrics["MAE"] < prev_mae or force_update:
         torch.save(final_model.state_dict(), overall_best_dir / "best_model.pt")
         overall_path.write_text(json.dumps(run_info, indent=2))
-        print(f"Overall best updated  "
+        reason = "split policy changed" if force_update else "MAE improved"
+        print(f"Overall best updated ({reason})  "
               f"({prev_mae:.4f} → {final_metrics['MAE']:.4f} MAE)  → {overall_best_dir}")
         return True
     else:
@@ -770,7 +810,8 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
 def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                    model_cfg: dict, train_cfg: dict,
                    seed: int, device: torch.device, strat_labels=None,
-                   group_values=None, group_cfg=None):
+                   group_values=None, group_cfg=None, edge_values=None,
+                   edge_cfg=None):
     """Train the final M1Model on all dev data.
     A small internal validation split (val_fraction × dev) is used solely
     for early stopping — it is never reported.  Final evaluation is always
@@ -779,10 +820,10 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
     Returns (model, (pp_sc, pt_scalers)).
     """
     n_pp = X_pp.shape[1]
-    if grouping_enabled(group_cfg):
+    if group_split_required(group_cfg, edge_cfg, "validation"):
         tr_idx, val_idx = grouped_train_val_split(
             dev_idx, train_cfg["val_fraction"], seed, group_values,
-            group_cfg, strat_labels)
+            group_cfg, strat_labels, edge_values, edge_cfg)
     elif strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
                                      test_size=train_cfg["val_fraction"],
@@ -964,7 +1005,8 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int,
 def optuna_objective(trial, X_pp, X_pt_list, y,
                      optuna_cfg, base_model_cfg, base_train_cfg,
                      seed, device, strat_labels=None,
-                     group_values=None, group_cfg=None):
+                     group_values=None, group_cfg=None, edge_values=None,
+                     edge_cfg=None):
     """Optuna objective: mini K-fold CV, returns mean test MAE (minimize)."""
     ss      = optuna_cfg["search_space"]
     n_folds = optuna_cfg["n_folds"]
@@ -981,9 +1023,10 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
         "k_folds":     n_folds,
     }
 
-    if grouping_enabled(group_cfg):
+    if group_split_required(group_cfg, edge_cfg, "validation"):
         split_iter = grouped_kfold(np.arange(len(y)), n_folds, seed,
-                                   group_values, group_cfg, strat_labels)
+                                   group_values, group_cfg, strat_labels,
+                                   edge_values, edge_cfg)
     elif strat_labels is not None:
         kf         = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
         split_iter = list(kf.split(X_pp, strat_labels))
@@ -994,10 +1037,10 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
     mae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(split_iter):
         # Inner validation split (mirrors run_cv logic)
-        if grouping_enabled(group_cfg):
+        if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
                 tv_idx, base_train_cfg["val_fraction"], seed + fold,
-                group_values, group_cfg, strat_labels)
+                group_values, group_cfg, strat_labels, edge_values, edge_cfg)
         elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
                                         test_size=base_train_cfg["val_fraction"],
@@ -1037,7 +1080,8 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
 
 def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
             seed, device, strat_labels=None, out_dir=None,
-            group_values=None, group_cfg=None, sampler_seed=None):
+            group_values=None, group_cfg=None, sampler_seed=None,
+            edge_values=None, edge_cfg=None):
     """Create Optuna study (TPE sampler + HyperbandPruner), run HPO, return study."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -1072,7 +1116,8 @@ def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
     study.optimize(
         lambda t: optuna_objective(
             t, X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
-            seed, device, strat_labels, group_values, group_cfg),
+            seed, device, strat_labels, group_values, group_cfg,
+            edge_values, edge_cfg),
         n_trials=n_trials,
         show_progress_bar=True,
     )
@@ -1154,22 +1199,48 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
 
     (part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols,
-     y_removed_ids, group_ids) = load_data(data_cfg, prep_cfg)
+     group_ids, edge_values) = load_data(data_cfg)
     group_cfg = data_cfg.get("group_split", {})
+    edge_cfg = data_cfg.get("edge_group_split", {})
     n_pp = X_pp.shape[1]
     T_list = [arr.shape[1] for arr in X_pt_list]
 
     # ── Initial train/test split (done once; test data NEVER used in HPO or CV) ──
     test_frac = prep_cfg.get("test_fraction", 0.2)
     dev_idx, test_idx = _initial_split(
-        len(part_ids), test_frac, seed, strat_labels, group_ids, group_cfg)
-    if grouping_enabled(group_cfg) and group_ids is not None:
+        len(part_ids), test_frac, seed, strat_labels, group_ids, group_cfg,
+        edge_values, edge_cfg)
+    if group_split_required(group_cfg, edge_cfg, "test") and group_ids is not None:
         validate_group_disjoint(dev_idx, test_idx,
                                 group_values=group_ids, config=group_cfg)
         validate_protected_excluded(test_idx, group_ids, group_cfg)
-    dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
+    if edge_values is not None:
+        validate_edge_groups_excluded(
+            test_idx, edge_values, group_ids, edge_cfg, group_cfg,
+            partition="test")
     print(f"Initial split  →  dev={len(dev_idx)}  test={len(test_idx)}  "
           f"(test_fraction={test_frac})")
+
+    # Determine y-outlier thresholds from dev only; preserve every test row.
+    y_keep_mask, y_removed_ids = _dev_y_outlier_keep_mask(
+        y, part_ids, dev_idx, prep_cfg)
+    if not y_keep_mask.all():
+        old_to_new = np.full(len(y_keep_mask), -1, dtype=np.intp)
+        old_to_new[y_keep_mask] = np.arange(
+            int(y_keep_mask.sum()), dtype=np.intp)
+        dev_idx = old_to_new[dev_idx[y_keep_mask[dev_idx]]]
+        test_idx = old_to_new[test_idx]
+        part_ids = part_ids[y_keep_mask]
+        X_pp = X_pp[y_keep_mask]
+        X_pt_list = [x[y_keep_mask] for x in X_pt_list]
+        y = y[y_keep_mask]
+        strat_labels = (strat_labels[y_keep_mask]
+                        if strat_labels is not None else None)
+        group_ids = group_ids[y_keep_mask] if group_ids is not None else None
+        edge_values = edge_values[y_keep_mask] if edge_values is not None else None
+        print(f"Post-filter split  →  dev={len(dev_idx)}  test={len(test_idx)}")
+
+    dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
 
     # ── Mode selection / HPO (dev data only) ─────────────────────────────────
     mode     = cfg.get("mode", "manual").lower()
@@ -1185,7 +1256,9 @@ def main():
                         cfg["optuna"], model_cfg, train_cfg,
                         seed, device, dev_strat, run_best_dir,
                         group_ids[dev_idx] if group_ids is not None else None,
-                        group_cfg, sampler_seed)
+                        group_cfg, sampler_seed,
+                        edge_values[dev_idx] if edge_values is not None else None,
+                        edge_cfg)
         model_cfg, train_cfg = best_cfg_from_study(
             study, cfg["optuna"], model_cfg, train_cfg, n_pp)
         best_hpo = {
@@ -1205,21 +1278,29 @@ def main():
         print("Using manual model config — skipping HPO.")
 
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
-    metrics_df, best_fold_idx, best_fold_mae = run_cv(
+    metrics_df, best_fold_idx, best_fold_mae, cv_predictions = run_cv(
         X_pp[dev_idx], [x[dev_idx] for x in X_pt_list], y[dev_idx],
         model_cfg, train_cfg, device, seed, dev_strat,
-        group_ids[dev_idx] if group_ids is not None else None, group_cfg)
+        group_ids[dev_idx] if group_ids is not None else None, group_cfg,
+        edge_values[dev_idx] if edge_values is not None else None, edge_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(run_best_dir / "cv_fold_metrics.csv")
     print_summary(metrics_df, best_fold_idx, best_fold_mae, K)
     save_cv_plots(metrics_df, K, mat, run_best_dir)
+    save_cv_diagnostics(
+        cv_predictions, run_best_dir,
+        f"[{mat}] Indicative K-fold CV on dev set")
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
     final_model, final_scalers, tr_idx_final, val_idx_final = final_train_m1(
         X_pp, X_pt_list, y, dev_idx, model_cfg, train_cfg, seed, device,
-        strat_labels, group_ids, group_cfg)
+        strat_labels, group_ids, group_cfg, edge_values, edge_cfg)
+    if edge_values is not None:
+        validate_edge_groups_excluded(
+            val_idx_final, edge_values, group_ids, edge_cfg, group_cfg,
+            scope_indices=dev_idx, partition="validation")
     pp_sc, pt_scalers = final_scalers
     Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], [x[test_idx] for x in X_pt_list], pp_sc, pt_scalers)
     final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[test_idx], device)
@@ -1233,8 +1314,23 @@ def main():
     save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat)
 
+    edge_policy_metadata = edge_group_policy_metadata(
+        edge_values, group_ids, edge_cfg, group_cfg)
+    prior_dp_path = overall_best_dir / "data_processing.json"
+    prior_edge_policy = (json.loads(prior_dp_path.read_text()).get("edge_group_split")
+                         if prior_dp_path.exists() else None)
+    force_policy_refresh = bool(
+        edge_cfg and (not prior_edge_policy
+                      or prior_edge_policy.get("policy_hash")
+                      != edge_policy_metadata["policy_hash"])
+    )
+    if force_policy_refresh:
+        print("Saved M1 best-overall split uses a different edge policy; "
+              "promoting this run so downstream models receive a coherent split.")
+
     overall_updated = save_models(final_model, final_metrics, n_pp, T_list, model_cfg,
-                                  run_best_dir, overall_best_dir)
+                                  run_best_dir, overall_best_dir,
+                                  force_update=force_policy_refresh)
 
     # Extract f-features for the FULL cleaned dataset (all parts, incl. test)
     # so that M2 has features for every part when it evaluates its own test set.
@@ -1248,6 +1344,7 @@ def main():
         "train_part_ids": part_ids[dev_idx].tolist(),
         "test_part_ids":  part_ids[test_idx].tolist(),
         "group_split": group_cfg,
+        "edge_group_split": edge_policy_metadata,
     }
     (run_best_dir / "train_test_split.json").write_text(json.dumps(split_out, indent=2))
     print(f"Train/test split saved → {run_best_dir / 'train_test_split.json'}")
@@ -1263,6 +1360,7 @@ def main():
         "test_part_ids":  part_ids[test_idx].tolist(),
         "group_col":      data_cfg.get("group_col"),
         "group_split":    group_cfg,
+        "edge_group_split": edge_policy_metadata,
         "split_counts": {
             "train": len(tr_idx_final), "val": len(val_idx_final),
             "dev": len(dev_idx), "test": len(test_idx), "total": len(part_ids),
@@ -1282,7 +1380,8 @@ def main():
         "y_filter": {
             "target_col":    data_cfg["target_col"],
             "iqr_multiplier": prep_cfg["iqr_multiplier"],
-            "enabled":       bool(prep_cfg.get("remove_target_outliers", True)),
+            "enabled":       prep_cfg.get("remove_target_outliers", False) is True,
+            "threshold_scope": "development",
             "removed_ids":   y_removed_ids,
         },
     }
@@ -1304,6 +1403,8 @@ def main():
         save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat)
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
+        for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
+            shutil.copy2(cv_plot, overall_best_dir / cv_plot.name)
         metrics_df.to_csv(overall_best_dir / "cv_fold_metrics.csv")
         shutil.copy2(run_best_dir / "train_test_split.json",
                      overall_best_dir / "train_test_split.json")

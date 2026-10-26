@@ -82,12 +82,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 try:
     from Utility.group_splitting import (
-        grouping_enabled, validate_group_disjoint, validate_protected_excluded,
+        validate_group_disjoint, validate_protected_excluded,
+        edge_group_policy_metadata, validate_edge_groups_excluded,
+        group_split_required,
     )
+    from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
-        grouping_enabled, validate_group_disjoint, validate_protected_excluded,
+        validate_group_disjoint, validate_protected_excluded,
+        edge_group_policy_metadata, validate_edge_groups_excluded,
+        group_split_required,
     )
+    from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -526,9 +532,28 @@ def load_scalar_data(material: str, cfg: dict):
     id_col = data_cfg["id_col"]
     target_col = data_cfg["target_col"]
     df = pd.read_csv(csv_path, index_col=id_col)
-    group_col = data_cfg.get("group_col")
+    if material.upper() == "DOE1":
+        df = rename_doe1_scalar_columns(df)
+        id_col = doe1_column_name(id_col)
+        target_col = doe1_column_name(target_col)
+        group_col = doe1_column_name(data_cfg.get("group_col"))
+        drop_cols = [doe1_column_name(c) for c in data_cfg.get("drop_cols", [])]
+    else:
+        group_col = data_cfg.get("group_col")
+        drop_cols = data_cfg.get("drop_cols", [])
+
+    # The source config keeps the raw CSV names so M1/M2 remain compatible;
+    # Fusion exposes the canonical names in its data and XAI artefacts.
     group_values = df[group_col].copy() if group_col in df else None
-    df = df.drop(columns=data_cfg.get("drop_cols", []), errors="ignore")
+    edge_cfg = data_cfg.get("edge_group_split", {})
+    edge_cols = list(edge_cfg.get("columns", []))
+    missing_edge_cols = [col for col in edge_cols if col not in df.columns]
+    if edge_cfg.get("enabled", False) and missing_edge_cols:
+        raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
+    edge_values = (df[edge_cols].copy()
+                   if edge_cols and all(c in df.columns for c in edge_cols) else None)
+    drop_cols = list(dict.fromkeys([*drop_cols, *edge_cols]))
+    df = df.drop(columns=drop_cols, errors="ignore")
     pp_cols = [c for c in df.columns if c != target_col and c != group_col]
 
     # impute pp columns
@@ -537,7 +562,7 @@ def load_scalar_data(material: str, cfg: dict):
             df[col] = df[col].fillna(df[col].median())
 
     print(f"  Loaded {len(df)} parts from {csv_path.name}")
-    return df, pp_cols, target_col, group_values
+    return df, pp_cols, target_col, group_values, edge_values
 
 
 def load_train_test_split(m1_dir: Path):
@@ -1579,7 +1604,7 @@ def main():
     # Load X-clean scalar data (X-outliers pre-removed by clean_data.py).
     # y-filter is applied after the split is loaded (Step 2) using M1's
     # data_processing.json so Fusion uses the exact same parts as M1.
-    df_scalar, pp_cols, target_col, group_values = load_scalar_data(MAT, cfg)
+    df_scalar, pp_cols, target_col, group_values, edge_values = load_scalar_data(MAT, cfg)
     n_pp = len(pp_cols)
 
     # Peek at M1 data_processing.json early to extract y_filter params
@@ -1594,6 +1619,8 @@ def main():
             print(f"  y-filter (from M1 data_processing): "
                   f"{len(_removed_y_ids)} parts to remove → {sorted(_removed_y_ids)}")
     if _pp_cols_from_m1:
+        if MAT == "DOE1":
+            _pp_cols_from_m1 = [doe1_column_name(c) for c in _pp_cols_from_m1]
         pp_cols = [c for c in _pp_cols_from_m1 if c in df_scalar.columns]
         n_pp = len(pp_cols)
         print(f"  Reusing pp_cols from M1 data_processing ({len(pp_cols)} features)")
@@ -1626,12 +1653,48 @@ def main():
     print("\n── Step 2: Loading train/test split ────────────────────────")
     dev_idx_m1, test_idx_m1, m1_pp_sc, m1_run_ts = load_m1_data_for_fusion(m1_dir, part_ids_m1)
     group_cfg = cfg.get("data", {}).get("group_split", {})
-    if grouping_enabled(group_cfg) and group_values is not None:
-        m1_groups = group_values.reindex(part_ids_m1).to_numpy()
+    edge_cfg = cfg.get("data", {}).get("edge_group_split", {})
+    m1_policy_source = _dp_preview.get("edge_group_split") if _dp_path.exists() else None
+    if m1_policy_source is None:
+        for _policy_path in (
+                m1_dir / "train_test_split.json",
+                m1_dir.parent / "run_best" / "data_processing.json",
+                m1_dir.parent / "run_best" / "train_test_split.json"):
+            if _policy_path.exists():
+                m1_policy_source = json.loads(_policy_path.read_text()).get("edge_group_split")
+                if m1_policy_source is not None:
+                    break
+    m1_edge_values = (edge_values.reindex(part_ids_m1).to_numpy(dtype=np.float64)
+                      if edge_values is not None else None)
+    m1_groups = group_values.reindex(part_ids_m1).to_numpy() if group_values is not None else None
+    effective_edge_policy = edge_group_policy_metadata(
+        m1_edge_values, m1_groups, edge_cfg, group_cfg)
+    if edge_cfg.get("enabled", False):
+        if (not m1_policy_source
+                or m1_policy_source.get("policy_hash") != effective_edge_policy["policy_hash"]):
+            raise ValueError(
+                "M1 split edge-group policy is missing or differs from Fusion config; "
+                "rerun M1 with the matching edge_group_split configuration.")
+    if group_split_required(group_cfg, edge_cfg, "test") and m1_groups is not None:
         validate_group_disjoint(dev_idx_m1, test_idx_m1,
                                 group_values=m1_groups, config=group_cfg)
         validate_protected_excluded(test_idx_m1, m1_groups, group_cfg)
         print("  Group integrity verified for M1 dev/test split")
+    if m1_edge_values is not None:
+        validate_edge_groups_excluded(
+            test_idx_m1, m1_edge_values, m1_groups, edge_cfg, group_cfg,
+            partition="test")
+        if _dp_path.exists():
+            _dp_data = json.loads(_dp_path.read_text())
+            _id_to_idx = {pid: i for i, pid in enumerate(part_ids_m1.tolist())}
+            _m1_val_idx = np.array(
+                [_id_to_idx[p] for p in _dp_data.get("val_part_ids", []) if p in _id_to_idx],
+                dtype=np.intp)
+            _m1_dev_idx = dev_idx_m1
+            if len(_m1_val_idx):
+                validate_edge_groups_excluded(
+                    _m1_val_idx, m1_edge_values, m1_groups, edge_cfg, group_cfg,
+                    scope_indices=_m1_dev_idx, partition="validation")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 3 — Load models
@@ -1874,6 +1937,7 @@ def main():
         "material":     MAT,
         "run_ts":       RUN_TS,
         "m1_run_ts":    m1_run_ts,
+        "edge_group_split": effective_edge_policy,
         "device":       str(device),
         "m1_dir":       str(m1_dir),
         "m2_dir":       str(m2_dir),
