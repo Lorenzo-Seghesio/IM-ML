@@ -54,6 +54,10 @@ Outputs (under outputs/[dataset]/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
   feature_attributions.csv       Per-feature mean |attribution| for all XAI methods
   shap_values.csv                Per-sample SHAP values  (N_test × 20 cols)
   eg_values.csv                  Per-sample EG values    (N_test × 20 cols)
+    feature_attributions_single_pp.csv  Per-feature joint attribution through both paths
+    shap_single_pp_values.csv      Per-sample SHAP values with one column per PP
+    eg_single_pp_values.csv        Per-sample EG values with one column per PP
+    feature_attributions_comparison.csv  Split-path and tied-input metrics side by side
   jacobian_values.csv            Per-sample Jacobian values (N_test × 20 cols)
   ih_matrix.csv                  Mean Integrated-Hessians matrix (20 × 20)
   xai_bar_{method}.png           Stacked bar: mean |attr| direct + indirect
@@ -449,7 +453,7 @@ class FlatFusionWrapper(nn.Module):
     """Accepts a single (B, 2*n_pp) tensor for XAI tools.
     First n_pp columns → pp_indirect; last n_pp → pp_direct."""
 
-    def __init__(self, fusion: FusionModel, n_pp: int):
+    def __init__(self, fusion: nn.Module, n_pp: int):
         super().__init__()
         self.fusion = fusion
         self.n_pp   = n_pp
@@ -458,6 +462,25 @@ class FlatFusionWrapper(nn.Module):
         pp_ind = x[:, :self.n_pp]
         pp_dir = x[:, self.n_pp:]
         return self.fusion(pp_ind, pp_dir)
+
+
+class SinglePPFusionWrapper(nn.Module):
+    """Accepts one (B, n_pp) PP tensor and uses it for both Fusion paths.
+
+    Attributions from this wrapper describe each PP's joint effect through
+    both M2 (indirect) and M1 PPMLP (direct) paths.
+    """
+
+    def __init__(self, fusion: nn.Module, n_pp: int):
+        super().__init__()
+        self.fusion = fusion
+        self.n_pp = n_pp
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 2 or x.shape[1] != self.n_pp:
+            raise ValueError(f"Expected input with shape (batch, {self.n_pp}), "
+                             f"got {tuple(x.shape)}")
+        return self.fusion(x, x)
 
 
 class M1MergeWrapper(nn.Module):
@@ -889,26 +912,28 @@ class _ShapWrapper(nn.Module):
         return self.model(x).unsqueeze(-1)   # (B,) → (B, 1)
 
 
-def run_shap(flat_model: FlatFusionWrapper,
-             X_dev_flat:  np.ndarray,
-             X_test_flat: np.ndarray,
-             n_bg:        int,
-             device:      torch.device) -> np.ndarray:
-    """Run SHAP GradientExplainer; return shap_values (N_test, 2*n_pp)."""
+def run_shap(model: nn.Module,
+             X_background: np.ndarray,
+             X_test: np.ndarray,
+             n_bg: int,
+             device: torch.device) -> np.ndarray | None:
+    """Run SHAP GradientExplainer; output width matches the model input."""
     if not _HAS_SHAP:
         print("  [SKIP] SHAP not available")
         return None
 
     print(f"  Running SHAP GradientExplainer  "
-          f"(background: {min(n_bg, len(X_dev_flat))} samples) ...")
+          f"(background: {min(n_bg, len(X_background))} samples) ...")
     rng = np.random.default_rng(0)
-    bg_idx = rng.choice(len(X_dev_flat), size=min(n_bg, len(X_dev_flat)), replace=False)
-    bg_np  = X_dev_flat[bg_idx].astype(np.float32)
+    bg_idx = rng.choice(
+        len(X_background), size=min(n_bg, len(X_background)), replace=False)
+    bg_np  = X_background[bg_idx].astype(np.float32)
     bg_t   = torch.tensor(bg_np, dtype=torch.float32, device=device)
-    x_t    = torch.tensor(X_test_flat.astype(np.float32), dtype=torch.float32, device=device)
+    x_t    = torch.tensor(
+        X_test.astype(np.float32), dtype=torch.float32, device=device)
 
     # SHAP GradientExplainer requires 2-D output (B, n_outputs)
-    shap_model = _ShapWrapper(flat_model).to(device)
+    shap_model = _ShapWrapper(model).to(device)
     shap_model.eval()
     e  = shap_lib.GradientExplainer(shap_model, bg_t)
     sv = e.shap_values(x_t)
@@ -926,31 +951,32 @@ def run_shap(flat_model: FlatFusionWrapper,
 # Expected Gradients  (captum IntegratedGradients averaged over random baselines)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_ig(flat_model: FlatFusionWrapper,
-           X_bg_flat:  np.ndarray,
-           X_test_flat: np.ndarray,
+def run_ig(model: nn.Module,
+       X_background: np.ndarray,
+       X_test: np.ndarray,
            n_steps: int,
            n_eg_bg: int,
            device: torch.device) -> np.ndarray | None:
-    """Expected Gradients: captum IG averaged over n_eg_bg baselines sampled from X_bg_flat.
-    Returns eg_values (N_test, 2*n_pp) or None if captum unavailable.
+    """Expected Gradients: Captum IG averaged over sampled input baselines.
+    Returns an attribution array with the same feature width as X_test, or None
+    if Captum is unavailable.
     """
     if not _HAS_CAPTUM:
         print("  [SKIP] captum not available")
         return None
 
-    K = min(n_eg_bg, len(X_bg_flat))
+    K = min(n_eg_bg, len(X_background))
     print(f"  Running Expected Gradients  (steps={n_steps}, baselines={K}) ...")
     rng    = np.random.default_rng(0)
-    bl_idx = rng.choice(len(X_bg_flat), size=K, replace=False)
+    bl_idx = rng.choice(len(X_background), size=K, replace=False)
 
-    flat_model.eval()
-    ig  = IntegratedGradients(flat_model)
-    x_t = torch.tensor(X_test_flat.astype(np.float32), dtype=torch.float32, device=device)
+    model.eval()
+    ig  = IntegratedGradients(model)
+    x_t = torch.tensor(X_test.astype(np.float32), dtype=torch.float32, device=device)
 
-    eg_acc = np.zeros_like(X_test_flat)
+    eg_acc = np.zeros_like(X_test)
     for k in range(K):
-        bl      = torch.tensor(X_bg_flat[bl_idx[k]:bl_idx[k]+1].astype(np.float32),
+        bl      = torch.tensor(X_background[bl_idx[k]:bl_idx[k]+1].astype(np.float32),
                                dtype=torch.float32, device=device).expand_as(x_t)
         attr    = ig.attribute(x_t, baselines=bl, n_steps=n_steps, internal_batch_size=64)
         eg_acc += attr.detach().cpu().numpy()
@@ -1258,6 +1284,26 @@ def save_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
         print(f"  [warn] SHAP beeswarm failed: {exc}")
 
 
+def save_single_pp_shap_beeswarm(shap_vals: np.ndarray, X_test: np.ndarray,
+                                 pp_cols: list, out_dir: Path, material: str):
+    """SHAP beeswarm for one PP feature per input, tied across both paths."""
+    if not _HAS_SHAP:
+        return
+    try:
+        order = np.argsort(np.abs(shap_vals).mean(axis=0))[::-1]
+        feat_names_sorted = [_strip_prefixes(pp_cols)[i] for i in order]
+        shap_lib.summary_plot(shap_vals[:, order], X_test[:, order],
+                              feature_names=feat_names_sorted,
+                              plot_type="dot", show=False, sort=False)
+        plt.title(f"[{material}] SHAP beeswarm — single PP inputs (both paths)")
+        out_path = out_dir / "xai_shap_single_pp_beeswarm.png"
+        plt.savefig(out_path)
+        plt.close()
+        print(f"  Single-PP SHAP beeswarm saved → {out_path}")
+    except Exception as exc:
+        print(f"  [warn] Single-PP SHAP beeswarm failed: {exc}")
+
+
 def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
                            out_dir: Path, material: str):
     """Grouped bar: total effect per feature per method."""
@@ -1291,6 +1337,44 @@ def save_total_effect_plot(summary_df: pd.DataFrame, pp_cols: list,
     fig.savefig(out_dir / "xai_total_effect.png")
     plt.close(fig)
     print(f"  Total-effect plot saved → {out_dir / 'xai_total_effect.png'}")
+
+
+def save_single_pp_importance_plot(summary_df: pd.DataFrame, pp_cols: list,
+                                   out_dir: Path, material: str):
+    """Compare SHAP and EG importance in the tied, one-feature-per-PP space."""
+    method_cols = {
+        "SHAP": ("shap_single_pp_mean_abs", _PLT_C["shap"]),
+        "EG":   ("eg_single_pp_mean_abs", _PLT_C["ig"]),
+    }
+    available = {label: (col, color)
+                 for label, (col, color) in method_cols.items()
+                 if col in summary_df.columns}
+    if not available:
+        return
+
+    importance = np.mean(
+        [summary_df[col].values for col, _ in available.values()], axis=0)
+    order = np.argsort(importance)[::-1]
+    x = np.arange(len(pp_cols))
+    width = 0.8 / len(available)
+    labels = [_strip_prefixes(pp_cols)[i] for i in order]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(pp_cols) * 0.7),
+                                   max(4, len(pp_cols) * 0.4)))
+    for i, (label, (col, color)) in enumerate(available.items()):
+        offset = (i - (len(available) - 1) / 2) * width
+        ax.bar(x + offset, summary_df[col].values[order], width,
+               label=label, color=color, edgecolor="none")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=35, ha="right")
+    ax.set_ylabel("Mean |single-PP attribution|")
+    ax.set_title(f"[{material}] PP importance through both Fusion paths")
+    ax.legend()
+    fig.tight_layout()
+    out_path = out_dir / "xai_single_pp_importance.png"
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"  Single-PP importance plot saved → {out_path}")
 
 
 def save_net_effect_bars(summary_df: pd.DataFrame, pp_cols: list,
@@ -1520,6 +1604,27 @@ def build_summary(pp_cols: list,
     return pd.DataFrame(rows).set_index("feature")
 
 
+def build_single_pp_summary(pp_cols: list,
+                            shap_vals: np.ndarray | None,
+                            eg_vals: np.ndarray | None) -> pd.DataFrame:
+    """Summarize tied-input attributions, with one attribution per PP."""
+    rows = []
+    for i, col in enumerate(pp_cols):
+        row = {"feature": col}
+        for tag, vals in [("shap", shap_vals), ("eg", eg_vals)]:
+            if vals is None:
+                continue
+            if vals.ndim != 2 or vals.shape[1] != len(pp_cols):
+                raise ValueError(
+                    f"{tag.upper()} single-PP values must have shape "
+                    f"(n_samples, {len(pp_cols)}), got {vals.shape}")
+            attribution = vals[:, i]
+            row[f"{tag}_single_pp_mean"] = float(attribution.mean())
+            row[f"{tag}_single_pp_mean_abs"] = float(np.abs(attribution).mean())
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("feature")
+
+
 def build_per_sample_df(vals: np.ndarray, part_ids: np.ndarray,
                         flat_cols: list) -> pd.DataFrame:
     df = pd.DataFrame(vals, columns=flat_cols)
@@ -1621,7 +1726,15 @@ def main():
     if _pp_cols_from_m1:
         if MAT == "DOE1":
             _pp_cols_from_m1 = [doe1_column_name(c) for c in _pp_cols_from_m1]
-        pp_cols = [c for c in _pp_cols_from_m1 if c in df_scalar.columns]
+        missing_pp_cols = [c for c in _pp_cols_from_m1
+                           if c not in df_scalar.columns]
+        if missing_pp_cols:
+            raise ValueError(
+                "Fusion data is missing process-parameter columns required by "
+                f"the saved M1 model: {missing_pp_cols}. Use matching scalar "
+                "data or retrain M1 and M2 with the reduced feature set."
+            )
+        pp_cols = list(_pp_cols_from_m1)
         n_pp = len(pp_cols)
         print(f"  Reusing pp_cols from M1 data_processing ({len(pp_cols)} features)")
 
@@ -1703,6 +1816,29 @@ def main():
     m1_model, m1_cfg, m1_meta = load_m1(m1_dir, n_pp, device)
     m2_model, m2_cfg, m2_meta = load_m2(m2_dir, device)
 
+    m1_saved_n_pp = m1_meta.get("n_pp")
+    if m1_saved_n_pp is not None and m1_saved_n_pp != n_pp:
+        raise ValueError(
+            f"Saved M1 expects {m1_saved_n_pp} PP features, but Fusion data "
+            f"provides {n_pp}. Retrain M1/M2 with matching scalar columns."
+        )
+    m2_saved_n_pp = m2_meta.get("n_in")
+    if m2_saved_n_pp is not None and m2_saved_n_pp != n_pp:
+        raise ValueError(
+            f"Saved M2 expects {m2_saved_n_pp} PP features, but Fusion data "
+            f"provides {n_pp}. Retrain M1/M2 with matching scalar columns."
+        )
+    m2_saved_pp_cols = m2_meta.get("pp_cols")
+    if m2_saved_pp_cols is not None:
+        if MAT == "DOE1":
+            m2_saved_pp_cols = [doe1_column_name(c) for c in m2_saved_pp_cols]
+        if m2_saved_pp_cols != pp_cols:
+            raise ValueError(
+                "Saved M1 and M2 process-parameter columns do not match in "
+                "name and order. Reuse models trained with the same scalar "
+                "feature list."
+            )
+
     m2_f_cols   = m2_meta["f_cols"]        # e.g. ["f_3"]
     n_f         = get_m1_n_f_features(m1_cfg, m1_model, m1_dir)
     f_positions = get_f_positions(m1_dir, m2_f_cols)
@@ -1756,6 +1892,8 @@ def main():
 
     flat_fusion = FlatFusionWrapper(fusion, n_pp).to(device)
     flat_fusion.eval()
+    single_pp_fusion = SinglePPFusionWrapper(fusion, n_pp).to(device)
+    single_pp_fusion.eval()
 
     print(f"  FusionModel ready  "
           f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
@@ -1806,6 +1944,7 @@ def main():
     baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
     print(f"  Test flat shape : {X_test_flat.shape}")
     print(f"  Dev  flat shape : {X_dev_flat.shape}")
+    print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
     print(f"  IG/IH baseline  : mean of dev set")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1814,6 +1953,8 @@ def main():
     print("\n── Step 8: SHAP ────────────────────────────────────────────")
     shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
                          args.shap_bg, device)
+    shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
+                                   args.shap_bg, device)
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 9 — Expected Gradients
@@ -1821,6 +1962,8 @@ def main():
     print("\n── Step 9: Expected Gradients ──────────────────────────────")
     ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
                      args.n_ig_steps, args.eg_bg, device)
+    eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
+                               args.n_ig_steps, args.eg_bg, device)
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 10 — Integrated Hessians
@@ -1848,6 +1991,12 @@ def main():
     if ig_vals is not None:
         build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
             out_dir / "eg_values.csv", index=False)
+    if shap_single_pp_vals is not None:
+        build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
+            out_dir / "shap_single_pp_values.csv", index=False)
+    if eg_single_pp_vals is not None:
+        build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
+            out_dir / "eg_single_pp_values.csv", index=False)
     build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
         out_dir / "jacobian_values.csv", index=False)
 
@@ -1860,6 +2009,16 @@ def main():
     summary.to_csv(out_dir / "feature_attributions.csv")
     print(f"  feature_attributions.csv saved")
     print(summary.to_string())
+    single_pp_summary = build_single_pp_summary(
+        pp_cols, shap_single_pp_vals, eg_single_pp_vals)
+    single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
+    split_labeled_summary = summary.rename(columns={
+        col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
+        for col in summary.columns
+    })
+    split_labeled_summary.join(single_pp_summary, how="left").to_csv(
+        out_dir / "feature_attributions_comparison.csv")
+    print("  Single-PP and comparison attribution summaries saved")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 13 — XAI plots
@@ -1871,7 +2030,11 @@ def main():
     save_cancellation_bars(summary, pp_cols, out_dir, MAT)
     if shap_vals is not None:
         save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
+    if shap_single_pp_vals is not None:
+        save_single_pp_shap_beeswarm(
+            shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
     save_total_effect_plot(summary, pp_cols, out_dir, MAT)
+    save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
     save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
 
     # ══════════════════════════════════════════════════════════════════════

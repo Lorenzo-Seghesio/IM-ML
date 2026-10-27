@@ -84,16 +84,34 @@ def doe1_column_name(name: str | None) -> str | None:
 
 
 def rename_doe1_scalar_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename the complete DoE1 scalar schema while preserving its order.
+    """Rename known DoE1 scalar columns, accepting subsets and any order.
 
-    The validation prevents silently assigning a display name to the wrong
-    measurement if the source CSV schema changes.
+    The source file may intentionally omit scalar measurements. Names are
+    mapped individually, so the input order is preserved and absent fields are
+    not synthesized. The product ID must already be the DataFrame index.
     """
-    actual_columns = (df.index.name, *df.columns.tolist())
-    if actual_columns != DOE1_SOURCE_COLUMNS:
+    actual_columns = [df.index.name, *df.columns.tolist()]
+    if df.index.name != DOE1_SOURCE_COLUMNS[0]:
         raise ValueError(
-            "Unexpected DoE1 scalar CSV schema. Expected the columns in the "
-            "authoritative DoE_1_Dataset_Scalars.csv order."
+            f"Unexpected DoE1 scalar index {df.index.name!r}; expected "
+            f"{DOE1_SOURCE_COLUMNS[0]!r}."
+        )
+
+    duplicate_columns = pd.Index(actual_columns)[
+        pd.Index(actual_columns).duplicated()].unique().tolist()
+    if duplicate_columns:
+        raise ValueError(
+            f"Duplicate DoE1 scalar column names are not allowed: "
+            f"{duplicate_columns}"
+        )
+
+    unknown_columns = [
+        name for name in df.columns if name not in DOE1_COLUMN_MAP
+    ]
+    if unknown_columns:
+        raise ValueError(
+            f"Unknown DoE1 scalar columns: {unknown_columns}. Expected a "
+            "subset of the known DoE1 source columns."
         )
 
     renamed = df.rename(columns=DOE1_COLUMN_MAP).copy()

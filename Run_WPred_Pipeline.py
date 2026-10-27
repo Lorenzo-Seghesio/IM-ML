@@ -20,7 +20,7 @@ The pipeline config (config/WPred_Pipeline_config.json) controls:
 
 Per-material order: M1 → M2 → Fusion → Reference.
 Fusion is skipped automatically when material=ALL (it only supports PP / ABS).
-M2 is skipped (and so are Fusion) if no M1 run succeeded.
+M2 is skipped (and so are Fusion) if no M1 run succeeded. - Not anymore (we try to run anyway the rest - also useful if i want to only run the rest)
 """
 
 import argparse
@@ -182,9 +182,9 @@ def main() -> None:
 
         m1_any_ok = any(m1_results)
         if not m1_any_ok:
-            _banner(f"[{mat}] No M1 run succeeded — skipping M2, Fusion, Reference for {mat}.", char="!")
+            _banner(f"[{mat}] No M1 run succeeded — trying anyway M2, Fusion, Reference for {mat}.", char="!")
             all_results[mat] = {"m1": m1_results, "m2": [], "fusion": [], "ref": []}
-            continue
+            # continue
 
         # ── Phase 2: M2 ───────────────────────────────────────────────────────
         _banner(f"[{mat}] PHASE 2 — M2  (process params → f-features)")
