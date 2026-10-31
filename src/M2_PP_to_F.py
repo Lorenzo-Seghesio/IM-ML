@@ -72,6 +72,7 @@ try:
     )
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
+    from Utility.batch_test_diagnostics import save_batch_test_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -81,6 +82,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     )
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
+    from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -374,6 +376,30 @@ def evaluate_model(model: M2Model,
 
 # ── Pipeline functions ────────────────────────────────────────────────────────
 
+def _resolve_features_csv(configured_path: Path) -> Path:
+    """Resolve the canonical M1 feature CSV, falling back to legacy artifacts."""
+    if configured_path.exists():
+        return configured_path
+    if configured_path.name == "sensors_features_f.csv":
+        legacy_path = configured_path.with_name("pressure_features_f.csv")
+    elif configured_path.name == "pressure_features_f.csv":
+        legacy_path = configured_path.with_name("sensors_features_f.csv")
+    else:
+        legacy_path = None
+    if legacy_path is not None and legacy_path.exists():
+        warnings.warn(
+            f"Configured M1 feature file is missing: {configured_path}. "
+            f"Using legacy-compatible artifact: {legacy_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return legacy_path
+    raise FileNotFoundError(
+        f"M1 feature CSV not found: {configured_path}. Run M1 to generate "
+        "sensors_features_f.csv."
+    )
+
+
 def load_data(data_cfg: dict, prep_cfg: dict):
     """Load scalar process-parameter CSV and M1 f-feature CSV; join, clean, drop zero cols.
 
@@ -385,8 +411,8 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     """
     df_scalar = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                             index_col=data_cfg["id_col"])
-    df_f      = pd.read_csv(BASE_DIR / data_cfg["features_csv"],
-                            index_col=data_cfg["id_col"])
+    features_path = _resolve_features_csv(BASE_DIR / data_cfg["features_csv"])
+    df_f = pd.read_csv(features_path, index_col=data_cfg["id_col"])
 
     group_col = data_cfg.get("group_col")
     group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
@@ -1178,7 +1204,8 @@ def main():
     save_cv_plots(metrics_df, K, mat, run_best_dir)
     save_cv_diagnostics(
         cv_predictions, run_best_dir,
-        f"[{mat}] Indicative M2 K-fold CV on dev set", f_cols)
+        f"[{mat}] Indicative M2 K-fold CV on dev set", f_cols,
+        save_per_fold_plots=False)
 
     # ── Final training on all dev; evaluation on held-out test ───────────────
     final_model, y_sc = final_train_m2(
@@ -1198,6 +1225,13 @@ def main():
 
     save_final_test_plots(Y[test_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat, f_cols)
+    save_batch_test_diagnostics(
+        Y[test_idx], final_metrics["pred"],
+        group_ids[test_idx] if group_ids is not None else None,
+        part_ids[test_idx], run_best_dir,
+        target_names=f_cols,
+        title=f"[{mat} | M2] Final held-out test",
+    )
 
     overall_updated = save_models(
         final_model, final_metrics,
@@ -1234,6 +1268,13 @@ def main():
     if overall_updated:
         save_final_test_plots(Y[test_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat, f_cols)
+        save_batch_test_diagnostics(
+            Y[test_idx], final_metrics["pred"],
+            group_ids[test_idx] if group_ids is not None else None,
+            part_ids[test_idx], overall_best_dir,
+            target_names=f_cols,
+            title=f"[{mat} | M2] Final held-out test",
+        )
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
         for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
             shutil.copy2(cv_plot, overall_best_dir / cv_plot.name)

@@ -13,7 +13,7 @@ Architecture
                   → f_full  (n_f dims, zeros at inactive positions)
 
   Direct path (process parameters → M1's pp MLP):
-      pp_direct → [M1.pp_sc] → M1.pp_mlp → pp_out  (pp_hidden[-1] dims)
+    pp_direct → [M1.pp_sc] → M1.pp_mlp → pp_out  (pp_latent_dim dims)
 
   Merge (M1's frozen merge head):
       concat([f_full, pp_out]) → M1.merge → W
@@ -91,6 +91,7 @@ try:
         group_split_required,
     )
     from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
+    from Utility.batch_test_diagnostics import save_batch_test_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
@@ -98,6 +99,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
         group_split_required,
     )
     from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
+    from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -321,8 +323,21 @@ class M1Model(nn.Module):
                 )
             ])
             n_f_total = int(mcfg["n_f_features"])
-        self.pp_mlp  = PPMLP(n_pp, mcfg["pp_hidden"], mcfg["dropout"])
-        merge_in     = n_f_total + mcfg["pp_hidden"][-1]
+        if "pp_latent_dim" in mcfg:
+            pp_latent_dim = mcfg["pp_latent_dim"]
+            if isinstance(pp_latent_dim, (list, tuple)):
+                raise ValueError(
+                    "Saved M1 pp_latent_dim must be a resolved integer; "
+                    "rerun M1 Optuna with this configuration."
+                )
+            pp_layer_dims = [*mcfg["pp_hidden"], int(pp_latent_dim)]
+        else:
+            # Legacy checkpoints stored the PP output width as pp_hidden[-1].
+            pp_layer_dims = list(mcfg["pp_hidden"])
+            pp_latent_dim = pp_layer_dims[-1]
+        self.pp_latent_dim = int(pp_latent_dim)
+        self.pp_mlp  = PPMLP(n_pp, pp_layer_dims, mcfg["dropout"])
+        merge_in     = n_f_total + self.pp_latent_dim
         self.merge   = MergeHead(merge_in, mcfg["merge_hidden"], mcfg["dropout"])
 
     def forward(self, x_pt, x_pp):
@@ -442,10 +457,10 @@ class FusionModel(nn.Module):
 
         # ── Direct path ────────────────────────────────────────────────────
         pp_dir_s = self.m1_x_sc.transform(pp_direct)      # MinMax scale
-        pp_out   = self.pp_mlp(pp_dir_s)                   # (B, pp_hidden[-1])
+        pp_out   = self.pp_mlp(pp_dir_s)                   # (B, pp_latent_dim)
 
         # ── Merge ──────────────────────────────────────────────────────────
-        merged = torch.cat([f_full, pp_out], dim=1)        # (B, n_f + pp_hidden[-1])
+        merged = torch.cat([f_full, pp_out], dim=1)        # (B, n_f + pp_latent_dim)
         return self.merge(merged)                           # (B,)
 
 
@@ -506,8 +521,8 @@ class M1MergeWrapper(nn.Module):
         f_full    = x[:, :self.n_f]                          # (B, n_f)
         pp_raw    = x[:, self.n_f:]                          # (B, n_pp)
         pp_scaled = self.fusion.m1_x_sc.transform(pp_raw)   # MinMax scale
-        pp_out    = self.fusion.pp_mlp(pp_scaled)            # (B, pp_hidden[-1])
-        merged    = torch.cat([f_full, pp_out], dim=1)       # (B, n_f + pp_hidden[-1])
+        pp_out    = self.fusion.pp_mlp(pp_scaled)            # (B, pp_latent_dim)
+        merged    = torch.cat([f_full, pp_out], dim=1)       # (B, n_f + pp_latent_dim)
         return self.fusion.merge(merged)                     # (B,)
 
 
@@ -809,22 +824,67 @@ def load_m2(m2_dir: Path, device: torch.device):
     return model, mcfg, meta
 
 
+def _m1_features_path(m1_dir: Path) -> Path:
+    """Return M1's canonical sensor feature file or a legacy fallback."""
+    sensor_path = m1_dir / "sensors_features_f.csv"
+    legacy_path = m1_dir / "pressure_features_f.csv"
+    if sensor_path.exists():
+        return sensor_path
+    if legacy_path.exists():
+        warnings.warn(
+            f"M1 sensor feature file is missing: {sensor_path}. "
+            f"Using legacy artifact: {legacy_path}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return legacy_path
+    raise FileNotFoundError(
+        f"M1 feature CSV not found in {m1_dir}; expected sensors_features_f.csv."
+    )
+
+
 def get_f_positions(m1_dir: Path, m2_f_cols: list) -> list:
     """
     Return the integer positions in M1's full n_f vector where M2's predicted
-    f features belong.  Derived directly from the column names (f_3 → 3).
+    f features belong. Match signal-aware headers, with positional fallback
+    for older M2 checkpoints whose targets are named f_<position>.
     """
-    positions = [int(fc.split("_")[1]) for fc in m2_f_cols]
-    feat_csv  = m1_dir / "pressure_features_f.csv"
-    if feat_csv.exists():
-        df_f   = pd.read_csv(feat_csv, index_col=0, nrows=5)
-        f_cols = [c for c in df_f.columns]
-        zero_f = [c for c in f_cols if (df_f[c].abs() < 1e-6).all()]
-        nonzero_f = [c for c in f_cols if c not in zero_f]
-        print(f"  pressure_features_f.csv: {len(f_cols)} f cols, "
-              f"non-zero = {nonzero_f}, zero = {zero_f}")
+    feat_csv = _m1_features_path(m1_dir)
+    df_f = pd.read_csv(feat_csv, index_col=0, nrows=5)
+    f_cols = list(df_f.columns)
+    if all(fc in f_cols for fc in m2_f_cols):
+        positions = [f_cols.index(fc) for fc in m2_f_cols]
+    else:
+        # Older M2 checkpoints identify targets as f_<position>. Since the
+        # sensor rename preserves concatenation order, these remain mappable.
+        try:
+            positions = [int(fc[2:]) for fc in m2_f_cols
+                         if fc.startswith("f_") and fc[2:].isdigit()]
+        except (TypeError, ValueError):
+            positions = []
+        if (len(positions) != len(m2_f_cols)
+                or any(position >= len(f_cols) for position in positions)):
+            raise ValueError(
+                "M2 output features do not match M1's exported sensor feature "
+                f"columns. M2 features={m2_f_cols}; M1 features={f_cols}. "
+                "Rerun M2 using the current M1 sensor-feature CSV."
+            )
+    zero_f = [c for c in f_cols if (df_f[c].abs() < 1e-6).all()]
+    nonzero_f = [c for c in f_cols if c not in zero_f]
+    print(f"  {feat_csv.name}: {len(f_cols)} f cols, "
+          f"non-zero = {nonzero_f}, zero = {zero_f}")
     print(f"  f_positions for M2→M1 embedding: {positions}")
     return positions
+
+
+def _select_m2_feature_columns(df_f: pd.DataFrame, m2_f_cols: list,
+                               f_positions: list) -> pd.DataFrame:
+    """Select M2 targets from M1 features by name or legacy position."""
+    if all(column in df_f.columns for column in m2_f_cols):
+        return df_f[m2_f_cols]
+    selected = df_f.iloc[:, f_positions].copy()
+    selected.columns = m2_f_cols
+    return selected
 
 
 def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
@@ -846,12 +906,7 @@ def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
         n_f = int(m1_model.n_f_total)
     else:
         # Last-resort compatibility for metadata from an older/custom run.
-        feat_csv = m1_dir / "pressure_features_f.csv"
-        if not feat_csv.exists():
-            raise KeyError(
-                "M1 metadata contains neither 'n_f_features' nor "
-                "'curve_encoders', and pressure_features_f.csv is missing"
-            )
+        feat_csv = _m1_features_path(m1_dir)
         n_f = len(pd.read_csv(feat_csv, index_col=0, nrows=1).columns)
 
     if n_f <= 0:
@@ -1646,7 +1701,7 @@ def parse_args():
                         "(default: outputs/[dataset]/M1/{material}/best_overall)")
     p.add_argument("--m2-dir", default=None,
                    help="Path to M2 best_overall dir "
-                        "(default: outputs/[dataset]/M2/{material}/best_overall)")
+                        "(default: outputs/[dataset]/ProBayes/M2/{material}/best_overall)")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--n-ig-steps",   type=int,   default=50)
@@ -1754,11 +1809,9 @@ def main():
     print(f"  M2-scope: {len(df_m2)} parts × {n_pp} pp features")
 
     # M1's f-features (target for M2 scaler reconstruction)
-    feat_csv = m1_dir / "pressure_features_f.csv"
-    if not feat_csv.exists():
-        sys.exit(f"[ERROR] pressure_features_f.csv not found: {feat_csv}")
+    feat_csv = _m1_features_path(m1_dir)
     df_f_all  = pd.read_csv(feat_csv, index_col=0)
-    print(f"  pressure_features_f.csv: {df_f_all.shape}")
+    print(f"  {feat_csv.name}: {df_f_all.shape}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 2 — Load train/test split; map to indices
@@ -1860,7 +1913,8 @@ def main():
 
         # Need M2-joined dataset for y_sc reconstruction
         split_data_fallback = load_train_test_split(m1_dir)
-        df_f_m2 = df_m2.join(df_f_all[m2_f_cols], how="inner")
+        df_m2_f = _select_m2_feature_columns(df_f_all, m2_f_cols, f_positions)
+        df_f_m2 = df_m2.join(df_m2_f, how="inner")
         Y_f_m2  = df_f_m2[m2_f_cols].to_numpy(dtype=np.float32)
         X_pp_m2_joined     = df_f_m2[pp_cols].to_numpy(dtype=np.float32)
         part_ids_m2_joined = df_f_m2.index.to_numpy()
@@ -1897,8 +1951,8 @@ def main():
 
     print(f"  FusionModel ready  "
           f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
-    print(f"  MergeHead input = n_f + pp_hidden[-1] = "
-          f"{n_f} + {m1_cfg['pp_hidden'][-1]} = {n_f + m1_cfg['pp_hidden'][-1]}")
+    print(f"  MergeHead input = n_f + pp_latent_dim = "
+          f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 6 — Evaluate on test set
@@ -1929,6 +1983,13 @@ def main():
                             out_dir / "residuals_scatter_test.png", MAT)
     _save_residuals_hist(y_test, preds,
                          out_dir / "residuals_hist_test.png", MAT)
+    save_batch_test_diagnostics(
+        y_test, preds,
+        m1_groups[test_idx_m1] if m1_groups is not None else None,
+        ids_test, out_dir,
+        target_names=[target_col],
+        title=f"[{MAT} | Fusion] Final held-out test",
+    )
     print("  Test plots saved.")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2085,10 +2146,9 @@ def main():
             if src.exists():
                 shutil.copy2(src, out_dir / f"{prefix}_{fname}")
 
-    # Also save pressure_features_f.csv for reference
-    src_feat = m1_dir / "pressure_features_f.csv"
-    if src_feat.exists():
-        shutil.copy2(src_feat, out_dir / "pressure_features_f.csv")
+    # Also save the consumed M1 sensor-feature table for reference.
+    src_feat = _m1_features_path(m1_dir)
+    shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
 
     # Save test data
     df_test_data = df_m1.iloc[test_idx_m1].copy()

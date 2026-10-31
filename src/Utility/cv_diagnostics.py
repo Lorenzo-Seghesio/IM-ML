@@ -60,13 +60,15 @@ def _draw_diagnostics(axes, y_true: np.ndarray, y_pred: np.ndarray,
 
 
 def save_cv_diagnostics(fold_records: list[dict], out_dir: Path,
-                        title_prefix: str, target_names: list[str] | None = None
+                        title_prefix: str, target_names: list[str] | None = None,
+                        save_per_fold_plots: bool = True,
                         ) -> list[Path]:
-    """Save fold-level and combined diagnostic plots for out-of-fold predictions.
+    """Save combined and optionally individual fold diagnostic plots.
 
     Each record must contain ``fold``, ``y_true``, and ``y_pred``. Arrays may
     be one-dimensional or ``(samples, targets)``. Multi-output models receive
-    one compact all-fold diagnostic figure per target.
+    one compact all-fold diagnostic figure per target. Individual fold plots
+    are written only when ``save_per_fold_plots`` is true.
     """
     if not fold_records:
         return []
@@ -113,19 +115,20 @@ def save_cv_diagnostics(fold_records: list[dict], out_dir: Path,
         plt.close(fig)
         saved_paths.append(path)
 
-        for fold, y_true, y_pred in normalized:
-            fold_fig, fold_axes = plt.subplots(1, 3, figsize=(15, 4.5))
-            _draw_diagnostics(fold_axes, y_true[:, target_idx],
-                              y_pred[:, target_idx], f"Fold {fold + 1}",
-                              str(target_label))
-            fold_fig.suptitle(
-                f"{title_prefix} — {target_label} — Fold {fold + 1}", fontsize=13)
-            fold_fig.tight_layout(rect=(0, 0, 1, 0.94))
-            suffix = "" if n_targets == 1 else f"_{_slug(target_label)}"
-            fold_path = out_dir / f"cv_fold_{fold + 1:02d}_diagnostics{suffix}.png"
-            fold_fig.savefig(fold_path)
-            plt.close(fold_fig)
-            saved_paths.append(fold_path)
+        if save_per_fold_plots:
+            for fold, y_true, y_pred in normalized:
+                fold_fig, fold_axes = plt.subplots(1, 3, figsize=(15, 4.5))
+                _draw_diagnostics(fold_axes, y_true[:, target_idx],
+                                  y_pred[:, target_idx], f"Fold {fold + 1}",
+                                  str(target_label))
+                fold_fig.suptitle(
+                    f"{title_prefix} — {target_label} — Fold {fold + 1}", fontsize=13)
+                fold_fig.tight_layout(rect=(0, 0, 1, 0.94))
+                suffix = "" if n_targets == 1 else f"_{_slug(target_label)}"
+                fold_path = out_dir / f"cv_fold_{fold + 1:02d}_diagnostics{suffix}.png"
+                fold_fig.savefig(fold_path)
+                plt.close(fold_fig)
+                saved_paths.append(fold_path)
 
     print(f"CV diagnostic plots saved → {out_dir}")
     return saved_paths

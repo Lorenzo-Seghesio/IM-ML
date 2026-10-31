@@ -40,7 +40,7 @@ Outputs
   outputs/[dataset]/M1/[material]/plots/           scatter & metrics plots
   outputs/[dataset]/M1/[material]/run_best/        best model of this run (always written)
   outputs/[dataset]/M1/[material]/best_overall/    overall best model across all runs (updated when MAE improves)
-  outputs/[dataset]/M1/[material]/pressure_features_f.csv   encoder features for every part
+    outputs/[dataset]/M1/[material]/sensors_features_f.csv    per-signal encoder features for every part
 """
 
 import argparse
@@ -120,6 +120,7 @@ try:
     )
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
+    from Utility.batch_test_diagnostics import save_batch_test_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -129,6 +130,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     )
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
+    from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
 
 warnings.filterwarnings("ignore")
 
@@ -224,6 +226,39 @@ class PPMLP(nn.Module):
         return self.net(x)
 
 
+def _resolve_pp_branch_dims(model_cfg: dict) -> tuple[list[int], int]:
+    """Return PP hidden widths and its latent/output width.
+
+    New configs provide ``pp_hidden`` and a scalar ``pp_latent_dim``. Older
+    saved configs stored the output width as the final member of ``pp_hidden``;
+    that representation remains supported for checkpoint compatibility.
+    """
+    if "pp_latent_dim" in model_cfg:
+        latent_dim = model_cfg["pp_latent_dim"]
+        if isinstance(latent_dim, (list, tuple)):
+            raise ValueError(
+                "pp_latent_dim is a range that has not been resolved. "
+                "Use mode='optuna' to sample the PP latent width, or set a "
+                "single integer for manual mode."
+            )
+        if not isinstance(latent_dim, int) or isinstance(latent_dim, bool):
+            raise ValueError("pp_latent_dim must be a positive integer or a two-integer range.")
+        hidden_dims = list(model_cfg.get("pp_hidden", []))
+    else:
+        # Backward compatibility: legacy pp_hidden included the PP output width.
+        legacy_dims = list(model_cfg.get("pp_hidden", []))
+        if not legacy_dims:
+            raise ValueError("M1 model config must define pp_latent_dim or legacy pp_hidden.")
+        hidden_dims, latent_dim = legacy_dims[:-1], legacy_dims[-1]
+
+    if any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0
+           for dim in hidden_dims):
+        raise ValueError("Every PP hidden-layer width must be a positive integer.")
+    if latent_dim <= 0:
+        raise ValueError("The PP latent width must be a positive integer.")
+    return hidden_dims, int(latent_dim)
+
+
 class MergeHead(nn.Module):
     """
     Merge MLP: concat(f, pp_out) → hidden layers (ReLU+Dropout) → Linear(→1).
@@ -284,12 +319,13 @@ class M1Model(nn.Module):
             ])
             self.n_f_total = int(mcfg["n_f_features"])
         self.n_curves = len(self.encoders)
+        pp_hidden_dims, self.pp_latent_dim = _resolve_pp_branch_dims(mcfg)
         self.pp_mlp  = PPMLP(
             input_dim=n_pp,
-            hidden_dims=mcfg["pp_hidden"],
+            hidden_dims=[*pp_hidden_dims, self.pp_latent_dim],
             dropout=mcfg["dropout"],
         )
-        merge_in     = self.n_f_total + mcfg["pp_hidden"][-1]
+        merge_in     = self.n_f_total + self.pp_latent_dim
         self.merge   = MergeHead(
             input_dim=merge_in,
             hidden_dims=mcfg["merge_hidden"],
@@ -312,13 +348,17 @@ class M1Model(nn.Module):
         return self.merge(torch.cat([f, pp], dim=1))
 
     @torch.no_grad()
-    def get_f(self, x_pt) -> torch.Tensor:
+    def get_f_by_curve(self, x_pt) -> list[torch.Tensor]:
         self.eval()
         x_curves = self._ensure_curve_list(x_pt)
         if len(x_curves) != self.n_curves:
             raise ValueError(
                 f"Expected {self.n_curves} pressure curve tensor(s), got {len(x_curves)}")
-        return torch.cat([enc(x_curves[i]) for i, enc in enumerate(self.encoders)], dim=1)
+        return [enc(x_curves[i]) for i, enc in enumerate(self.encoders)]
+
+    @torch.no_grad()
+    def get_f(self, x_pt) -> torch.Tensor:
+        return torch.cat(self.get_f_by_curve(x_pt), dim=1)
 
 
 def _count_params(model: nn.Module) -> int:
@@ -787,24 +827,154 @@ def save_models(final_model: M1Model, final_metrics: dict,
         return False
 
 
+def _feature_signal_name(curve_name: str) -> str:
+    """Convert configured curve names to stable feature-name tokens."""
+    if curve_name.lower() in {"temp", "temperature", "t"}:
+        return "T"
+    token = "".join(char if char.isalnum() or char == "_" else "_"
+                    for char in curve_name)
+    token = token.strip("_")
+    if not token:
+        raise ValueError(f"Curve name {curve_name!r} cannot form a feature-name token.")
+    return token
+
+
+def _build_sensor_feature_schema(
+    curve_names: list[str], feature_counts: list[int],
+) -> tuple[list[str], list[dict]]:
+    if len(curve_names) != len(feature_counts):
+        raise ValueError("Curve names and encoded feature counts must have matching lengths.")
+    f_cols: list[str] = []
+    signals = []
+    for curve_name, feature_count in zip(curve_names, feature_counts):
+        signal_name = _feature_signal_name(curve_name)
+        signal_cols = [f"f_{signal_name}_{index}" for index in range(int(feature_count))]
+        if not signal_cols:
+            raise ValueError(f"Curve {curve_name!r} produced no encoded features.")
+        f_cols.extend(signal_cols)
+        signals.append({
+            "source_name": curve_name,
+            "signal_name": signal_name,
+            "n_features": int(feature_count),
+            "feature_columns": signal_cols,
+        })
+    if len(set(f_cols)) != len(f_cols):
+        raise ValueError(f"Curve names generated duplicate sensor feature columns: {f_cols}")
+    return f_cols, signals
+
+
+def _feature_summary(feat_csv: Path, id_col: str, n_samples: int,
+                     n_pp: int, model_cfg: dict,
+                     signals: list[dict]) -> dict:
+    curve_feature_total = sum(signal["n_features"] for signal in signals)
+    _, pp_embedding_width = _resolve_pp_branch_dims(model_cfg)
+    return {
+        "feature_file": feat_csv.name,
+        "id_column": id_col,
+        "n_samples": int(n_samples),
+        "n_pp_scalar_inputs": int(n_pp),
+        "curve_signals": signals,
+        "curve_feature_total": int(curve_feature_total),
+        "pp_embedding": {
+            "n_features": pp_embedding_width,
+            "included_in_sensor_features_csv": False,
+            "description": "PP-branch embedding concatenated with curve features inside the M1 merge head.",
+        },
+        "merge_head_input_width": int(curve_feature_total + pp_embedding_width),
+    }
+
+
+def _migrate_legacy_best_features(best_dir: Path, data_cfg: dict,
+                                  curve_names: list[str], n_pp: int) -> None:
+    """Add the signal-named CSV alias for an existing best model's features."""
+    sensor_path = best_dir / "sensors_features_f.csv"
+    legacy_path = best_dir / "pressure_features_f.csv"
+    metrics_path = best_dir / "best_metrics.json"
+    if sensor_path.exists() or not legacy_path.exists() or not metrics_path.exists():
+        return
+
+    best_meta = json.loads(metrics_path.read_text())
+    model_cfg = best_meta.get("model_cfg", {})
+    curve_cfgs = model_cfg.get("curve_encoders")
+    if curve_cfgs:
+        feature_counts = [int(curve_cfg["n_f_features"]) for curve_cfg in curve_cfgs]
+    elif "n_f_features" in model_cfg and len(curve_names) == 1:
+        feature_counts = [int(model_cfg["n_f_features"])]
+    else:
+        warnings.warn(
+            "Cannot migrate legacy M1 feature CSV: saved model metadata does "
+            "not identify per-curve feature widths.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+
+    try:
+        f_cols, signals = _build_sensor_feature_schema(curve_names, feature_counts)
+    except ValueError as exc:
+        warnings.warn(f"Cannot migrate legacy M1 features: {exc}", RuntimeWarning,
+                      stacklevel=2)
+        return
+
+    legacy_df = pd.read_csv(legacy_path, index_col=data_cfg["id_col"])
+    if len(legacy_df.columns) != len(f_cols):
+        warnings.warn(
+            "Cannot migrate legacy M1 feature CSV: saved column count does "
+            f"not match the model metadata ({len(legacy_df.columns)} vs {len(f_cols)}).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+
+    legacy_df.columns = f_cols
+    legacy_df.to_csv(sensor_path)
+    summary = _feature_summary(
+        sensor_path, data_cfg["id_col"], len(legacy_df), n_pp,
+        model_cfg, signals)
+    (best_dir / "feature_summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"Migrated legacy best-overall M1 features → {sensor_path}")
+
+
 def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
                      part_ids, feat_csv: Path, id_col: str,
-                     device: torch.device):
-    """Run best-fold encoder over the full cleaned dataset; save features CSV."""
+                     device: torch.device, curve_names: list[str],
+                     model_cfg: dict) -> tuple[pd.DataFrame, dict]:
+    """Run curve encoders over all cleaned parts and save labeled features."""
     pp_sc, pt_scalers = best_scalers
     _, X_pt_sc_list = apply_scalers(X_pp, X_pt, pp_sc, pt_scalers)
     pt_t_list = [
         torch.tensor(X_pt_sc[:, None, :], dtype=torch.float32, device=device)
         for X_pt_sc in X_pt_sc_list
     ]
-    f_features = best_model_cv.get_f(pt_t_list).cpu().numpy()
-    f_cols     = [f"f_{i}" for i in range(f_features.shape[1])]
+    curve_features = best_model_cv.get_f_by_curve(pt_t_list)
+    if len(curve_features) != len(curve_names):
+        raise ValueError(
+            f"Received {len(curve_features)} encoded curves but {len(curve_names)} "
+            "configured signal names."
+        )
+
+    feature_arrays = [features.cpu().numpy() for features in curve_features]
+    f_cols, signals = _build_sensor_feature_schema(
+        curve_names, [features.shape[1] for features in feature_arrays])
+
+    f_features = np.concatenate(feature_arrays, axis=1)
+    if len(f_cols) != f_features.shape[1]:
+        raise ValueError(
+            f"Generated {len(f_cols)} sensor feature names for a feature matrix "
+            f"with width {f_features.shape[1]}."
+        )
     df_f       = pd.DataFrame(f_features, columns=f_cols, index=part_ids)
     df_f.index.name = id_col
+    feat_csv.parent.mkdir(parents=True, exist_ok=True)
     df_f.to_csv(feat_csv)
-    print(f"Pressure features f saved → {feat_csv}  "
+    feature_summary = _feature_summary(
+        feat_csv, id_col, len(part_ids), X_pp.shape[1], model_cfg, signals)
+    (feat_csv.parent / "feature_summary.json").write_text(
+        json.dumps(feature_summary, indent=2))
+    print(f"Sensor features f saved → {feat_csv}  "
           f"({df_f.shape[0]} parts × {df_f.shape[1]} features)")
-    return df_f
+    print(f"Feature summary saved → {feat_csv.parent / 'feature_summary.json'}")
+    return df_f, feature_summary
 
 
 def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
@@ -980,6 +1150,7 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int,
         m_upd["n_f_features"] = _soi(trial, "n_f_features", ss["n_f_features"])
 
     # ── PP MLP ────────────────────────────────────────────────────────────────
+    has_pp_n_features = "pp_n_features" in ss
     if "pp_n_layers" in ss:
         pp_n  = _soi(trial, "pp_n_layers", ss["pp_n_layers"])
         h_cfg = ss.get("pp_hidden_size", 16)
@@ -988,6 +1159,32 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int,
              if isinstance(h_cfg, list) else int(h_cfg))
             for i in range(pp_n)
         ]
+
+    # The final PP embedding width is independently fixed or searched.
+    if has_pp_n_features:
+        feature_cfg = ss["pp_n_features"]
+        if isinstance(feature_cfg, (list, tuple)):
+            if (len(feature_cfg) != 2
+                    or any(not isinstance(value, int) or isinstance(value, bool)
+                           for value in feature_cfg)
+                    or feature_cfg[0] <= 0 or feature_cfg[1] < feature_cfg[0]):
+                raise ValueError(
+                    "optuna.search_space.pp_n_features must be a positive "
+                    "integer or a "
+                    "two-integer [min, max] range."
+                )
+            m_upd["pp_latent_dim"] = trial.suggest_int(
+                "pp_n_features", int(feature_cfg[0]), int(feature_cfg[1]))
+        elif (not isinstance(feature_cfg, int) or isinstance(feature_cfg, bool)
+              or feature_cfg <= 0):
+            raise ValueError(
+                "optuna.search_space.pp_n_features must be a positive "
+                "integer or a "
+                "two-integer [min, max] range."
+            )
+        else:
+            # Fixed integer: use it directly without creating an Optuna trial parameter.
+            m_upd["pp_latent_dim"] = feature_cfg
 
     # ── Merge MLP ─────────────────────────────────────────────────────────────
     if "merge_n_layers" in ss:
@@ -1149,6 +1346,28 @@ def best_cfg_from_study(study, optuna_cfg: dict,
     return {**base_model_cfg, **m_upd}, {**base_train_cfg, **t_upd}
 
 
+def apply_manual_pp_n_features(model_cfg: dict, optuna_cfg: dict) -> dict:
+    """Apply a fixed search-space PP embedding width when HPO is disabled."""
+    search_space = optuna_cfg.get("search_space", {})
+    if "pp_n_features" not in search_space:
+        return model_cfg
+    feature_cfg = search_space["pp_n_features"]
+    if isinstance(feature_cfg, (list, tuple)):
+        raise ValueError(
+            "optuna.search_space.pp_n_features is a range, but mode is "
+            "manual. Set mode='optuna' to optimize it or use a scalar value."
+        )
+    if (not isinstance(feature_cfg, int) or isinstance(feature_cfg, bool)
+            or feature_cfg <= 0):
+        raise ValueError(
+            "optuna.search_space.pp_n_features must be a positive integer "
+            "or a two-integer [min, max] range."
+        )
+    resolved_cfg = copy.deepcopy(model_cfg)
+    resolved_cfg["pp_latent_dim"] = feature_cfg
+    return resolved_cfg
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 _CFG_MAP = {
@@ -1275,6 +1494,7 @@ def main():
         print(f"\nFinal CV: {train_cfg['k_folds']} folds, "
               f"{train_cfg['epochs']} epochs, patience={train_cfg['patience']}")
     else:
+        model_cfg = apply_manual_pp_n_features(model_cfg, cfg.get("optuna", {}))
         print("Using manual model config — skipping HPO.")
 
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
@@ -1313,6 +1533,13 @@ def main():
 
     save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat)
+    save_batch_test_diagnostics(
+        y[test_idx], final_metrics["pred"],
+        group_ids[test_idx] if group_ids is not None else None,
+        part_ids[test_idx], run_best_dir,
+        target_names=[data_cfg["target_col"]],
+        title=f"[{mat} | M1] Final held-out test",
+    )
 
     edge_policy_metadata = edge_group_policy_metadata(
         edge_values, group_ids, edge_cfg, group_cfg)
@@ -1334,9 +1561,18 @@ def main():
 
     # Extract f-features for the FULL cleaned dataset (all parts, incl. test)
     # so that M2 has features for every part when it evaluates its own test set.
-    df_f = extract_features(final_model, final_scalers, X_pp, X_pt_list,
-                            part_ids, run_best_dir / "pressure_features_f.csv",
-                            data_cfg["id_col"], device)
+    pressure_sources = data_cfg.get("pressure_csvs")
+    if pressure_sources is None:
+        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+    curve_names = [source.get("name", f"curve_{i + 1}")
+                   for i, source in enumerate(pressure_sources)]
+    if not overall_updated:
+        _migrate_legacy_best_features(
+            overall_best_dir, data_cfg, curve_names, X_pp.shape[1])
+    df_f, feature_summary = extract_features(
+        final_model, final_scalers, X_pp, X_pt_list, part_ids,
+        run_best_dir / "sensors_features_f.csv", data_cfg["id_col"], device,
+        curve_names, model_cfg)
 
     # Save train/test split so M2 can reuse the exact same data division
     split_out = {
@@ -1402,6 +1638,13 @@ def main():
     if overall_updated:
         save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat)
+        save_batch_test_diagnostics(
+            y[test_idx], final_metrics["pred"],
+            group_ids[test_idx] if group_ids is not None else None,
+            part_ids[test_idx], overall_best_dir,
+            target_names=[data_cfg["target_col"]],
+            title=f"[{mat} | M1] Final held-out test",
+        )
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
         for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
             shutil.copy2(cv_plot, overall_best_dir / cv_plot.name)
@@ -1412,7 +1655,9 @@ def main():
                      overall_best_dir / "data_processing.json")
         (overall_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
         df_f.index.name = data_cfg["id_col"]
-        df_f.to_csv(overall_best_dir / "pressure_features_f.csv")
+        df_f.to_csv(overall_best_dir / "sensors_features_f.csv")
+        (overall_best_dir / "feature_summary.json").write_text(
+            json.dumps(feature_summary, indent=2))
         if mode == "optuna" and best_hpo is not None:
             (overall_best_dir / "hpo_best_config.json").write_text(
                 json.dumps(best_hpo, indent=2))

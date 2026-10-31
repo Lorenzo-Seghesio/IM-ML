@@ -59,6 +59,7 @@ try:
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from Utility.cv_diagnostics import save_cv_diagnostics
+    from Utility.batch_test_diagnostics import save_batch_test_diagnostics
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -69,6 +70,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from src.Utility.cv_diagnostics import save_cv_diagnostics
+    from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -554,6 +556,20 @@ def save_final_test_plots(y_test: np.ndarray, preds: np.ndarray,
     fig.savefig(out_dir / "residuals_hist_final_test.png")
     plt.close(fig)
     print(f"  Final test plots saved → {out_dir}")
+
+
+def _save_batch_test_artifacts(y_test: np.ndarray, preds: np.ndarray,
+                               group_ids, part_ids, test_idx: np.ndarray,
+                               out_dir: Path, material: str, label: str,
+                               target_name: str):
+    """Save batch diagnostics for one reference model's held-out predictions."""
+    sample_ids = part_ids[test_idx] if part_ids is not None else test_idx
+    batch_ids = group_ids[test_idx] if group_ids is not None else None
+    save_batch_test_diagnostics(
+        y_test, preds, batch_ids, sample_ids, out_dir,
+        target_names=[target_name],
+        title=f"[{material} | {label}] Final held-out test",
+    )
 
 
 def _check_overall_best(final_mae: float, overall_best_dir: Path):
@@ -1321,7 +1337,8 @@ def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed
 def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray,
                 group_values=None, group_cfg=None, fixed_train_idx=None,
-                fixed_val_idx=None, edge_values=None, edge_cfg=None):
+                fixed_val_idx=None, edge_values=None, edge_cfg=None,
+                part_ids=None, target_name="weight"):
     hpo_cfg   = cfg["encoder_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
@@ -1396,6 +1413,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
     save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "Encoder")
+    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                               part_ids, test_idx, rb_dir, mat, "Encoder",
+                               target_name)
 
     arch_info = {"channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
                  "head_hidden": head_hidden, "dropout": dropout}
@@ -1407,6 +1427,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
+        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                                   part_ids, test_idx, ob_dir, mat, "Encoder",
+                                   target_name)
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[Encoder] All artefacts copied → {ob_dir}")
@@ -1415,7 +1438,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
 def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
             dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
             group_values=None, group_cfg=None, fixed_train_idx=None,
-            fixed_val_idx=None, edge_values=None, edge_cfg=None):
+            fixed_val_idx=None, edge_values=None, edge_cfg=None,
+            part_ids=None, target_name="weight"):
     hpo_cfg   = cfg["mlp_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
@@ -1487,6 +1511,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
     save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "MLP")
+    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                               part_ids, test_idx, rb_dir, mat, "MLP",
+                               target_name)
 
     arch_info = {"n_in": n_in, "hidden_dims": hidden_dims, "dropout": dropout}
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "MLP")
@@ -1499,6 +1526,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     _save_run_info(rb_dir, ob_dir, mat, "MLP", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "MLP")
+        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                                   part_ids, test_idx, ob_dir, mat, "MLP",
+                                   target_name)
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[MLP] All artefacts copied → {ob_dir}")
@@ -1507,7 +1537,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
              dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
              group_values=None, group_cfg=None, edge_values=None,
-             edge_cfg=None):
+             edge_cfg=None, part_ids=None, target_name="weight"):
     hpo_cfg   = cfg["lgbm_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
@@ -1573,6 +1603,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
     save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "LightGBM")
+    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                               part_ids, test_idx, rb_dir, mat, "LightGBM",
+                               target_name)
 
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "LightGBM")
@@ -1583,6 +1616,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     _save_run_info(rb_dir, ob_dir, mat, "LightGBM", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "LightGBM")
+        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                                   part_ids, test_idx, ob_dir, mat, "LightGBM",
+                                   target_name)
         save_cv_plots(metrics_df, K, mat, ob_dir, "LightGBM")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[LightGBM] All artefacts copied → {ob_dir}")
@@ -1591,7 +1627,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray, pp_cols: list,
                 group_values=None, group_cfg=None, edge_values=None,
-                edge_cfg=None):
+                edge_cfg=None, part_ids=None, target_name="weight"):
     hpo_cfg   = cfg["xgboost_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
@@ -1657,6 +1693,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
     save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "XGBoost")
+    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                               part_ids, test_idx, rb_dir, mat, "XGBoost",
+                               target_name)
 
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "XGBoost")
@@ -1667,6 +1706,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     _save_run_info(rb_dir, ob_dir, mat, "XGBoost", updated, seed, sampler_seed)
     if updated:
         save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "XGBoost")
+        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
+                                   part_ids, test_idx, ob_dir, mat, "XGBoost",
+                                   target_name)
         save_cv_plots(metrics_df, K, mat, ob_dir, "XGBoost")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[XGBoost] All artefacts copied → {ob_dir}")
@@ -1779,28 +1821,32 @@ def main():
     if enc_on:
         run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                  dev_idx, test_idx, group_ids, group_cfg,
-                 m1_train_idx, m1_val_idx, edge_values, edge_cfg)
+                 m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+                 part_ids=part_ids, target_name=cfg["data"]["target_col"])
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
 
     if mlp_on:
         run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx, test_idx, pp_cols, group_ids, group_cfg,
-            m1_train_idx, m1_val_idx, edge_values, edge_cfg)
+            m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+            part_ids=part_ids, target_name=cfg["data"]["target_col"])
     else:
         print("\n[mlp]      skipped (active_models.mlp = 0)")
 
     if lgbm_on:
         run_lgbm(    X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
             dev_idx, test_idx, pp_cols, group_ids, group_cfg,
-            edge_values, edge_cfg)
+            edge_values, edge_cfg, part_ids=part_ids,
+            target_name=cfg["data"]["target_col"])
     else:
         print("\n[lgbm]     skipped (active_models.lgbm = 0)")
 
     if xgb_on:
         run_xgboost( X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                  dev_idx, test_idx, pp_cols, group_ids, group_cfg,
-                 edge_values, edge_cfg)
+                 edge_values, edge_cfg, part_ids=part_ids,
+                 target_name=cfg["data"]["target_col"])
     else:
         print("\n[xgboost]  skipped (active_models.xgboost = 0)")
 
