@@ -3,6 +3,27 @@ Fusion_M1M2_WPred.py
 ====================
 Fusion of M1's PPMLP + MergeHead with M2 acting as the encoder substitute.
 
+Fine-tuning
+-----------
+Only M2 is updated; all M1 parameters and scalers remain frozen. M1's
+PPMLP and merge head stay in evaluation mode, but gradients flow through
+the merge head into M2. The objective uses original (unscaled) units:
+
+    L = alpha * MAE_w + (1 - alpha) * mean_i(MAE_f_i)
+
+Feature targets are the saved M1 extracted sensor features, aligned by
+part ID and M2 output column. The average includes the features predicted
+by M2, excluding inactive zero-padded positions. Each alpha starts from the
+same pretrained checkpoint and seed. M1's saved train/validation split is
+reused; early stopping selects the fine-tuned epoch with the lowest validation
+composite loss. Epoch 0 is recorded as a separate pretrained reference, and
+test data is used only for reporting and XAI.
+
+Configure a scalar or list in finetuning.alpha in the Fusion JSON config,
+or pass --alpha 0 0.1 0.25 0.5 0.75 0.9 1. Fine-tuning settings are
+finetuning.{epochs,lr,batch_size,patience}, with matching CLI overrides.
+The default sweep is [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1].
+
 Architecture
 ------------
   W = Fusion(pp_indirect, pp_direct)
@@ -26,6 +47,12 @@ Usage
   # Use models from standard output paths (after running M1/M2):
   python src/Fusion_M1M2_WPred.py --material PP
 
+  # Run the configured DOE1 sweep, including full test evaluation and XAI:
+  python src/Fusion_M1M2_WPred.py --material DOE1
+
+  # Fine-tune once, overriding the configured sweep and learning rate:
+  python src/Fusion_M1M2_WPred.py --material DOE1 --alpha 0.5 --lr 0.0001
+
   # Override model paths (e.g. when using z_Old models for testing):
   python src/Fusion_M1M2_WPred.py --material PP \\
       --m1-dir outputs/z_Old/M1/PP/best_overall \\
@@ -44,8 +71,22 @@ Arguments
   --shap-bg        : max background samples for SHAP GradientExplainer (default: 100)
   --ih-samples     : max test samples used for Integrated Hessians (default: 20)
 
-Outputs (under outputs/[dataset]/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
+Outputs (under outputs/[dataset]/Fusion/{timestamp}_{material}/)
 ---------
+  alpha_comparison.csv / .png    Held-out metrics for every alpha
+  pretrained_test_metrics.json   Weight metrics before fine-tuning
+  finetuning_split.json          Exact train/validation/test part IDs
+  sweep_config.json              Resolved settings and checkpoint sources
+
+Each alpha_{value}/ subfolder contains all test and XAI outputs below, plus:
+  training_history.csv           Train/validation loss and both MAE components
+  finetuning_info.json           Settings and selected epoch/validation loss
+  fusion_model.pt                Full tuned Fusion state_dict, including scalers
+  m2_best_model.pt               Selected fine-tuned M2 state_dict
+  m2_pretrained_best_model.pt    Original M2 checkpoint for reference
+  test_feature_metrics.csv       Held-out MAE per M1 extracted feature
+  test_feature_predictions.csv   Held-out feature targets and predictions
+
   test_metrics.json              Fusion model metrics on held-out test set
   test_predictions.csv           ID_Part, y_true, y_pred
   scatter_test.png               Predicted vs. real weight scatter plot
@@ -67,8 +108,8 @@ Outputs (under outputs/[dataset]/Fusion/{YYYY-MM-DD}_{HH-MM-SS}/)
   shap_m1merge_values.csv        M1-merge SHAP values (N_test × (n_f + n_pp) cols)
   eg_m1merge_values.csv          M1-merge EG values   (N_test × (n_f + n_pp) cols)
   fusion_model_info.json         Architecture + scaler info + which model files used
-  m1_best_model.pt  /  m2_best_model.pt   (copies of used model weights)
-  m1_best_metrics.json / m2_best_metrics.json
+  m1_best_model.pt               Copy of frozen M1 weights
+  m1_best_metrics.json / m2_best_metrics.json  Source / tuned model metadata
 """
 
 import argparse
@@ -88,7 +129,7 @@ try:
     from Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
         edge_group_policy_metadata, validate_edge_groups_excluded,
-        group_split_required,
+        group_split_required, grouped_train_val_split,
     )
     from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -96,7 +137,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
         edge_group_policy_metadata, validate_edge_groups_excluded,
-        group_split_required,
+        group_split_required, grouped_train_val_split,
     )
     from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -399,7 +440,7 @@ class TorchMinMaxScaler(nn.Module):
 
 class FusionModel(nn.Module):
     """
-    Frozen fusion of M2 (encoder substitute) + M1's PPMLP + M1's MergeHead.
+    M2 (encoder substitute) + frozen M1 PPMLP and MergeHead.
 
     forward(pp_indirect, pp_direct) → W  (raw unscaled pp inputs → weight)
 
@@ -433,9 +474,7 @@ class FusionModel(nn.Module):
             p.requires_grad_(False)
 
     def forward(self, pp_indirect: torch.Tensor,
-                pp_direct: torch.Tensor) -> torch.Tensor:
-        B = pp_indirect.shape[0]
-
+                pp_direct: torch.Tensor, return_features: bool = False):
         # ── Indirect path ──────────────────────────────────────────────────
         pp_ind_s = self.m2_x_sc.transform(pp_indirect)    # MinMax scale
         f_scaled = self.m2(pp_ind_s)                       # (B, n_m2_out)
@@ -443,17 +482,7 @@ class FusionModel(nn.Module):
 
         # embed M2 predictions into the full n_f-dimensional f vector
         # inactive positions remain zero (differentiable construction via cat)
-        parts = []
-        m2_col = 0
-        for i in range(self.n_f):
-            if i in self.f_positions:
-                parts.append(f_orig[:, m2_col : m2_col + 1])
-                m2_col += 1
-            else:
-                parts.append(torch.zeros(B, 1,
-                                         device=pp_indirect.device,
-                                         dtype=pp_indirect.dtype))
-        f_full = torch.cat(parts, dim=1)                   # (B, n_f)
+        f_full = self.embed_features(f_orig)
 
         # ── Direct path ────────────────────────────────────────────────────
         pp_dir_s = self.m1_x_sc.transform(pp_direct)      # MinMax scale
@@ -461,7 +490,14 @@ class FusionModel(nn.Module):
 
         # ── Merge ──────────────────────────────────────────────────────────
         merged = torch.cat([f_full, pp_out], dim=1)        # (B, n_f + pp_latent_dim)
-        return self.merge(merged)                           # (B,)
+        weight = self.merge(merged)                         # (B,)
+        return (weight, f_orig) if return_features else weight
+
+    def embed_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Embed outputs in M1 order, preserving M2's saved column order."""
+        positions = torch.as_tensor(self.f_positions, device=features.device)
+        return features.new_zeros(len(features), self.n_f).index_copy(
+            1, positions, features)
 
 
 class FlatFusionWrapper(nn.Module):
@@ -538,16 +574,7 @@ def _compute_f_full(fusion: FusionModel, X_pp: np.ndarray,
         pp_s   = fusion.m2_x_sc.transform(pp_t)
         f_sc   = fusion.m2(pp_s)
         f_orig = fusion.m2_y_sc.inverse_transform(f_sc)
-        B      = X_pp.shape[0]
-        parts  = []
-        m2_col = 0
-        for i in range(fusion.n_f):
-            if i in fusion.f_positions:
-                parts.append(f_orig[:, m2_col : m2_col + 1])
-                m2_col += 1
-            else:
-                parts.append(torch.zeros(B, 1, device=device, dtype=torch.float32))
-        f_full = torch.cat(parts, dim=1)   # (B, n_f)
+        f_full = fusion.embed_features(f_orig)
     return f_full.cpu().numpy()
 
 
@@ -917,6 +944,164 @@ def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
 # ══════════════════════════════════════════════════════════════════════════════
 # Evaluation
 # ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_FINETUNING = {
+    "alpha": [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1],
+    "epochs": 200, "lr": 1e-4, "batch_size": 64, "patience": 30,
+}
+
+
+def resolve_finetuning(cfg: dict, args) -> tuple[list[float], dict]:
+    settings = {**DEFAULT_FINETUNING, **cfg.get("finetuning", {})}
+    for key in ("alpha", "epochs", "lr", "batch_size", "patience"):
+        override = getattr(args, key, None)
+        if override is not None:
+            settings[key] = override
+    values = settings.pop("alpha")
+    alphas = [float(a) for a in (values if isinstance(values, (list, tuple)) else [values])]
+    if not alphas or any(not math.isfinite(a) or not 0 <= a <= 1 for a in alphas):
+        raise ValueError("alpha must be a scalar or non-empty list of values in [0, 1]")
+    if len(set(alphas)) != len(alphas):
+        raise ValueError("alpha values must be unique (each has its own output folder)")
+    for key in ("epochs", "batch_size", "patience"):
+        if not isinstance(settings[key], int) or settings[key] <= 0:
+            raise ValueError(f"finetuning {key} must be a positive integer")
+    if not math.isfinite(settings["lr"]) or settings["lr"] <= 0:
+        raise ValueError("finetuning lr must be positive and finite")
+    return alphas, settings
+
+
+def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction,
+                     groups=None, group_cfg=None, edge_values=None, edge_cfg=None):
+    """Reuse M1's train/validation IDs; never use test data for model selection."""
+    path = m1_dir / "data_processing.json"
+    dp = json.loads(path.read_text()) if path.exists() else {}
+    if dp.get("train_part_ids") and dp.get("val_part_ids"):
+        lookup = {pid: i for i, pid in enumerate(part_ids.tolist())}
+        missing = set(dp["train_part_ids"] + dp["val_part_ids"]) - set(lookup)
+        if missing:
+            raise ValueError(f"Missing M1 fine-tuning part IDs: {sorted(missing)}")
+        train, val = [np.array([lookup[p] for p in dp[key]], dtype=np.intp)
+                      for key in ("train_part_ids", "val_part_ids")]
+        source = "M1 data_processing.json"
+    elif group_split_required(group_cfg, edge_cfg):
+        split_groups = groups if groups is not None else np.arange(len(part_ids))
+        train, val = grouped_train_val_split(
+            dev_idx, val_fraction, seed, split_groups, group_cfg,
+            edge_values=edge_values, edge_config=edge_cfg)
+        source = "reconstructed grouped dev split"
+    else:
+        perm = np.random.default_rng(seed).permutation(dev_idx)
+        n_val = max(1, int(len(perm) * val_fraction))
+        val, train = perm[:n_val], perm[n_val:]
+        source = "reconstructed dev split"
+    train_set, val_set, test_set = map(lambda x: set(x.tolist()), (train, val, test_idx))
+    if (not train_set or not val_set or train_set & val_set
+            or (train_set | val_set) & test_set
+            or train_set | val_set != set(dev_idx.tolist())):
+        raise ValueError("Fine-tuning requires nonempty, disjoint train/val/test partitions")
+    if groups is not None and group_split_required(group_cfg, edge_cfg):
+        validate_group_disjoint(train, val, test_idx, group_values=groups, config=group_cfg)
+    if edge_values is not None:
+        validate_edge_groups_excluded(val, edge_values, groups, edge_cfg, group_cfg,
+                                     scope_indices=dev_idx, partition="validation")
+    return train, val, source
+
+
+def fusion_mae_loss(pred_w, target_w, pred_f, target_f, alpha):
+    """Raw-unit MAE_w and the equally weighted mean of per-feature MAEs."""
+    mae_w = (pred_w.reshape(-1) - target_w.reshape(-1)).abs().mean()
+    mae_f = (pred_f - target_f).abs().mean(dim=0).mean()
+    return alpha * mae_w + (1 - alpha) * mae_f, mae_w, mae_f
+
+
+def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
+                settings, seed, device, out_dir):
+    """Train only M2, select by validation composite loss, restore best weights."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    for p in fusion.parameters():
+        p.requires_grad_(False)
+    for p in fusion.m2.parameters():
+        p.requires_grad_(True)
+    # Keep M1 Dropout disabled while retaining its gradient path back to M2.
+    fusion.eval()
+    tensors = [torch.as_tensor(a, dtype=torch.float32, device=device)
+               for a in (X, y, features)]
+    if not all(torch.isfinite(t[train_idx]).all() and torch.isfinite(t[val_idx]).all()
+               for t in tensors):
+        raise ValueError("Non-finite fine-tuning inputs or targets")
+    optimizer = torch.optim.Adam(fusion.m2.parameters(), lr=settings["lr"])
+    generator = torch.Generator().manual_seed(seed)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(torch.as_tensor(train_idx)),
+        batch_size=settings["batch_size"], shuffle=True, generator=generator)
+
+    def losses(indices):
+        x, w, f = [t[indices] for t in tensors]
+        pred_w, pred_f = fusion(x, x, return_features=True)
+        return fusion_mae_loss(pred_w, w, pred_f, f, alpha)
+
+    def score(indices):
+        fusion.eval()
+        with torch.no_grad():
+            return [float(v) for v in losses(indices)]
+
+    history = []
+    best_state = copy.deepcopy(fusion.m2.state_dict())
+    best_epoch, stale = 0, 0
+    initial_train, initial_val = score(train_idx), score(val_idx)
+    # Select an actually fine-tuned checkpoint; epoch 0 remains a reference.
+    best_loss = math.inf
+    names = ("loss", "mae_w", "mae_f")
+    history.append({"epoch": 0, **dict(zip([f"train_{n}" for n in names], initial_train)),
+                    **dict(zip([f"val_{n}" for n in names], initial_val))})
+    for epoch in range(1, settings["epochs"] + 1):
+        fusion.eval()
+        fusion.m2.train()
+        for (indices,) in loader:
+            optimizer.zero_grad(set_to_none=True)
+            loss, _, _ = losses(indices.to(device))
+            if not torch.isfinite(loss):
+                raise ValueError(f"Non-finite training loss at epoch {epoch}")
+            loss.backward()
+            optimizer.step()
+        train_score, val_score = score(train_idx), score(val_idx)
+        if not np.isfinite(train_score + val_score).all():
+            raise ValueError(f"Non-finite validation/training metrics at epoch {epoch}")
+        history.append({"epoch": epoch,
+                        **dict(zip([f"train_{n}" for n in names], train_score)),
+                        **dict(zip([f"val_{n}" for n in names], val_score))})
+        if val_score[0] < best_loss:
+            best_loss, best_epoch, stale = val_score[0], epoch, 0
+            best_state = copy.deepcopy(fusion.m2.state_dict())
+        else:
+            stale += 1
+        if epoch == 1 or epoch % 20 == 0:
+            print(f"  alpha={alpha:g} epoch={epoch} train={train_score[0]:.6f} "
+                  f"val={val_score[0]:.6f} best_epoch={best_epoch}", flush=True)
+        if stale >= settings["patience"]:
+            break
+    fusion.m2.load_state_dict(best_state)
+    fusion.eval()
+    for p in fusion.parameters():
+        p.requires_grad_(False)
+    pd.DataFrame(history).to_csv(out_dir / "training_history.csv", index=False)
+    torch.save(fusion.m2.state_dict(), out_dir / "m2_best_model.pt")
+    torch.save(fusion.state_dict(), out_dir / "fusion_model.pt")
+    info = {"alpha": alpha, **settings, "seed": seed,
+            "loss": "alpha * MAE_w + (1-alpha) * mean_i(MAE_f_i)",
+            "loss_units": "raw weight and original M1 encoder feature units",
+            "n_feature_targets": int(features.shape[1]), "m1_frozen": True,
+            "best_epoch": best_epoch, "epochs_run": epoch,
+            "initial_val_loss": initial_val[0], "best_val_loss": best_loss,
+            "train_metrics": dict(zip(names, score(train_idx))),
+            "val_metrics": dict(zip(names, score(val_idx)))}
+    (out_dir / "finetuning_info.json").write_text(json.dumps(info, indent=2))
+    print(f"  Fine-tuning done: alpha={alpha:g}, best epoch={best_epoch}, "
+          f"validation loss={best_loss:.6f}", flush=True)
+    return info
+
 
 def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
                     device: torch.device) -> dict:
@@ -1709,6 +1894,16 @@ def parse_args():
     p.add_argument("--ih-samples",   type=int,   default=20)
     p.add_argument("--eg-bg",        type=int,   default=20,
                    help="Random baselines for Expected Gradients (default: 20)")
+    p.add_argument("--alpha", type=float, nargs="+", default=None,
+                   help="One or more loss weights in [0,1]; overrides finetuning.alpha")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Maximum fine-tuning epochs (default: config or 200)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="M2 fine-tuning learning rate (default: config or 1e-4)")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Fine-tuning batch size (default: config or 64)")
+    p.add_argument("--patience", type=int, default=None,
+                   help="Early stopping patience on validation composite loss (default: 30)")
     return p.parse_args()
 
 
@@ -1734,6 +1929,9 @@ def main():
     if not cfg_path.exists():
         sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
     cfg = json.loads(cfg_path.read_text())
+    alphas, finetuning_settings = resolve_finetuning(cfg, args)
+    if not 0 < VAL_FR < 1:
+        raise ValueError("val-fraction must be in (0,1)")
 
     # ── Resolve model directories ──────────────────────────────────────────
     m1_dir = Path(args.m1_dir) if args.m1_dir else \
@@ -1753,9 +1951,9 @@ def main():
 
     # ── Output directory ───────────────────────────────────────────────────
     out_base = cfg.get("output", {}).get("output_base_dir", "outputs/ProBayes/Fusion")
-    out_dir = BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  Output : {out_dir}\n")
+    run_dir = BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    print(f"  Output : {run_dir}\n")
 
     # ══════════════════════════════════════════════════════════════════════
     # Step 1 — Load and preprocess data
@@ -1944,262 +2142,344 @@ def main():
     ).to(device)
     fusion.eval()
 
-    flat_fusion = FlatFusionWrapper(fusion, n_pp).to(device)
-    flat_fusion.eval()
-    single_pp_fusion = SinglePPFusionWrapper(fusion, n_pp).to(device)
-    single_pp_fusion.eval()
+    # Align M1's extracted signal features to the scalar rows and M2 output order.
+    selected_features = _select_m2_feature_columns(df_f_all, m2_f_cols, f_positions)
+    if not selected_features.index.is_unique:
+        raise ValueError("M1 extracted-feature IDs must be unique")
+    feature_targets = selected_features.reindex(part_ids_m1).to_numpy(dtype=np.float32)
+    used_indices = np.concatenate([dev_idx_m1, test_idx_m1])
+    if not np.isfinite(feature_targets[used_indices]).all():
+        raise ValueError("Missing or non-finite M1 extracted features for train/val/test parts")
+    train_idx, val_idx, split_source = finetuning_split(
+        m1_dir, part_ids_m1, dev_idx_m1, test_idx_m1, SEED, VAL_FR,
+        m1_groups, group_cfg, m1_edge_values, edge_cfg)
+    split_info = {"source": split_source,
+                  "train_part_ids": part_ids_m1[train_idx].tolist(),
+                  "val_part_ids": part_ids_m1[val_idx].tolist(),
+                  "test_part_ids": part_ids_m1[test_idx_m1].tolist()}
+    (run_dir / "finetuning_split.json").write_text(json.dumps(split_info, indent=2))
+    (run_dir / "sweep_config.json").write_text(json.dumps({
+        "alpha": alphas, "finetuning": finetuning_settings, "seed": SEED,
+        "m1_dir": str(m1_dir), "m2_dir": str(m2_dir),
+        "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx_m1),
+    }, indent=2))
+    pretrained_m2_state = copy.deepcopy(fusion.m2.state_dict())
+    baseline_metrics = evaluate_fusion(
+        fusion, X_pp_m1[test_idx_m1], y_m1[test_idx_m1], device)
+    baseline_metrics.pop("pred")
+    (run_dir / "pretrained_test_metrics.json").write_text(json.dumps(baseline_metrics, indent=2))
+    sweep_results = []
+    for alpha in alphas:
+        # Independent runs: reset M2 and the random streams for each alpha.
+        fusion.m2.load_state_dict(pretrained_m2_state)
+        out_dir = run_dir / f"alpha_{alpha}"
+        out_dir.mkdir()
+        print(f"\n── Fine-tuning M2: alpha={alpha:g} → {out_dir} ──", flush=True)
+        tuning_info = finetune_m2(
+            fusion, X_pp_m1, y_m1, feature_targets, train_idx, val_idx,
+            alpha, finetuning_settings, SEED, device, out_dir)
+        # Give every model the same random XAI draws for a fair comparison.
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        flat_fusion = FlatFusionWrapper(fusion, n_pp).to(device)
+        flat_fusion.eval()
+        single_pp_fusion = SinglePPFusionWrapper(fusion, n_pp).to(device)
+        single_pp_fusion.eval()
 
-    print(f"  FusionModel ready  "
-          f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
-    print(f"  MergeHead input = n_f + pp_latent_dim = "
-          f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
+        print(f"  FusionModel ready  "
+              f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
+        print(f"  MergeHead input = n_f + pp_latent_dim = "
+              f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 6 — Evaluate on test set
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 6: Test evaluation ─────────────────────────────────")
-    X_test   = X_pp_m1[test_idx_m1]
-    y_test   = y_m1[test_idx_m1]
-    ids_test = part_ids_m1[test_idx_m1]
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 6 — Evaluate on test set
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 6: Test evaluation ─────────────────────────────────")
+        X_test   = X_pp_m1[test_idx_m1]
+        y_test   = y_m1[test_idx_m1]
+        ids_test = part_ids_m1[test_idx_m1]
 
-    X_dev    = X_pp_m1[dev_idx_m1]
-    y_dev    = y_m1[dev_idx_m1]
+        X_dev    = X_pp_m1[dev_idx_m1]
+        y_dev    = y_m1[dev_idx_m1]
 
-    metrics = evaluate_fusion(fusion, X_test, y_test, device)
-    preds   = metrics.pop("pred")
+        metrics = evaluate_fusion(fusion, X_test, y_test, device)
+        preds   = metrics.pop("pred")
 
-    # Save test predictions + metrics
-    pd.DataFrame({
-        "ID_Part": ids_test,
-        "y_true":  y_test,
-        "y_pred":  preds,
-    }).to_csv(out_dir / "test_predictions.csv", index=False)
-    (out_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2))
+        with torch.no_grad():
+            test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+            _, pred_features = fusion(test_pp, test_pp, return_features=True)
+        pred_features = pred_features.cpu().numpy()
+        true_features = feature_targets[test_idx_m1]
+        per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
+        feature_mae = float(per_feature_mae.mean())
+        metrics["feature_MAE"] = feature_mae
+        metrics["composite_loss"] = alpha * metrics["MAE"] + (1-alpha) * feature_mae
+        pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
+            out_dir / "test_feature_metrics.csv", index=False)
+        feature_predictions = pd.DataFrame({"ID_Part": ids_test})
+        for i, name in enumerate(m2_f_cols):
+            feature_predictions[f"{name}_true"] = true_features[:, i]
+            feature_predictions[f"{name}_pred"] = pred_features[:, i]
+        feature_predictions.to_csv(out_dir / "test_feature_predictions.csv", index=False)
 
-    # Prediction plots
-    _save_scatter(y_test, preds, metrics,
-                  out_dir / "scatter_test.png", MAT)
-    _save_residuals_scatter(y_test, preds,
-                            out_dir / "residuals_scatter_test.png", MAT)
-    _save_residuals_hist(y_test, preds,
-                         out_dir / "residuals_hist_test.png", MAT)
-    save_batch_test_diagnostics(
-        y_test, preds,
-        m1_groups[test_idx_m1] if m1_groups is not None else None,
-        ids_test, out_dir,
-        target_names=[target_col],
-        title=f"[{MAT} | Fusion] Final held-out test",
-    )
-    print("  Test plots saved.")
+        # Save test predictions + metrics
+        pd.DataFrame({
+            "ID_Part": ids_test,
+            "y_true":  y_test,
+            "y_pred":  preds,
+        }).to_csv(out_dir / "test_predictions.csv", index=False)
+        (out_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2))
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 7 — XAI setup
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 7: XAI setup ───────────────────────────────────────")
-    # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
-    X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
-    X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
-    flat_cols   = _flat_col_names(pp_cols)
+        # Prediction plots
+        _save_scatter(y_test, preds, metrics,
+                      out_dir / "scatter_test.png", MAT)
+        _save_residuals_scatter(y_test, preds,
+                                out_dir / "residuals_scatter_test.png", MAT)
+        _save_residuals_hist(y_test, preds,
+                             out_dir / "residuals_hist_test.png", MAT)
+        save_batch_test_diagnostics(
+            y_test, preds,
+            m1_groups[test_idx_m1] if m1_groups is not None else None,
+            ids_test, out_dir,
+            target_names=[target_col],
+            title=f"[{MAT} | Fusion] Final held-out test",
+        )
+        print("  Test plots saved.")
 
-    # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
-    baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
-    print(f"  Test flat shape : {X_test_flat.shape}")
-    print(f"  Dev  flat shape : {X_dev_flat.shape}")
-    print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
-    print(f"  IG/IH baseline  : mean of dev set")
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 7 — XAI setup
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 7: XAI setup ───────────────────────────────────────")
+        # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
+        X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
+        X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
+        flat_cols   = _flat_col_names(pp_cols)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 8 — SHAP
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 8: SHAP ────────────────────────────────────────────")
-    shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
-                         args.shap_bg, device)
-    shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
-                                   args.shap_bg, device)
+        # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
+        baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
+        print(f"  Test flat shape : {X_test_flat.shape}")
+        print(f"  Dev  flat shape : {X_dev_flat.shape}")
+        print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
+        print(f"  IG/IH baseline  : mean of dev set")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 9 — Expected Gradients
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 9: Expected Gradients ──────────────────────────────")
-    ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
-                     args.n_ig_steps, args.eg_bg, device)
-    eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
-                               args.n_ig_steps, args.eg_bg, device)
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 8 — SHAP
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 8: SHAP ────────────────────────────────────────────")
+        shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
+                             args.shap_bg, device)
+        shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
+                                       args.shap_bg, device)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 10 — Integrated Hessians
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 10: Integrated Hessians ────────────────────────────")
-    ih_matrix = run_integrated_hessians(
-        flat_fusion, X_test_flat, baseline_flat,
-        args.n_ig_steps, args.ih_samples, device)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 11 — Jacobian pathway analysis
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
-    jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 12 — Save XAI results
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 12: Saving XAI results ─────────────────────────────")
-
-    # per-sample CSVs
-    if shap_vals is not None:
-        build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
-            out_dir / "shap_values.csv", index=False)
-    if ig_vals is not None:
-        build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
-            out_dir / "eg_values.csv", index=False)
-    if shap_single_pp_vals is not None:
-        build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
-            out_dir / "shap_single_pp_values.csv", index=False)
-    if eg_single_pp_vals is not None:
-        build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
-            out_dir / "eg_single_pp_values.csv", index=False)
-    build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
-        out_dir / "jacobian_values.csv", index=False)
-
-    # IH matrix
-    ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
-    ih_df.to_csv(out_dir / "ih_matrix.csv")
-
-    # summary (mean |attr| per feature)
-    summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
-    summary.to_csv(out_dir / "feature_attributions.csv")
-    print(f"  feature_attributions.csv saved")
-    print(summary.to_string())
-    single_pp_summary = build_single_pp_summary(
-        pp_cols, shap_single_pp_vals, eg_single_pp_vals)
-    single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
-    split_labeled_summary = summary.rename(columns={
-        col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
-        for col in summary.columns
-    })
-    split_labeled_summary.join(single_pp_summary, how="left").to_csv(
-        out_dir / "feature_attributions_comparison.csv")
-    print("  Single-PP and comparison attribution summaries saved")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 13 — XAI plots
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 13: XAI plots ──────────────────────────────────────")
-    save_xai_bars(summary, pp_cols, out_dir, MAT)
-    save_net_effect_bars(summary, pp_cols, out_dir, MAT)
-    save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
-    save_cancellation_bars(summary, pp_cols, out_dir, MAT)
-    if shap_vals is not None:
-        save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
-    if shap_single_pp_vals is not None:
-        save_single_pp_shap_beeswarm(
-            shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
-    save_total_effect_plot(summary, pp_cols, out_dir, MAT)
-    save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
-    save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
-
-    # ══════════════════════════════════════════════════════════════════════
-    # M1-merge XAI — f features (M2 output) + pp_direct → W
-    # Shows how much each encoder f_i feature and each raw pp feature
-    # individually contributes to the weight prediction via the merge head.
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
-    m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
-    m1_wrap.eval()
-
-    # Compute f_full from M2 predictions for dev and test sets
-    f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
-    f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
-
-    # Build [f_full | pp_raw] inputs for M1MergeWrapper
-    X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
-    X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
-    f_col_names      = [f"f_{i}" for i in range(n_f)]
-    m1merge_cols     = f_col_names + pp_cols
-    baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
-
-    print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
-          f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
-    print(f"  Active f positions   : {f_positions}  (others zero by construction)")
-
-    shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
-                                    args.shap_bg, device)
-    ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 9 — Expected Gradients
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 9: Expected Gradients ──────────────────────────────")
+        ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
+                         args.n_ig_steps, args.eg_bg, device)
+        eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
                                    args.n_ig_steps, args.eg_bg, device)
 
-    if shap_m1merge is not None:
-        build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
-            out_dir / "shap_m1merge_values.csv", index=False)
-    if ig_m1merge is not None:
-        build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
-            out_dir / "eg_m1merge_values.csv", index=False)
-    save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
-    print("  M1-merge XAI done.")
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 10 — Integrated Hessians
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 10: Integrated Hessians ────────────────────────────")
+        ih_matrix = run_integrated_hessians(
+            flat_fusion, X_test_flat, baseline_flat,
+            args.n_ig_steps, args.ih_samples, device)
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 14 — Copy model files; save fusion info
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 14: Saving model copies & fusion info ──────────────")
-    for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
-        for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2")]:
-            src = src_dir / fname
-            if src.exists():
-                shutil.copy2(src, out_dir / f"{prefix}_{fname}")
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 11 — Jacobian pathway analysis
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
+        jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
 
-    # Also save the consumed M1 sensor-feature table for reference.
-    src_feat = _m1_features_path(m1_dir)
-    shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 12 — Save XAI results
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 12: Saving XAI results ─────────────────────────────")
 
-    # Save test data
-    df_test_data = df_m1.iloc[test_idx_m1].copy()
-    df_test_data["y_pred"] = preds
-    df_test_data.to_csv(out_dir / "test_data_with_pred.csv")
+        # per-sample CSVs
+        if shap_vals is not None:
+            build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
+                out_dir / "shap_values.csv", index=False)
+        if ig_vals is not None:
+            build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
+                out_dir / "eg_values.csv", index=False)
+        if shap_single_pp_vals is not None:
+            build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
+                out_dir / "shap_single_pp_values.csv", index=False)
+        if eg_single_pp_vals is not None:
+            build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
+                out_dir / "eg_single_pp_values.csv", index=False)
+        build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
+            out_dir / "jacobian_values.csv", index=False)
 
-    # Fusion model info JSON
-    info = {
-        "material":     MAT,
-        "run_ts":       RUN_TS,
-        "m1_run_ts":    m1_run_ts,
-        "edge_group_split": effective_edge_policy,
-        "device":       str(device),
-        "m1_dir":       str(m1_dir),
-        "m2_dir":       str(m2_dir),
-        "n_pp":         n_pp,
-        "n_f":          n_f,
-        "f_positions":  f_positions,
-        "m2_f_cols":    m2_f_cols,
-        "pp_cols":      pp_cols,
-        "test_metrics": metrics,
-        "n_test":       int(len(test_idx_m1)),
-        "n_dev":        int(len(dev_idx_m1)),
-        "seed":         SEED,
-        "val_fraction": VAL_FR,
-        "n_ig_steps":   args.n_ig_steps,
-        "ih_samples":   args.ih_samples,
-        "shap_bg":      args.shap_bg,
-        "eg_bg":        args.eg_bg,
-        "m1_model_cfg": m1_cfg,
-        "m2_model_cfg": m2_cfg,
-        "m1_metrics":   {k: v for k, v in m1_meta.items()
-                         if k not in ("model_cfg",)},
-        "m2_metrics":   {k: v for k, v in m2_meta.items()
-                         if k not in ("model_cfg",)},
-        "scaler_info": {
-            "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
-            "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
-            "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
-            "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
-            "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
-            "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
-        },
-    }
-    (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
+        # IH matrix
+        ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
+        ih_df.to_csv(out_dir / "ih_matrix.csv")
 
-    print(f"\n{'═'*60}")
-    print(f"  All outputs saved → {out_dir}")
-    print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
-    print(f"  Fusion R²   = {metrics['R2']:.4f}")
-    print(f"{'═'*60}\n")
+        # summary (mean |attr| per feature)
+        summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
+        summary.to_csv(out_dir / "feature_attributions.csv")
+        print(f"  feature_attributions.csv saved")
+        print(summary.to_string())
+        single_pp_summary = build_single_pp_summary(
+            pp_cols, shap_single_pp_vals, eg_single_pp_vals)
+        single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
+        split_labeled_summary = summary.rename(columns={
+            col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
+            for col in summary.columns
+        })
+        split_labeled_summary.join(single_pp_summary, how="left").to_csv(
+            out_dir / "feature_attributions_comparison.csv")
+        print("  Single-PP and comparison attribution summaries saved")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 13 — XAI plots
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 13: XAI plots ──────────────────────────────────────")
+        save_xai_bars(summary, pp_cols, out_dir, MAT)
+        save_net_effect_bars(summary, pp_cols, out_dir, MAT)
+        save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
+        save_cancellation_bars(summary, pp_cols, out_dir, MAT)
+        if shap_vals is not None:
+            save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
+        if shap_single_pp_vals is not None:
+            save_single_pp_shap_beeswarm(
+                shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
+        save_total_effect_plot(summary, pp_cols, out_dir, MAT)
+        save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
+        save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # M1-merge XAI — f features (M2 output) + pp_direct → W
+        # Shows how much each encoder f_i feature and each raw pp feature
+        # individually contributes to the weight prediction via the merge head.
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
+        m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
+        m1_wrap.eval()
+
+        # Compute f_full from M2 predictions for dev and test sets
+        f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
+        f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
+
+        # Build [f_full | pp_raw] inputs for M1MergeWrapper
+        X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
+        X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
+        f_col_names      = [f"f_{i}" for i in range(n_f)]
+        m1merge_cols     = f_col_names + pp_cols
+        baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
+
+        print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
+              f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
+        print(f"  Active f positions   : {f_positions}  (others zero by construction)")
+
+        shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                        args.shap_bg, device)
+        ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                       args.n_ig_steps, args.eg_bg, device)
+
+        if shap_m1merge is not None:
+            build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
+                out_dir / "shap_m1merge_values.csv", index=False)
+        if ig_m1merge is not None:
+            build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
+                out_dir / "eg_m1merge_values.csv", index=False)
+        save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
+        print("  M1-merge XAI done.")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 14 — Copy model files; save fusion info
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 14: Saving model copies & fusion info ──────────────")
+        for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
+            for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2_pretrained")]:
+                src = src_dir / fname
+                if src.exists():
+                    shutil.copy2(src, out_dir / f"{prefix}_{fname}")
+
+        # The fine-tuned M2 checkpoint is saved by finetune_m2; retain its architecture.
+        tuned_meta = {**m2_meta, "source": "fusion_finetuning", "finetuning": tuning_info,
+                      "pretrained_metrics": {k: v for k, v in m2_meta.items()
+                                             if k.startswith("mean_") or k == "per_target"}}
+        for key in ("mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target"):
+            tuned_meta.pop(key, None)
+        (out_dir / "m2_best_metrics.json").write_text(json.dumps(tuned_meta, indent=2))
+
+        # Also save the consumed M1 sensor-feature table for reference.
+        src_feat = _m1_features_path(m1_dir)
+        shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
+
+        # Save test data
+        df_test_data = df_m1.iloc[test_idx_m1].copy()
+        df_test_data["y_pred"] = preds
+        df_test_data.to_csv(out_dir / "test_data_with_pred.csv")
+
+        # Fusion model info JSON
+        info = {
+            "alpha": alpha,
+            "finetuning": tuning_info,
+            "material":     MAT,
+            "run_ts":       RUN_TS,
+            "m1_run_ts":    m1_run_ts,
+            "edge_group_split": effective_edge_policy,
+            "device":       str(device),
+            "m1_dir":       str(m1_dir),
+            "m2_dir":       str(m2_dir),
+            "n_pp":         n_pp,
+            "n_f":          n_f,
+            "f_positions":  f_positions,
+            "m2_f_cols":    m2_f_cols,
+            "pp_cols":      pp_cols,
+            "test_metrics": metrics,
+            "n_test":       int(len(test_idx_m1)),
+            "n_dev":        int(len(dev_idx_m1)),
+            "seed":         SEED,
+            "val_fraction": VAL_FR,
+            "n_ig_steps":   args.n_ig_steps,
+            "ih_samples":   args.ih_samples,
+            "shap_bg":      args.shap_bg,
+            "eg_bg":        args.eg_bg,
+            "m1_model_cfg": m1_cfg,
+            "m2_model_cfg": m2_cfg,
+            "m1_metrics":   {k: v for k, v in m1_meta.items()
+                             if k not in ("model_cfg",)},
+            "m2_metrics":   {k: v for k, v in m2_meta.items()
+                             if k not in ("model_cfg",)},
+            "scaler_info": {
+                "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
+                "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
+                "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
+                "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
+                "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
+                "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
+            },
+        }
+        (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
+
+        print(f"\n{'═'*60}")
+        print(f"  All outputs saved → {out_dir}")
+        print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
+        print(f"  Fusion R²   = {metrics['R2']:.4f}")
+        print(f"{'═'*60}\n")
+
+        sweep_results.append({"alpha": alpha, "folder": out_dir.name,
+                              "best_epoch": tuning_info["best_epoch"],
+                              "best_val_loss": tuning_info["best_val_loss"], **metrics})
+        pd.DataFrame(sweep_results).to_csv(run_dir / "alpha_comparison.csv", index=False)
+    comparison = pd.DataFrame(sweep_results)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(comparison["alpha"], comparison["MAE"], "o-", label="Fine-tuned Fusion")
+    ax.axhline(baseline_metrics["MAE"], color=_PLT_C["ideal_line"], linestyle="--",
+               label="Pretrained Fusion")
+    ax.set(xlabel="Alpha", ylabel="Test weight MAE (g)", title=f"{MAT}: alpha comparison")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(run_dir / "alpha_comparison.png")
+    plt.close(fig)
+    print(f"\nAlpha sweep complete → {run_dir}\n{comparison.to_string(index=False)}")
 
 
 if __name__ == "__main__":

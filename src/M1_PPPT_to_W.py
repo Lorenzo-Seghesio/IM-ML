@@ -539,6 +539,34 @@ def evaluate_model(model: M1Model,
 
 # ── Pipeline functions ────────────────────────────────────────────────────────
 
+def _timeseries_sources(data_cfg: dict) -> list[dict]:
+    """Resolve signal sources, including the legacy pressure-only config keys."""
+    sources = data_cfg.get("timeseries_csvs")
+    if sources is None:
+        sources = data_cfg.get("pressure_csvs")
+    if sources is None:
+        sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+    if not sources:
+        raise ValueError("data.timeseries_csvs must contain at least one signal.")
+    return sources
+
+
+def _validate_curve_encoder_config(data_cfg: dict, model_cfg: dict) -> None:
+    """Require one encoder per configured signal before launching training/HPO."""
+    sources = _timeseries_sources(data_cfg)
+    encoders = model_cfg.get("curve_encoders")
+    n_encoders = len(encoders) if encoders else 1
+    if n_encoders != len(sources):
+        names = [source.get("name", f"curve_{i + 1}")
+                 for i, source in enumerate(sources)]
+        raise ValueError(
+            f"Configured {len(sources)} time-series signal(s) {names}, but "
+            f"model.curve_encoders defines {n_encoders} encoder(s). "
+            "Keep one encoder entry per signal, in the same order; when removing "
+            "a signal, also remove its corresponding model.curve_encoders entry."
+        )
+
+
 def load_data(data_cfg: dict):
     """Load CSVs, join, impute, and prepare aligned model arrays.
 
@@ -550,22 +578,20 @@ def load_data(data_cfg: dict):
     """
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
-    pressure_sources = data_cfg.get("pressure_csvs")
-    if pressure_sources is None:
-        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+    timeseries_sources = _timeseries_sources(data_cfg)
 
-    pressure_frames = []
-    pressure_cols_by_curve = []
-    for i, src in enumerate(pressure_sources):
+    signals_frames = []
+    signals_cols_by_curve = []
+    for i, src in enumerate(timeseries_sources):
         curve_name = src.get("name", f"curve_{i + 1}")
         curve_path = src.get("path")
         if curve_path is None:
-            raise ValueError("Each entry in data.pressure_csvs must define a 'path'.")
+            raise ValueError("Each entry in data.timeseries_csvs must define a 'path'.")
         df_curve = pd.read_csv(BASE_DIR / curve_path, index_col=data_cfg["id_col"])
         renamed_cols = [f"{curve_name}__{c}" for c in df_curve.columns]
         df_curve.columns = renamed_cols
-        pressure_frames.append(df_curve)
-        pressure_cols_by_curve.append((curve_name, renamed_cols))
+        signals_frames.append(df_curve)
+        signals_cols_by_curve.append((curve_name, renamed_cols))
 
     group_col = data_cfg.get("group_col")
     group_values = df_scalar[group_col].copy() if group_col in df_scalar else None
@@ -579,7 +605,7 @@ def load_data(data_cfg: dict):
     forced_drop_cols = list(dict.fromkeys([*data_cfg.get("drop_cols", []), *edge_cols]))
     df_scalar = df_scalar.drop(columns=forced_drop_cols, errors="ignore")
     df        = df_scalar.copy()
-    for df_curve in pressure_frames:
+    for df_curve in signals_frames:
         df = df.join(df_curve, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
 
@@ -601,10 +627,10 @@ def load_data(data_cfg: dict):
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
-    X_pt_list    = [df[cols].to_numpy(dtype=np.float32) for _, cols in pressure_cols_by_curve]
+    X_pt_list    = [df[cols].to_numpy(dtype=np.float32) for _, cols in signals_cols_by_curve]
     y            = df[target_col].to_numpy(dtype=np.float32)
     strat_labels = df[mat_col].to_numpy() if mat_col else None
-    curve_dims = ", ".join([f"{name}={arr.shape[1]}" for (name, _), arr in zip(pressure_cols_by_curve, X_pt_list)])
+    curve_dims = ", ".join([f"{name}={arr.shape[1]}" for (name, _), arr in zip(signals_cols_by_curve, X_pt_list)])
     print(f"pp features : {X_pp.shape[1]}   |   curves : {len(X_pt_list)} ({curve_dims})   |   samples : {len(y)}")
     print(f"Target      : mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
@@ -1402,6 +1428,7 @@ def main():
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
     out_cfg   = cfg["output"]
+    _validate_curve_encoder_config(data_cfg, model_cfg)
 
     seed   = prep_cfg["random_seed"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1561,11 +1588,9 @@ def main():
 
     # Extract f-features for the FULL cleaned dataset (all parts, incl. test)
     # so that M2 has features for every part when it evaluates its own test set.
-    pressure_sources = data_cfg.get("pressure_csvs")
-    if pressure_sources is None:
-        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+    timeseries_sources = _timeseries_sources(data_cfg)
     curve_names = [source.get("name", f"curve_{i + 1}")
-                   for i, source in enumerate(pressure_sources)]
+                   for i, source in enumerate(timeseries_sources)]
     if not overall_updated:
         _migrate_legacy_best_features(
             overall_best_dir, data_cfg, curve_names, X_pp.shape[1])

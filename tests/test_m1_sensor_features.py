@@ -11,11 +11,29 @@ from sklearn.preprocessing import MinMaxScaler
 from src.M1_PPPT_to_W import (
     _build_sensor_feature_schema,
     _migrate_legacy_best_features,
+    _timeseries_sources,
+    _validate_curve_encoder_config,
     extract_features,
 )
 
 
 class M1SensorFeatureSchemaTests(unittest.TestCase):
+    def test_removed_signal_requires_removing_its_encoder(self):
+        data = {"timeseries_csvs": [{"name": "p1"}, {"name": "p2"}]}
+        with self.assertRaisesRegex(ValueError, "also remove its corresponding"):
+            _validate_curve_encoder_config(data, {"curve_encoders": [{}, {}, {}]})
+        _validate_curve_encoder_config(data, {"curve_encoders": [{}, {}]})
+
+    def test_source_names_support_current_and_legacy_configuration(self):
+        sources = [{"name": "p1", "path": "p1.csv"},
+                   {"name": "p2", "path": "p2.csv"}]
+        for key in ("timeseries_csvs", "pressure_csvs"):
+            self.assertEqual(_timeseries_sources({key: sources}), sources)
+        self.assertEqual(_timeseries_sources({"pressure_csv": "pressure.csv"}),
+                         [{"name": "pressure", "path": "pressure.csv"}])
+        with self.assertRaisesRegex(ValueError, "at least one signal"):
+            _timeseries_sources({"timeseries_csvs": []})
+
     def test_feature_columns_follow_signal_and_curve_order(self):
         columns, signals = _build_sensor_feature_schema(
             ["p1", "p2", "temp"], [2, 1, 2],
