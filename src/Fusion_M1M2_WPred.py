@@ -11,6 +11,11 @@ the merge head into M2. The objective uses original (unscaled) units:
 
     L = alpha * MAE_w + (1 - alpha) * mean_i(MAE_f_i)
 
+For batch-decomposed M1 checkpoints, MAE_w is replaced by that checkpoint's
+component/total/balance objective, with its selected beta and saved gamma and
+balance_lambda. M1's experiment manifest automatically expands the run into
+the three matching M1/M2 loss variants. XAI continues to explain total weight.
+
 Feature targets are the saved M1 extracted sensor features, aligned by
 part ID and M2 output column. The average includes the features predicted
 by M2, excluding inactive zero-padded positions. Each alpha starts from the
@@ -133,6 +138,10 @@ try:
     )
     from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.weight_decomposition import (
+        decomposition_loss, pack_batch_targets, part_weights,
+        WholeGroupBatchSampler, feature_drop_columns,
+    )
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
@@ -141,6 +150,10 @@ except ModuleNotFoundError:  # package-style import from the repository root
     )
     from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.weight_decomposition import (
+        decomposition_loss, pack_batch_targets, part_weights,
+        WholeGroupBatchSampler, feature_drop_columns,
+    )
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -298,7 +311,7 @@ class PressureEncoder(nn.Module):
     def forward(self, x):
         x = self.convs(x)
         x = self.pool(x).squeeze(-1)
-        return self.act(self.fc(x))
+        return self.fc(x)  # M1 exports signed encoder features (no final activation).
 
 
 class PPMLP(nn.Module):
@@ -321,7 +334,7 @@ class PPMLP(nn.Module):
 
 
 class MergeHead(nn.Module):
-    def __init__(self, input_dim, hidden_dims, dropout):
+    def __init__(self, input_dim, hidden_dims, dropout, n_outputs=1):
         super().__init__()
         layers = []
         dims   = [input_dim] + hidden_dims
@@ -329,7 +342,7 @@ class MergeHead(nn.Module):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
-        layers.append(nn.Linear(dims[-1], 1))
+        layers.append(nn.Linear(dims[-1], n_outputs))
         self.net = nn.Sequential(*layers)
         linears = [m for m in self.net if isinstance(m, nn.Linear)]
         for m in linears[:-1]:
@@ -379,7 +392,10 @@ class M1Model(nn.Module):
         self.pp_latent_dim = int(pp_latent_dim)
         self.pp_mlp  = PPMLP(n_pp, pp_layer_dims, mcfg["dropout"])
         merge_in     = n_f_total + self.pp_latent_dim
-        self.merge   = MergeHead(merge_in, mcfg["merge_hidden"], mcfg["dropout"])
+        self.weight_decomposition = bool(mcfg.get("weight_decomposition", False))
+        self.loss_settings = copy.deepcopy(mcfg.get("loss_settings", {}))
+        self.merge   = MergeHead(merge_in, mcfg["merge_hidden"], mcfg["dropout"],
+                                 n_outputs=2 if self.weight_decomposition else 1)
 
     def forward(self, x_pt, x_pp):
         if isinstance(x_pt, (list, tuple)):
@@ -388,7 +404,8 @@ class M1Model(nn.Module):
             f_parts = [self.encoders[0](x_pt)]
         f  = torch.cat(f_parts, dim=1)
         pp = self.pp_mlp(x_pp)
-        return self.merge(torch.cat([f, pp], dim=1))
+        prediction = self.merge(torch.cat([f, pp], dim=1))
+        return prediction.sum(dim=1) if self.weight_decomposition else prediction
 
 
 class M2Model(nn.Module):
@@ -458,6 +475,7 @@ class FusionModel(nn.Module):
         m1_x_scaler:   TorchMinMaxScaler,
         n_f:           int,
         f_positions:   list,          # ints — M2's output cols → position in n_f vector
+        loss_settings: dict | None = None,
     ):
         super().__init__()
         self.m2        = m2_model
@@ -468,13 +486,18 @@ class FusionModel(nn.Module):
         self.m1_x_sc   = m1_x_scaler
         self.n_f       = n_f
         self.f_positions = f_positions  # e.g. [3] when only f_3 is active
+        self.weight_decomposition = next(
+            layer for layer in reversed(list(self.merge.modules()))
+            if isinstance(layer, nn.Linear)).out_features == 2
+        self.loss_settings = copy.deepcopy(loss_settings or {})
 
         # freeze all sub-modules
         for p in self.parameters():
             p.requires_grad_(False)
 
     def forward(self, pp_indirect: torch.Tensor,
-                pp_direct: torch.Tensor, return_features: bool = False):
+                pp_direct: torch.Tensor, return_features: bool = False,
+                return_components: bool = False):
         # ── Indirect path ──────────────────────────────────────────────────
         pp_ind_s = self.m2_x_sc.transform(pp_indirect)    # MinMax scale
         f_scaled = self.m2(pp_ind_s)                       # (B, n_m2_out)
@@ -490,8 +513,12 @@ class FusionModel(nn.Module):
 
         # ── Merge ──────────────────────────────────────────────────────────
         merged = torch.cat([f_full, pp_out], dim=1)        # (B, n_f + pp_latent_dim)
-        weight = self.merge(merged)                         # (B,)
-        return (weight, f_orig) if return_features else weight
+        prediction = self.merge(merged)
+        if return_components and not self.weight_decomposition:
+            raise ValueError("This legacy checkpoint has a single weight output")
+        weight = prediction.sum(dim=1) if self.weight_decomposition else prediction
+        output = prediction if return_components else weight
+        return (output, f_orig) if return_features else output
 
     def embed_features(self, features: torch.Tensor) -> torch.Tensor:
         """Embed outputs in M1 order, preserving M2's saved column order."""
@@ -559,7 +586,8 @@ class M1MergeWrapper(nn.Module):
         pp_scaled = self.fusion.m1_x_sc.transform(pp_raw)   # MinMax scale
         pp_out    = self.fusion.pp_mlp(pp_scaled)            # (B, pp_latent_dim)
         merged    = torch.cat([f_full, pp_out], dim=1)       # (B, n_f + pp_latent_dim)
-        return self.fusion.merge(merged)                     # (B,)
+        prediction = self.fusion.merge(merged)
+        return prediction.sum(dim=1) if self.fusion.weight_decomposition else prediction
 
 
 def _compute_f_full(fusion: FusionModel, X_pp: np.ndarray,
@@ -602,10 +630,10 @@ def load_scalar_data(material: str, cfg: dict):
         id_col = doe1_column_name(id_col)
         target_col = doe1_column_name(target_col)
         group_col = doe1_column_name(data_cfg.get("group_col"))
-        drop_cols = [doe1_column_name(c) for c in data_cfg.get("drop_cols", [])]
+        drop_cols = [doe1_column_name(c) for c in feature_drop_columns(data_cfg)]
     else:
         group_col = data_cfg.get("group_col")
-        drop_cols = data_cfg.get("drop_cols", [])
+        drop_cols = feature_drop_columns(data_cfg)
 
     # The source config keeps the raw CSV names so M1/M2 remain compatible;
     # Fusion exposes the canonical names in its data and XAI artefacts.
@@ -617,7 +645,6 @@ def load_scalar_data(material: str, cfg: dict):
         raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
     edge_values = (df[edge_cols].copy()
                    if edge_cols and all(c in df.columns for c in edge_cols) else None)
-    drop_cols = list(dict.fromkeys([*drop_cols, *edge_cols]))
     df = df.drop(columns=drop_cols, errors="ignore")
     pp_cols = [c for c in df.columns if c != target_col and c != group_col]
 
@@ -774,6 +801,12 @@ def _check_m1_m2_coherence(m1_dir: Path, m2_dir: Path) -> None:
     if m1_ts == m2_recorded_ts:
         print(f"  M1 ↔ M2 coherence OK  (run_ts={m1_ts})")
         return
+
+    # Batch-decomposed models have incompatible feature targets across variants/betas.
+    if json.loads(dp_path.read_text()).get("weight_decomposition", False):
+        raise ValueError(
+            f"M2 was trained for M1 {m2_recorded_ts!r}, but this model is {m1_ts!r}. "
+            "Run M2 for the matching loss variant/beta before running Fusion.")
 
     # --- Mismatch ---
     print(
@@ -1008,9 +1041,12 @@ def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction,
     return train, val, source
 
 
-def fusion_mae_loss(pred_w, target_w, pred_f, target_f, alpha):
+def fusion_mae_loss(pred_w, target_w, pred_f, target_f, alpha, loss_settings=None):
     """Raw-unit MAE_w and the equally weighted mean of per-feature MAEs."""
-    mae_w = (pred_w.reshape(-1) - target_w.reshape(-1)).abs().mean()
+    if loss_settings is not None:
+        mae_w, _ = decomposition_loss(pred_w, target_w, loss_settings)
+    else:
+        mae_w = (pred_w.reshape(-1) - target_w.reshape(-1)).abs().mean()
     mae_f = (pred_f - target_f).abs().mean(dim=0).mean()
     return alpha * mae_w + (1 - alpha) * mae_f, mae_w, mae_f
 
@@ -1033,14 +1069,24 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
         raise ValueError("Non-finite fine-tuning inputs or targets")
     optimizer = torch.optim.Adam(fusion.m2.parameters(), lr=settings["lr"])
     generator = torch.Generator().manual_seed(seed)
-    loader = torch.utils.data.DataLoader(
-        torch.utils.data.TensorDataset(torch.as_tensor(train_idx)),
-        batch_size=settings["batch_size"], shuffle=True, generator=generator)
+    dataset = torch.utils.data.TensorDataset(torch.as_tensor(train_idx))
+    if fusion.weight_decomposition and fusion.loss_settings.get("balance_lambda", 0) > 0:
+        loader = torch.utils.data.DataLoader(dataset, batch_sampler=WholeGroupBatchSampler(
+            y[train_idx, 3], settings["batch_size"], generator))
+    else:
+        loader = torch.utils.data.DataLoader(dataset, batch_size=settings["batch_size"],
+                                            shuffle=True, generator=generator)
 
     def losses(indices):
         x, w, f = [t[indices] for t in tensors]
-        pred_w, pred_f = fusion(x, x, return_features=True)
-        return fusion_mae_loss(pred_w, w, pred_f, f, alpha)
+        pred_w, pred_f = fusion(x, x, return_features=True,
+                                return_components=fusion.weight_decomposition)
+        settings_w = fusion.loss_settings if fusion.weight_decomposition else None
+        values = fusion_mae_loss(pred_w, w, pred_f, f, alpha, settings_w)
+        if fusion.weight_decomposition:
+            _, terms = decomposition_loss(pred_w, w, settings_w)
+            return (*values, *terms.values())
+        return values
 
     def score(indices):
         fusion.eval()
@@ -1053,7 +1099,8 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     initial_train, initial_val = score(train_idx), score(val_idx)
     # Select an actually fine-tuned checkpoint; epoch 0 remains a reference.
     best_loss = math.inf
-    names = ("loss", "mae_w", "mae_f")
+    names = (("loss", "weight_loss", "mae_f", "mae_avg", "mae_dev", "mae_w", "balance_loss")
+             if fusion.weight_decomposition else ("loss", "mae_w", "mae_f"))
     history.append({"epoch": 0, **dict(zip([f"train_{n}" for n in names], initial_train)),
                     **dict(zip([f"val_{n}" for n in names], initial_val))})
     for epoch in range(1, settings["epochs"] + 1):
@@ -1061,7 +1108,7 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
         fusion.m2.train()
         for (indices,) in loader:
             optimizer.zero_grad(set_to_none=True)
-            loss, _, _ = losses(indices.to(device))
+            loss = losses(indices.to(device))[0]
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite training loss at epoch {epoch}")
             loss.backward()
@@ -1090,7 +1137,9 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     torch.save(fusion.m2.state_dict(), out_dir / "m2_best_model.pt")
     torch.save(fusion.state_dict(), out_dir / "fusion_model.pt")
     info = {"alpha": alpha, **settings, "seed": seed,
-            "loss": "alpha * MAE_w + (1-alpha) * mean_i(MAE_f_i)",
+            "loss": "alpha * weight_loss + (1-alpha) * mean_i(MAE_f_i)",
+            "weight_loss_settings": fusion.loss_settings,
+            "weight_decomposition": fusion.weight_decomposition,
             "loss_units": "raw weight and original M1 encoder feature units",
             "n_feature_targets": int(features.shape[1]), "m1_frozen": True,
             "best_epoch": best_epoch, "epochs_run": epoch,
@@ -1111,10 +1160,11 @@ def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
     fusion.eval()
     with torch.no_grad():
         preds = fusion(t_pp_indirect, t_pp_direct).cpu().numpy()
-    mae  = float(mean_absolute_error(y, preds))
-    mse  = float(mean_squared_error(y, preds))
+    actual = part_weights(y)
+    mae  = float(mean_absolute_error(actual, preds))
+    mse  = float(mean_squared_error(actual, preds))
     rmse = math.sqrt(mse)
-    r2   = float(r2_score(y, preds))
+    r2   = float(r2_score(actual, preds))
     print(f"\n{'═'*55}")
     print(f"  Fusion test metrics:")
     print(f"    MAE  = {mae:.4f} g")
@@ -1122,7 +1172,15 @@ def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
     print(f"    R²   = {r2:.4f}")
     print(f"    MSE  = {mse:.4f}")
     print(f"{'═'*55}")
-    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": preds}
+    result = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": preds}
+    if fusion.weight_decomposition:
+        with torch.no_grad():
+            components = fusion(t_pp_indirect, t_pp_direct, return_components=True)
+            loss, terms = decomposition_loss(components, torch.as_tensor(
+                y, dtype=torch.float32, device=device), fusion.loss_settings)
+        result.update({"weight_loss": float(loss),
+                       **{key: float(value) for key, value in terms.items()}})
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1881,6 +1939,7 @@ def parse_args():
     p.add_argument("--material", required=True,
                    choices=["PP", "ABS", "DOE1", "pp", "abs", "doe1"],
                    help="Material (PP, ABS, or DOE1)")
+    p.add_argument("--config", default=None, help="Override the material config path")
     p.add_argument("--m1-dir", default=None,
                    help="Path to M1 best_overall dir "
                         "(default: outputs/[dataset]/M1/{material}/best_overall)")
@@ -1907,28 +1966,11 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args    = parse_args()
-    MAT     = args.material.upper()
-    SEED    = args.seed
-    VAL_FR  = args.val_fraction
-    RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'═'*60}")
-    print(f"  Fusion M1+M2  |  material={MAT}  |  device={device}")
-    print(f"{'═'*60}")
-
-    cfg_map = {
-        "PP":   "config/ProBayes/Fusion_PP_config.json",
-        "ABS":  "config/ProBayes/Fusion_ABS_config.json",
-        "DOE1": "config/DoE1/Fusion_DoE1_config.json",
-    }
-    if MAT not in cfg_map:
-        sys.exit(f"[ERROR] Unsupported material '{MAT}'")
-    cfg_path = BASE_DIR / cfg_map[MAT]
-    if not cfg_path.exists():
-        sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
-    cfg = json.loads(cfg_path.read_text())
+def run_configuration(args, cfg: dict, run_dir: Path | None = None):
+    MAT = args.material.upper()
+    SEED, VAL_FR = args.seed, args.val_fraction
+    RUN_TS = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     alphas, finetuning_settings = resolve_finetuning(cfg, args)
     if not 0 < VAL_FR < 1:
         raise ValueError("val-fraction must be in (0,1)")
@@ -1951,7 +1993,7 @@ def main():
 
     # ── Output directory ───────────────────────────────────────────────────
     out_base = cfg.get("output", {}).get("output_base_dir", "outputs/ProBayes/Fusion")
-    run_dir = BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
+    run_dir = run_dir or BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
     run_dir.mkdir(parents=True, exist_ok=False)
     print(f"  Output : {run_dir}\n")
 
@@ -2139,8 +2181,26 @@ def main():
         m1_x_scaler = t_m1_x_sc,
         n_f          = n_f,
         f_positions  = f_positions,
+        loss_settings = m1_cfg.get("loss_settings"),
     ).to(device)
     fusion.eval()
+
+    if fusion.weight_decomposition:
+        if m1_groups is None:
+            raise ValueError("Batch-decomposed Fusion requires M1 production batch IDs")
+        targets_path = m1_dir / "batch_targets.csv"
+        if not targets_path.exists():
+            raise FileNotFoundError(f"M1 batch targets missing: {targets_path}. Rerun M1.")
+        target_table = pd.read_csv(targets_path).set_index("part_id").reindex(part_ids_m1)
+        codes, _ = pd.factorize(target_table["batch_id"], sort=False)
+        packed = np.column_stack([target_table[["weight", "batch_mean", "deviation"]].to_numpy(),
+                                  codes]).astype(np.float32)
+        used = np.concatenate([dev_idx_m1, test_idx_m1])
+        if (not np.isfinite(packed[used]).all()
+                or not np.allclose(packed[used, 0], y_m1[used], rtol=1e-6, atol=1e-6)
+                or not np.array_equal(target_table["batch_id"].to_numpy()[used], m1_groups[used])):
+            raise ValueError("Fusion data does not match the actual batch targets saved by M1")
+        y_m1 = packed
 
     # Align M1's extracted signal features to the scalar rows and M2 output order.
     selected_features = _select_m2_feature_columns(df_f_all, m2_f_cols, f_positions)
@@ -2196,13 +2256,14 @@ def main():
         # ══════════════════════════════════════════════════════════════════════
         print("\n── Step 6: Test evaluation ─────────────────────────────────")
         X_test   = X_pp_m1[test_idx_m1]
-        y_test   = y_m1[test_idx_m1]
+        targets_test = y_m1[test_idx_m1]
+        y_test   = part_weights(targets_test)
         ids_test = part_ids_m1[test_idx_m1]
 
         X_dev    = X_pp_m1[dev_idx_m1]
         y_dev    = y_m1[dev_idx_m1]
 
-        metrics = evaluate_fusion(fusion, X_test, y_test, device)
+        metrics = evaluate_fusion(fusion, X_test, targets_test, device)
         preds   = metrics.pop("pred")
 
         with torch.no_grad():
@@ -2213,7 +2274,7 @@ def main():
         per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
         feature_mae = float(per_feature_mae.mean())
         metrics["feature_MAE"] = feature_mae
-        metrics["composite_loss"] = alpha * metrics["MAE"] + (1-alpha) * feature_mae
+        metrics["composite_loss"] = alpha * metrics.get("weight_loss", metrics["MAE"]) + (1-alpha) * feature_mae
         pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
             out_dir / "test_feature_metrics.csv", index=False)
         feature_predictions = pd.DataFrame({"ID_Part": ids_test})
@@ -2221,6 +2282,15 @@ def main():
             feature_predictions[f"{name}_true"] = true_features[:, i]
             feature_predictions[f"{name}_pred"] = pred_features[:, i]
         feature_predictions.to_csv(out_dir / "test_feature_predictions.csv", index=False)
+
+        if fusion.weight_decomposition:
+            with torch.no_grad():
+                components = fusion(test_pp, test_pp, return_components=True).cpu().numpy()
+            pd.DataFrame({"part_id": ids_test, "batch_id": m1_groups[test_idx_m1],
+                          "weight_true": y_test, "avg_true": targets_test[:, 1],
+                          "dev_true": targets_test[:, 2], "avg_pred": components[:, 0],
+                          "dev_pred": components[:, 1], "weight_pred": preds}).to_csv(
+                out_dir / "test_component_predictions.csv", index=False)
 
         # Save test predictions + metrics
         pd.DataFrame({
@@ -2411,6 +2481,9 @@ def main():
         # Also save the consumed M1 sensor-feature table for reference.
         src_feat = _m1_features_path(m1_dir)
         shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
+        for name in ("data_processing.json", "batch_targets.csv"):
+            if (m1_dir / name).exists():
+                shutil.copy2(m1_dir / name, out_dir / f"m1_{name}")
 
         # Save test data
         df_test_data = df_m1.iloc[test_idx_m1].copy()
@@ -2420,6 +2493,7 @@ def main():
         # Fusion model info JSON
         info = {
             "alpha": alpha,
+            "weight_loss_settings": fusion.loss_settings,
             "finetuning": tuning_info,
             "material":     MAT,
             "run_ts":       RUN_TS,
@@ -2480,6 +2554,59 @@ def main():
     fig.savefig(run_dir / "alpha_comparison.png")
     plt.close(fig)
     print(f"\nAlpha sweep complete → {run_dir}\n{comparison.to_string(index=False)}")
+
+    return comparison.to_dict("records")
+
+
+def main():
+    args    = parse_args()
+    MAT     = args.material.upper()
+    SEED    = args.seed
+    VAL_FR  = args.val_fraction
+    RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'═'*60}")
+    print(f"  Fusion M1+M2  |  material={MAT}  |  device={device}")
+    print(f"{'═'*60}")
+
+    cfg_map = {
+        "PP":   "config/ProBayes/Fusion_PP_config.json",
+        "ABS":  "config/ProBayes/Fusion_ABS_config.json",
+        "DOE1": "config/DoE1/Fusion_DoE1_config.json",
+    }
+    if MAT not in cfg_map:
+        sys.exit(f"[ERROR] Unsupported material '{MAT}'")
+    cfg_path = Path(args.config) if args.config else BASE_DIR / cfg_map[MAT]
+    if not cfg_path.exists():
+        sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
+    cfg = json.loads(cfg_path.read_text())
+    m1_root = Path(args.m1_dir) if args.m1_dir else BASE_DIR / cfg.get("models", {}).get(
+        "m1_best_dir", f"outputs/ProBayes/M1/{MAT}/best_overall")
+    manifest_path = m1_root / "experiment_variants.json"
+    if not manifest_path.exists() or not cfg.get("run_m1_variants", True):
+        run_configuration(args, cfg)
+        return
+    manifest = json.loads(manifest_path.read_text())
+    m2_root = Path(args.m2_dir) if args.m2_dir else BASE_DIR / cfg["models"]["m2_best_dir"]
+    m2_manifest_path = m2_root / "experiment_variants.json"
+    m2_manifest = json.loads(m2_manifest_path.read_text()) if m2_manifest_path.exists() else {}
+    m2_dirs = {entry["variant"]: Path(entry["m2_dir"])
+               for entry in m2_manifest.get("variants", [])}
+    run_root = BASE_DIR / cfg["output"]["output_base_dir"] / f"{RUN_TS}_{MAT}"
+    run_root.mkdir(parents=True, exist_ok=False)
+    results = []
+    for entry in manifest["variants"]:
+        experiment_args = argparse.Namespace(**vars(args))
+        experiment_args.m1_dir = entry["m1_dir"]
+        experiment_args.m2_dir = str(m2_dirs.get(entry["variant"],
+            m2_root.parent / "variants" / entry["variant"] / "best_overall"))
+        experiment_cfg = copy.deepcopy(cfg)
+        experiment_cfg["data"]["include_nominal_pp"] = True
+        rows = run_configuration(experiment_args, experiment_cfg, run_root / entry["variant"])
+        results.extend({"variant": entry["variant"], "beta": entry["beta"], **row} for row in rows)
+        pd.DataFrame(results).to_csv(run_root / "variant_alpha_comparison.csv", index=False)
+    (run_root / "experiment_variants.json").write_text(json.dumps(manifest, indent=2))
+    print(f"Fusion: all M1 loss variants complete → {run_root}")
 
 
 if __name__ == "__main__":

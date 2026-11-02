@@ -73,6 +73,7 @@ try:
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.weight_decomposition import feature_drop_columns, copy_artifacts
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -83,6 +84,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.weight_decomposition import feature_drop_columns, copy_artifacts
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -423,7 +425,7 @@ def load_data(data_cfg: dict, prep_cfg: dict):
         raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
     edge_values = (df_scalar[edge_cols].copy()
                    if edge_cols and all(c in df_scalar.columns for c in edge_cols) else None)
-    forced_drop_cols = list(dict.fromkeys([*data_cfg.get("drop_cols", []), *edge_cols]))
+    forced_drop_cols = feature_drop_columns(data_cfg)
     df_scalar = df_scalar.drop(columns=forced_drop_cols, errors="ignore")
     df        = df_scalar.join(df_f, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
@@ -450,6 +452,14 @@ def load_data(data_cfg: dict, prep_cfg: dict):
     print(f"Active f targets  : {f_cols}")
 
     pp_cols = [c for c in df.columns if c not in f_cols and c != group_col]
+    dp_path = features_path.parent / "data_processing.json"
+    if dp_path.exists():
+        expected = json.loads(dp_path.read_text()).get("pp_cols")
+        if expected:
+            missing = set(expected) - set(df.columns)
+            if missing:
+                raise ValueError(f"M2 is missing M1 process parameters: {sorted(missing)}")
+            pp_cols = expected
 
     # Impute missing values in input columns
     for col in pp_cols:
@@ -742,7 +752,7 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
 def save_models(final_model: M2Model, final_metrics: dict,
                 run_best_dir: Path, overall_best_dir: Path,
                 n_in: int, n_out: int, pp_cols: list, f_cols: list,
-                model_cfg: dict, id_col: str) -> bool:
+                model_cfg: dict, id_col: str, force_update: bool = False) -> bool:
     """Save final model weights + metadata to run_best; update overall_best if improved."""
     run_info = {
         "mean_MAE":   final_metrics["mean_MAE"],
@@ -767,7 +777,7 @@ def save_models(final_model: M2Model, final_metrics: dict,
     if overall_path.exists():
         prev_mae = json.loads(overall_path.read_text()).get("mean_MAE", float("inf"))
 
-    if mae < prev_mae:
+    if mae < prev_mae or force_update:
         torch.save(final_model.state_dict(), overall_best_dir / "best_model.pt")
         overall_path.write_text(json.dumps(run_info, indent=2))
         print(f"Overall best updated  ({prev_mae:.4f} → {mae:.4f} mean_MAE)  "
@@ -1048,25 +1058,7 @@ _CFG_MAP = {
 }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="M2 MLP — multi-output regression: process params → M1 f features.")
-    parser.add_argument("--material", type=str.upper,
-                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
-                        help=("Material subset: PP or ABS (plain KFold) "
-                              "or ALL for full dataset (stratified KFold). "
-                              "Case-insensitive."))
-    parser.add_argument("--optuna-seed", type=int, default=None,
-                        help="Optuna sampler seed; omit to generate a fresh seed.")
-    args = parser.parse_args()
-    mat  = args.material
-
-    cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
-    cfg      = json.loads(cfg_path.read_text())
-    if args.optuna_seed is not None:
-        cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
-        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
-
+def run_configuration(cfg: dict, mat: str, cfg_path: Path):
     data_cfg  = cfg["data"]
     prep_cfg  = cfg["preprocessing"]
     model_cfg = cfg["model"]
@@ -1236,7 +1228,10 @@ def main():
     overall_updated = save_models(
         final_model, final_metrics,
         run_best_dir, overall_best_dir,
-        n_in, n_out, pp_cols, f_cols, model_cfg, data_cfg["id_col"])
+        n_in, n_out, pp_cols, f_cols, model_cfg, data_cfg["id_col"],
+        force_update=(not (overall_best_dir / "scalers.json").exists()
+                      or json.loads((overall_best_dir / "scalers.json").read_text()).get("m1_run_ts")
+                      != (m1_run_ts or "unknown")))
 
     # Save scalers.json — M2's y_sc for Fusion to load directly
     sc_info = {
@@ -1256,7 +1251,7 @@ def main():
         "split_seed":   seed,
         "sampler_seed": sampler_seed,
         "m1_run_ts":    m1_run_ts or "unknown",
-        "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
+        "run_best_dir": str(run_best_dir),
     }
     (run_best_dir / "run_info.json").write_text(json.dumps(m2_run_info, indent=2))
     print(f"Run info saved → {run_best_dir / 'run_info.json'}")
@@ -1289,6 +1284,54 @@ def main():
             if src_trials.exists():
                 shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
+
+    return {"run_dir": str(run_best_dir), "m2_dir": str(overall_best_dir)}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="M2 MLP — multi-output regression: process params → M1 f features.")
+    parser.add_argument("--material", type=str.upper,
+                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
+                        help=("Material subset: PP or ABS (plain KFold) "
+                              "or ALL for full dataset (stratified KFold). "
+                              "Case-insensitive."))
+    parser.add_argument("--optuna-seed", type=int, default=None,
+                        help="Optuna sampler seed; omit to generate a fresh seed.")
+    parser.add_argument("--config", type=Path, default=None, help="Override material config path")
+    args = parser.parse_args()
+    mat  = args.material
+
+    cfg_path = args.config or BASE_DIR / "config" / _CFG_MAP[mat]
+    cfg      = json.loads(cfg_path.read_text())
+    if args.optuna_seed is not None:
+        cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
+        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
+
+    source_dir = (BASE_DIR / cfg["data"]["features_csv"]).parent
+    manifest_path = source_dir / "experiment_variants.json"
+    if not manifest_path.exists():
+        run_configuration(cfg, mat, cfg_path)
+        return
+    manifest = json.loads(manifest_path.read_text())
+    results = []
+    for entry in manifest["variants"]:
+        experiment = copy.deepcopy(cfg)
+        experiment["data"]["features_csv"] = str(Path(entry["m1_dir"]) / "sensors_features_f.csv")
+        experiment["data"]["include_nominal_pp"] = True
+        base = BASE_DIR / cfg["output"]["output_dir"] / "variants" / entry["variant"]
+        experiment["output"].update({"output_dir": str(base),
+                                     "run_best_dir": str(base / "run_best"),
+                                     "best_overall_dir": str(base / "best_overall")})
+        print(f"\nM2 matching M1 variant: {entry['variant']}, beta={entry['beta']}")
+        result = run_configuration(experiment, mat, cfg_path)
+        results.append({**entry, **result})
+    selected = next(entry for entry in results if entry["variant"] == manifest["selected_variant"])
+    root = BASE_DIR / cfg["output"]["best_overall_dir"]
+    copy_artifacts(Path(selected["m2_dir"]), root)
+    (root / "experiment_variants.json").write_text(json.dumps({
+        "selected_variant": manifest["selected_variant"], "variants": results,
+    }, indent=2))
 
 
 if __name__ == "__main__":

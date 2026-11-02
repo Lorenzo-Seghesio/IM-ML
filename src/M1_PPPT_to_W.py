@@ -121,6 +121,10 @@ try:
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.weight_decomposition import (
+        resolve_decomposition, part_weights, pack_batch_targets, decomposition_loss,
+        WholeGroupBatchSampler, feature_drop_columns, copy_artifacts, promote_m1_candidate,
+    )
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -131,6 +135,10 @@ except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.weight_decomposition import (
+        resolve_decomposition, part_weights, pack_batch_targets, decomposition_loss,
+        WholeGroupBatchSampler, feature_drop_columns, copy_artifacts, promote_m1_candidate,
+    )
 
 warnings.filterwarnings("ignore")
 
@@ -261,11 +269,13 @@ def _resolve_pp_branch_dims(model_cfg: dict) -> tuple[list[int], int]:
 
 class MergeHead(nn.Module):
     """
-    Merge MLP: concat(f, pp_out) → hidden layers (ReLU+Dropout) → Linear(→1).
+    Merge MLP: concat(f, pp_out) → hidden layers → signed linear output(s).
+    Decomposition checkpoints use [batch average, part deviation]; legacy ones
+    use a single weight output. No output activation constrains the deviation.
     Final output layer: no activation, PyTorch default init (bias enabled).
     """
 
-    def __init__(self, input_dim: int, hidden_dims: list, dropout: float):
+    def __init__(self, input_dim: int, hidden_dims: list, dropout: float, n_outputs: int = 1):
         super().__init__()
         layers = []
         dims   = [input_dim] + hidden_dims
@@ -273,7 +283,7 @@ class MergeHead(nn.Module):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(nn.ReLU())
             layers.append(nn.Dropout(dropout))
-        layers.append(nn.Linear(dims[-1], 1))   # output — no activation
+        layers.append(nn.Linear(dims[-1], n_outputs))   # signed mean/deviation outputs
         self.net = nn.Sequential(*layers)
         self._init_weights()
 
@@ -291,6 +301,7 @@ class M1Model(nn.Module):
     """
     Full dual-input model.
       forward(x_pt, x_pp)  → predicted weight (B,)
+      forward(..., return_components=True) → [batch average, deviation] (B, 2)
       get_f(x_pt)          → encoder features (B, n_f)   [no_grad]
     """
 
@@ -319,6 +330,8 @@ class M1Model(nn.Module):
             ])
             self.n_f_total = int(mcfg["n_f_features"])
         self.n_curves = len(self.encoders)
+        self.weight_decomposition = bool(mcfg.get("weight_decomposition", False))
+        self.loss_settings = copy.deepcopy(mcfg.get("loss_settings", {}))
         pp_hidden_dims, self.pp_latent_dim = _resolve_pp_branch_dims(mcfg)
         self.pp_mlp  = PPMLP(
             input_dim=n_pp,
@@ -330,6 +343,7 @@ class M1Model(nn.Module):
             input_dim=merge_in,
             hidden_dims=mcfg["merge_hidden"],
             dropout=mcfg["dropout"],
+            n_outputs=2 if self.weight_decomposition else 1,
         )
 
     def _ensure_curve_list(self, x_pt):
@@ -337,7 +351,7 @@ class M1Model(nn.Module):
             return list(x_pt)
         return [x_pt]
 
-    def forward(self, x_pt, x_pp: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_pt, x_pp: torch.Tensor, return_components: bool = False) -> torch.Tensor:
         x_curves = self._ensure_curve_list(x_pt)
         if len(x_curves) != self.n_curves:
             raise ValueError(
@@ -345,7 +359,12 @@ class M1Model(nn.Module):
         f_parts = [enc(x_curves[i]) for i, enc in enumerate(self.encoders)]
         f   = torch.cat(f_parts, dim=1)
         pp  = self.pp_mlp(x_pp)
-        return self.merge(torch.cat([f, pp], dim=1))
+        prediction = self.merge(torch.cat([f, pp], dim=1))
+        if self.weight_decomposition:
+            return prediction if return_components else prediction.sum(dim=1)
+        if return_components:
+            raise ValueError("This legacy checkpoint has a single weight output")
+        return prediction
 
     @torch.no_grad()
     def get_f_by_curve(self, x_pt) -> list[torch.Tensor]:
@@ -464,7 +483,7 @@ def train_fold(model: M1Model,
                Xpp_tr, Xpt_tr_list, y_tr,
                Xpp_val, Xpt_val_list, y_val,
                tcfg: dict, device: torch.device):
-    """Train for one fold with early stopping; returns model & best val MAE."""
+    """Train with the configured objective; early-stop on full-weight val MAE."""
     criterion = nn.L1Loss()
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=tcfg["lr"],
@@ -477,9 +496,14 @@ def train_fold(model: M1Model,
     pp_tr,  pt_tr_list,  ty_tr  = to_tensors(Xpp_tr,  Xpt_tr_list,  y_tr,  device)
     pp_val, pt_val_list, ty_val = to_tensors(Xpp_val, Xpt_val_list, y_val, device)
 
-    loader = DataLoader(TensorDataset(pp_tr, *pt_tr_list, ty_tr),
-                        batch_size=tcfg["batch_size"], shuffle=True,
-                        drop_last=False)
+    dataset = TensorDataset(pp_tr, *pt_tr_list, ty_tr)
+    if model.weight_decomposition and model.loss_settings.get("balance_lambda", 0) > 0:
+        loader = DataLoader(dataset, batch_sampler=WholeGroupBatchSampler(
+            y_tr[:, 3], tcfg["batch_size"]))
+    else:
+        loader = DataLoader(dataset, batch_size=tcfg["batch_size"], shuffle=True,
+                            drop_last=False)
+    history = []
 
     best_val_mae = float("inf")
     best_state   = copy.deepcopy(model.state_dict())
@@ -493,7 +517,11 @@ def train_fold(model: M1Model,
             b_pt_list = list(batch[1:-1])
             b_y  = batch[-1]
             optimizer.zero_grad()
-            loss = criterion(model(b_pt_list, b_pp), b_y)
+            if model.weight_decomposition:
+                components = model(b_pt_list, b_pp, return_components=True)
+                loss, _ = decomposition_loss(components, b_y, model.loss_settings)
+            else:
+                loss = criterion(model(b_pt_list, b_pp), b_y)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(b_y)
@@ -501,7 +529,18 @@ def train_fold(model: M1Model,
 
         model.eval()
         with torch.no_grad():
-            val_mae = criterion(model(pt_val_list, pp_val), ty_val).item()
+            if model.weight_decomposition:
+                components = model(pt_val_list, pp_val, return_components=True)
+                val_loss, val_terms = decomposition_loss(components, ty_val, model.loss_settings)
+                val_mae = val_terms["mae_w"].item()
+                history.append({"epoch": epoch, "train_loss": epoch_loss,
+                                "val_loss": float(val_loss),
+                                **{f"val_{key}": float(value) for key, value in val_terms.items()}})
+            else:
+                val_mae = criterion(model(pt_val_list, pp_val), ty_val).item()
+                history.append({"epoch": epoch, "train_loss": epoch_loss, "val_mae_w": val_mae})
+            if not np.isfinite(val_mae) or not np.isfinite(epoch_loss):
+                raise ValueError("Non-finite M1 training or validation loss")
         if tcfg["scheduler_factor"] < 1:
             scheduler.step(val_mae)
 
@@ -519,6 +558,9 @@ def train_fold(model: M1Model,
                 break
 
     model.load_state_dict(best_state)
+    model.best_val_mae = best_val_mae
+    model.training_history = history
+    model.eval()
     return model, best_val_mae
 
 
@@ -530,11 +572,22 @@ def evaluate_model(model: M1Model,
     model.eval()
     with torch.no_grad():
         pred = model(pt_t_list, pp_t).cpu().numpy()
-    mae  = float(mean_absolute_error(y_arr, pred))
-    mse  = float(mean_squared_error(y_arr, pred))
+    actual = part_weights(y_arr)
+    mae  = float(mean_absolute_error(actual, pred))
+    mse  = float(mean_squared_error(actual, pred))
     rmse = math.sqrt(mse)
-    r2   = float(r2_score(y_arr, pred))
-    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": pred}
+    r2   = float(r2_score(actual, pred))
+    result = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": pred}
+    if model.weight_decomposition:
+        with torch.no_grad():
+            components = model(pt_t_list, pp_t, return_components=True)
+            loss, terms = decomposition_loss(
+                components, torch.as_tensor(y_arr, dtype=torch.float32, device=device),
+                model.loss_settings)
+        result.update({"weight_loss": float(loss),
+                       **{key: float(value) for key, value in terms.items()},
+                       "pred_components": components.cpu().numpy()})
+    return result
 
 
 # ── Pipeline functions ────────────────────────────────────────────────────────
@@ -602,7 +655,7 @@ def load_data(data_cfg: dict):
         raise ValueError(f"Configured edge-group columns are missing: {missing_edge_cols}")
     edge_values = (df_scalar[edge_cols].copy()
                    if edge_cols and all(c in df_scalar.columns for c in edge_cols) else None)
-    forced_drop_cols = list(dict.fromkeys([*data_cfg.get("drop_cols", []), *edge_cols]))
+    forced_drop_cols = feature_drop_columns(data_cfg)
     df_scalar = df_scalar.drop(columns=forced_drop_cols, errors="ignore")
     df        = df_scalar.copy()
     for df_curve in signals_frames:
@@ -711,10 +764,10 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
                               Xpp_val, Xpt_val, y[val_idx], train_cfg, device)
 
         res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device)
-        fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        fold_results.append({k: v for k, v in res.items() if k not in ("pred", "pred_components")})
         fold_predictions.append({
             "fold": fold,
-            "y_true": y[test_idx].copy(),
+            "y_true": part_weights(y[test_idx]).copy(),
             "y_pred": res["pred"].copy(),
         })
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
@@ -812,7 +865,7 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
 
 def save_models(final_model: M1Model, final_metrics: dict,
                 n_pp: int, T_list: list[int], model_cfg: dict,
-                run_best_dir: Path, overall_best_dir: Path,
+                run_best_dir: Path, overall_best_dir: Path | None,
                 force_update: bool = False) -> bool:
     """Save final model weights + test metrics; update overall_best if improved.
 
@@ -830,11 +883,17 @@ def save_models(final_model: M1Model, final_metrics: dict,
         "n_pp":     n_pp,
         "T_list":   T_list,
         "model_cfg": model_cfg,
+        "selection_MAE": getattr(final_model, "best_val_mae", final_metrics["MAE"]),
+        "selection_scope": "validation_full_part_weight",
+        **{key: value for key, value in final_metrics.items()
+           if key not in ("pred", "pred_components")},
     }
     torch.save(final_model.state_dict(), run_best_dir / "best_model.pt")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(run_info, indent=2))
     print(f"\nFinal model saved  (MAE={final_metrics['MAE']:.4f})  → {run_best_dir}")
 
+    if overall_best_dir is None:
+        return False
     overall_path = overall_best_dir / "best_metrics.json"
     prev_mae     = float("inf")
     if overall_path.exists():
@@ -1009,9 +1068,9 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                    group_values=None, group_cfg=None, edge_values=None,
                    edge_cfg=None):
     """Train the final M1Model on all dev data.
-    A small internal validation split (val_fraction × dev) is used solely
-    for early stopping — it is never reported.  Final evaluation is always
-    performed by the caller on the held-out test set.
+    A small internal validation split (val_fraction × dev) is used for early
+    stopping and, in decomposition sweeps, beta selection. Test data is reserved
+    for final reporting by the caller.
     Uses final_epochs / final_patience from train_cfg when present.
     Returns (model, (pp_sc, pt_scalers)).
     """
@@ -1404,30 +1463,18 @@ _CFG_MAP = {
 }
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="M1 dual-input NN — injection-moulded part weight prediction.")
-    parser.add_argument("--material", type=str.upper,
-                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
-                        help=("Material subset: PP or ABS (plain KFold) "
-                              "or ALL for full dataset (stratified KFold). "
-                              "Case-insensitive."))
-    parser.add_argument("--optuna-seed", type=int, default=None,
-                        help="Optuna sampler seed; omit to generate a fresh seed.")
-    args = parser.parse_args()
-    mat  = args.material
-
-    cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
-    cfg      = json.loads(cfg_path.read_text())
-    if args.optuna_seed is not None:
-        cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
-        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
-
+def run_configuration(cfg: dict, mat: str, cfg_path: Path,
+                      run_best_dir: Path | None = None,
+                      overall_best_dir: Path | None = None, promote_legacy: bool = False):
+    """Run one beta/loss experiment; ordinary one-output models remain supported."""
     data_cfg  = cfg["data"]
     prep_cfg  = cfg["preprocessing"]
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
     out_cfg   = cfg["output"]
+    loss = model_cfg.get("loss_settings")
+    model_run_ts = (_RUN_TS if not loss else
+                    f"{_RUN_TS}_{loss['variant']}_beta_{loss['beta']:g}")
     _validate_curve_encoder_config(data_cfg, model_cfg)
 
     seed   = prep_cfg["random_seed"]
@@ -1439,9 +1486,13 @@ def main():
     print(f"Config   : {cfg_path}")
 
     out_dir          = BASE_DIR / out_cfg["output_dir"]
-    run_best_dir     = BASE_DIR / out_cfg["run_best_dir"] / _RUN_TS
-    overall_best_dir = BASE_DIR / out_cfg["best_overall_dir"]
+    if run_best_dir is None:
+        run_best_dir = BASE_DIR / out_cfg["run_best_dir"] / _RUN_TS
+    if promote_legacy:
+        overall_best_dir = BASE_DIR / out_cfg["best_overall_dir"]
     for d in [out_dir, run_best_dir, overall_best_dir]:
+        if d is None:
+            continue
         d.mkdir(parents=True, exist_ok=True)
 
     (part_ids, X_pp, X_pt_list, y, strat_labels, pp_cols,
@@ -1485,6 +1536,14 @@ def main():
         group_ids = group_ids[y_keep_mask] if group_ids is not None else None
         edge_values = edge_values[y_keep_mask] if edge_values is not None else None
         print(f"Post-filter split  →  dev={len(dev_idx)}  test={len(test_idx)}")
+
+    if model_cfg.get("weight_decomposition", False):
+        if group_ids is None or not group_cfg.get("enabled", False):
+            raise ValueError("Batch decomposition requires data.group_col and group_split.enabled=true")
+        y = pack_batch_targets(y, group_ids)
+        pd.DataFrame({"part_id": part_ids, "batch_id": group_ids, "weight": y[:, 0],
+                      "batch_mean": y[:, 1], "deviation": y[:, 2]}).to_csv(
+            run_best_dir / "batch_targets.csv", index=False)
 
     dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
 
@@ -1558,10 +1617,10 @@ def main():
           f"R²={final_metrics['R2']:.4f}  MSE={final_metrics['MSE']:.4f}")
     print(f"{'═' * 60}")
 
-    save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
+    save_final_test_plots(part_weights(y[test_idx]), final_metrics["pred"], final_metrics,
                           run_best_dir, mat)
     save_batch_test_diagnostics(
-        y[test_idx], final_metrics["pred"],
+        part_weights(y[test_idx]), final_metrics["pred"],
         group_ids[test_idx] if group_ids is not None else None,
         part_ids[test_idx], run_best_dir,
         target_names=[data_cfg["target_col"]],
@@ -1570,11 +1629,11 @@ def main():
 
     edge_policy_metadata = edge_group_policy_metadata(
         edge_values, group_ids, edge_cfg, group_cfg)
-    prior_dp_path = overall_best_dir / "data_processing.json"
+    prior_dp_path = overall_best_dir / "data_processing.json" if overall_best_dir else None
     prior_edge_policy = (json.loads(prior_dp_path.read_text()).get("edge_group_split")
-                         if prior_dp_path.exists() else None)
+                         if prior_dp_path and prior_dp_path.exists() else None)
     force_policy_refresh = bool(
-        edge_cfg and (not prior_edge_policy
+        overall_best_dir and edge_cfg and (not prior_edge_policy
                       or prior_edge_policy.get("policy_hash")
                       != edge_policy_metadata["policy_hash"])
     )
@@ -1591,7 +1650,7 @@ def main():
     timeseries_sources = _timeseries_sources(data_cfg)
     curve_names = [source.get("name", f"curve_{i + 1}")
                    for i, source in enumerate(timeseries_sources)]
-    if not overall_updated:
+    if not overall_updated and overall_best_dir is not None:
         _migrate_legacy_best_features(
             overall_best_dir, data_cfg, curve_names, X_pp.shape[1])
     df_f, feature_summary = extract_features(
@@ -1612,7 +1671,10 @@ def main():
 
     # Save data_processing.json — shared contract for M2 and Fusion
     dp = {
-        "run_ts":         _RUN_TS,
+        "weight_decomposition": model_cfg.get("weight_decomposition", False),
+        "loss_settings": model_cfg.get("loss_settings", {}),
+        "batch_target_definition": "actual production batch mean; deviation = weight - batch mean",
+        "run_ts":         model_run_ts,
         "id_col":         data_cfg["id_col"],
         "random_seed":    seed,
         "pp_cols":        pp_cols,
@@ -1651,20 +1713,20 @@ def main():
 
     # Save run_info.json — lightweight run identifier for users
     run_info = {
-        "run_ts":       _RUN_TS,
+        "run_ts":       model_run_ts,
         "material":     mat,
         "split_seed":   seed,
         "sampler_seed": sampler_seed,
-        "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
+        "run_best_dir": str(run_best_dir),
     }
     (run_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
     print(f"Run info saved → {run_best_dir / 'run_info.json'}")
 
     if overall_updated:
-        save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
+        save_final_test_plots(part_weights(y[test_idx]), final_metrics["pred"], final_metrics,
                               overall_best_dir, mat)
         save_batch_test_diagnostics(
-            y[test_idx], final_metrics["pred"],
+            part_weights(y[test_idx]), final_metrics["pred"],
             group_ids[test_idx] if group_ids is not None else None,
             part_ids[test_idx], overall_best_dir,
             target_names=[data_cfg["target_col"]],
@@ -1690,6 +1752,127 @@ def main():
             if src_trials.exists():
                 shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
+
+    pd.DataFrame(final_model.training_history).to_csv(run_best_dir / "training_history.csv", index=False)
+    if final_model.weight_decomposition:
+        components = final_metrics["pred_components"]
+        pd.DataFrame({"part_id": part_ids[test_idx], "batch_id": group_ids[test_idx],
+                      "weight_true": y[test_idx, 0], "avg_true": y[test_idx, 1],
+                      "dev_true": y[test_idx, 2], "avg_pred": components[:, 0],
+                      "dev_pred": components[:, 1], "weight_pred": final_metrics["pred"]}).to_csv(
+            run_best_dir / "test_component_predictions.csv", index=False)
+    metadata_path = run_best_dir / "best_metrics.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["signal_names"] = curve_names
+    metadata_path.write_text(json.dumps(metadata, indent=2))
+    return {"folder": str(run_best_dir), "selection_MAE": final_model.best_val_mae,
+            "test_MAE": final_metrics["MAE"], "model_cfg": model_cfg, "train_cfg": train_cfg}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="M1 dual-input NN — injection-moulded part weight prediction.")
+    parser.add_argument("--material", type=str.upper,
+                        choices=["PP", "ABS", "ALL", "DOE1"], required=True,
+                        help=("Material subset: PP or ABS (plain KFold) "
+                              "or ALL for full dataset (stratified KFold). "
+                              "Case-insensitive."))
+    parser.add_argument("--optuna-seed", type=int, default=None,
+                        help="Optuna sampler seed; omit to generate a fresh seed.")
+    parser.add_argument("--config", type=Path, default=None, help="Override the material config path")
+    parser.add_argument("--beta", type=float, nargs="+", default=None,
+                        help="Override decomposition.beta with one or more values in [0,1]")
+    args = parser.parse_args()
+    mat  = args.material
+
+    cfg_path = args.config or BASE_DIR / "config" / _CFG_MAP[mat]
+    cfg      = json.loads(cfg_path.read_text())
+    if args.optuna_seed is not None:
+        cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
+        print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
+
+    if args.beta is not None:
+        cfg.setdefault("decomposition", {})["beta"] = args.beta
+        cfg["decomposition"]["enabled"] = True
+    if not cfg.get("decomposition", {}).get("enabled", False):
+        run_configuration(cfg, mat, cfg_path, promote_legacy=True)
+        return
+    run_decomposition_experiments(cfg, mat, cfg_path)
+
+
+def run_decomposition_experiments(cfg: dict, mat: str, cfg_path: Path):
+    decomposition = cfg["decomposition"]
+    betas, settings = resolve_decomposition(decomposition)
+    run_root = BASE_DIR / cfg["output"]["run_best_dir"] / _RUN_TS
+    overall_root = BASE_DIR / cfg["output"]["best_overall_dir"]
+    variant_base = BASE_DIR / cfg["output"]["output_dir"] / "variants"
+    run_root.mkdir(parents=True, exist_ok=True)
+    share_hpo = decomposition.get("share_hpo", True)
+    reference_beta = float(decomposition.get("hpo_beta", 0.5))
+    variant_order = {name: index for index, name in enumerate(
+        dict.fromkeys(setting["variant"] for setting in settings))}
+    # Tune the architecture once, then compare losses with identical hyperparameters.
+    ordered = sorted(settings, key=lambda setting: (
+        variant_order[setting["variant"]], abs(setting["beta"] - reference_beta)))
+    shared = None
+    results = []
+    for loss in ordered:
+        experiment = copy.deepcopy(cfg)
+        if share_hpo and shared is not None:
+            experiment["mode"] = "manual"
+            experiment["model"] = copy.deepcopy(shared["model_cfg"])
+            experiment["training"] = copy.deepcopy(shared["train_cfg"])
+            experiment.get("optuna", {}).get("search_space", {}).pop("pp_n_features", None)
+        experiment["model"]["weight_decomposition"] = True
+        experiment["model"]["loss_settings"] = loss
+        experiment["data"]["include_nominal_pp"] = True
+        directory = run_root / loss["variant"] / f"beta_{loss['beta']:g}"
+        print(f"\nM1 experiment: {loss} → {directory}")
+        result = run_configuration(experiment, mat, cfg_path, run_best_dir=directory)
+        if shared is None:
+            shared = result
+        if share_hpo:
+            hpo_source = Path(shared["folder"]) / "hpo_best_config.json"
+            if hpo_source.exists():
+                hpo_metadata = json.loads(hpo_source.read_text())
+                hpo_metadata["model_cfg"] = result["model_cfg"]
+                hpo_metadata["shared_hpo_reference"] = shared["folder"]
+                (directory / "hpo_best_config.json").write_text(json.dumps(hpo_metadata, indent=2))
+        results.append({**loss, **result})
+    rows = [{key: value for key, value in row.items() if key not in ("model_cfg", "train_cfg")}
+            for row in results]
+    pd.DataFrame(rows).to_csv(run_root / "beta_comparison.csv", index=False)
+    entries = []
+    for variant in dict.fromkeys(setting["variant"] for setting in settings):
+        candidates = [row for row in results if row["variant"] == variant]
+        selected = min(candidates, key=lambda row: row["selection_MAE"])
+        variant_run = run_root / variant
+        copy_artifacts(Path(selected["folder"]), variant_run)
+        pd.DataFrame([row for row in rows if row["variant"] == variant]).to_csv(
+            variant_run / "beta_comparison.csv", index=False)
+        destination = variant_base / variant / "best_overall"
+        promote_m1_candidate(variant_run, destination)
+        saved = json.loads((destination / "best_metrics.json").read_text())
+        entries.append({"variant": variant, "m1_dir": str(destination),
+                        "beta": saved["model_cfg"]["loss_settings"]["beta"],
+                        "run_beta": selected["beta"], "run_dir": str(variant_run)})
+    selected = min(results, key=lambda row: row["selection_MAE"])
+    copy_artifacts(Path(selected["folder"]), run_root)
+    promote_m1_candidate(run_root, overall_root)
+    selected_metadata = json.loads((overall_root / "best_metrics.json").read_text())
+    manifest = {"run_ts": _RUN_TS, "selection_metric": "validation_full_part_weight_MAE",
+                "selected_variant": selected_metadata["model_cfg"]["loss_settings"]["variant"],
+                "run_selected_variant": selected["variant"], "run_selected_beta": selected["beta"],
+                "betas": betas, "share_hpo": share_hpo,
+                "hpo_reference": {k: ordered[0][k] for k in ("variant", "beta")},
+                "variants": entries}
+    # Keep the top-level comparison covering every beta and variant.
+    pd.DataFrame(rows).to_csv(run_root / "beta_comparison.csv", index=False)
+    for directory in (run_root, overall_root):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "experiment_variants.json").write_text(json.dumps(manifest, indent=2))
+    print(f"M1 sweep complete: run beta={selected['beta']:g}, variant={selected['variant']}; "
+          f"validation weight MAE={selected['selection_MAE']:.6f}. Outputs: {run_root}")
 
 
 if __name__ == "__main__":

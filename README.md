@@ -5,6 +5,10 @@
 Used Python 3.12.3  
 Needed packages are specified in requirements.txt  
 
+DOE1 supports batch-average/deviation weight prediction, beta sweeps, and
+three loss variants across M1, M2, and Fusion. See
+[configuration and output details](docs/weight_decomposition.md).
+
 ### How to run the code  
 - Tune your configuration inside config folder (different config files for different .py files)
 
