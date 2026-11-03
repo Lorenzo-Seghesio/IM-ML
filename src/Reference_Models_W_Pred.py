@@ -66,6 +66,7 @@ try:
         test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
     )
     from Utility.custom_test_point_gbdt import CustomTestPointGBDT, train_custom_gbdt
+    from Utility.split_config import split_fraction, validation_fraction
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from Utility.cv_diagnostics import save_cv_diagnostics
@@ -83,6 +84,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
         test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
     )
     from src.Utility.custom_test_point_gbdt import CustomTestPointGBDT, train_custom_gbdt
+    from src.Utility.split_config import split_fraction, validation_fraction
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from src.Utility.cv_diagnostics import save_cv_diagnostics
@@ -189,6 +191,7 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
     """One-time deterministic train/test split performed before HPO or CV.
     Returns (dev_idx, test_idx) as np.intp arrays.
     """
+    test_frac = split_fraction(test_frac, "preprocessing.test_fraction")
     if group_split_required(group_cfg, edge_cfg, "test"):
         return grouped_train_test_split(n, test_frac, seed, group_values,
                                         group_cfg, strat_labels,
@@ -415,17 +418,17 @@ def _inner_split(tv_idx: np.ndarray, train_cfg: dict, seed: int, fold: int,
                  edge_values=None, edge_cfg=None) -> tuple:
     if group_split_required(group_cfg, edge_cfg, "validation"):
         return grouped_train_val_split(
-            tv_idx, train_cfg["val_fraction"], seed + fold,
+            tv_idx, validation_fraction(train_cfg), seed + fold,
             group_values, group_cfg, strat_labels, edge_values, edge_cfg)
     if strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
-                                     test_size=train_cfg["val_fraction"],
+                                     test_size=validation_fraction(train_cfg),
                                      random_state=seed + fold)
         _tr, _val = next(sss.split(tv_idx, strat_labels[tv_idx]))
         return tv_idx[_tr], tv_idx[_val]
     rng   = np.random.default_rng(seed + fold)
     perm  = rng.permutation(len(tv_idx))
-    n_val = max(1, int(len(tv_idx) * train_cfg["val_fraction"]))
+    n_val = max(1, int(len(tv_idx) * validation_fraction(train_cfg)))
     return tv_idx[perm[n_val:]], tv_idx[perm[:n_val]]
 
 
@@ -1502,6 +1505,7 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
     ss = _nn_search_space(hpo_cfg, base_tcfg)
     mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
+            "val_fraction": validation_fraction(base_tcfg, hpo_cfg),
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
             "print_every": 999999, "k_folds": hpo_cfg["n_folds"]}
 
@@ -1547,6 +1551,7 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
     ss = _nn_search_space(hpo_cfg, base_tcfg)
     mcfg_upd, tcfg_upd = suggest_mlp_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
+            "val_fraction": validation_fraction(base_tcfg, hpo_cfg),
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
             "print_every": 999999, "k_folds": hpo_cfg["n_folds"]}
 
@@ -2108,6 +2113,7 @@ def _obj_custom_gbdt(trial, X_pp, y, hpo_cfg, base_train_cfg, model_params, seed
     params = {**model_params, **suggest_custom_gbdt_params(
         trial, _nn_search_space(hpo_cfg, base_train_cfg))}
     tcfg = {**base_train_cfg, "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
+            "val_fraction": validation_fraction(base_train_cfg, hpo_cfg),
             "print_every": 999999}
     splits = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
                           group_values, group_cfg, edge_values, edge_cfg)

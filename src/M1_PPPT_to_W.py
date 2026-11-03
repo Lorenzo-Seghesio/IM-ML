@@ -123,6 +123,7 @@ try:
         TestPointMiniBatchSampler, normalization_factors, test_point_loss,
         test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
     )
+    from Utility.split_config import split_fraction, validation_fraction, split_ids_changed
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -138,6 +139,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
         TestPointMiniBatchSampler, normalization_factors, test_point_loss,
         test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
     )
+    from src.Utility.split_config import split_fraction, validation_fraction, split_ids_changed
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -385,6 +387,7 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
     Uses StratifiedShuffleSplit when strat_labels is provided (ALL mode)
     so that material proportions are balanced in both splits.
     """
+    test_frac = split_fraction(test_frac, "preprocessing.test_fraction")
     if group_split_required(group_cfg, edge_cfg, "test"):
         return grouped_train_test_split(n, test_frac, seed, group_values,
                                         group_cfg, strat_labels,
@@ -755,11 +758,11 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
 
         if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
-                tv_idx, train_cfg["val_fraction"], seed + fold,
+                tv_idx, validation_fraction(train_cfg), seed + fold,
                 group_values, group_cfg, strat_labels, edge_values, edge_cfg)
         elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
-                                        test_size=train_cfg["val_fraction"],
+                                        test_size=validation_fraction(train_cfg),
                                         random_state=seed + fold)
             _tr_rel, _val_rel = next(sss.split(tv_idx, strat_labels[tv_idx]))
             tr_idx  = tv_idx[_tr_rel]
@@ -767,7 +770,7 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
         else:
             rng     = np.random.default_rng(seed + fold)
             perm    = rng.permutation(len(tv_idx))
-            n_val   = max(1, int(len(tv_idx) * train_cfg["val_fraction"]))
+            n_val   = max(1, int(len(tv_idx) * validation_fraction(train_cfg)))
             val_idx = tv_idx[perm[:n_val]]
             tr_idx  = tv_idx[perm[n_val:]]
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
@@ -1108,11 +1111,11 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
     n_pp = X_pp.shape[1]
     if group_split_required(group_cfg, edge_cfg, "validation"):
         tr_idx, val_idx = grouped_train_val_split(
-            dev_idx, train_cfg["val_fraction"], seed, group_values,
+            dev_idx, validation_fraction(train_cfg), seed, group_values,
             group_cfg, strat_labels, edge_values, edge_cfg)
     elif strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
-                                     test_size=train_cfg["val_fraction"],
+                                     test_size=validation_fraction(train_cfg),
                                      random_state=seed)
         rel = np.arange(len(dev_idx))
         _tr_rel, _val_rel = next(sss.split(rel, strat_labels[dev_idx]))
@@ -1121,7 +1124,7 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
     else:
         rng     = np.random.default_rng(seed)
         perm    = rng.permutation(len(dev_idx))
-        n_val   = max(1, int(len(dev_idx) * train_cfg["val_fraction"]))
+        n_val   = max(1, int(len(dev_idx) * validation_fraction(train_cfg)))
         val_idx = dev_idx[perm[:n_val]]
         tr_idx  = dev_idx[perm[n_val:]]
 
@@ -1340,6 +1343,7 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
         "patience":    optuna_cfg["patience"],
         "print_every": 999999,          # suppress per-epoch printing during HPO
         "k_folds":     n_folds,
+        "val_fraction": validation_fraction(base_train_cfg, optuna_cfg),
     }
 
     if group_split_required(group_cfg, edge_cfg, "validation"):
@@ -1358,18 +1362,18 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
         # Inner validation split (mirrors run_cv logic)
         if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
-                tv_idx, base_train_cfg["val_fraction"], seed + fold,
+                tv_idx, validation_fraction(tcfg), seed + fold,
                 group_values, group_cfg, strat_labels, edge_values, edge_cfg)
         elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
-                                        test_size=base_train_cfg["val_fraction"],
+                                        test_size=validation_fraction(tcfg),
                                         random_state=seed + fold)
             _tr, _val = next(sss.split(tv_idx, strat_labels[tv_idx]))
             tr_idx, val_idx = tv_idx[_tr], tv_idx[_val]
         else:
             rng     = np.random.default_rng(seed + fold)
             perm    = rng.permutation(len(tv_idx))
-            n_val   = max(1, int(len(tv_idx) * base_train_cfg["val_fraction"]))
+            n_val   = max(1, int(len(tv_idx) * validation_fraction(tcfg)))
             val_idx = tv_idx[perm[:n_val]]
             tr_idx  = tv_idx[perm[n_val:]]
 
@@ -1723,8 +1727,14 @@ def run_experiment(cfg, mat, cfg_path):
     edge_policy_metadata = edge_group_policy_metadata(
         edge_values, group_ids, edge_cfg, group_cfg)
     prior_dp_path = overall_best_dir / "data_processing.json"
-    prior_edge_policy = (json.loads(prior_dp_path.read_text()).get("edge_group_split")
-                         if prior_dp_path.exists() else None)
+    prior_dp = json.loads(prior_dp_path.read_text()) if prior_dp_path.exists() else {}
+    prior_edge_policy = prior_dp.get("edge_group_split")
+    final_split_ids = {
+        "train_part_ids": part_ids[tr_idx_final].tolist(),
+        "val_part_ids": part_ids[val_idx_final].tolist(),
+        "test_part_ids": part_ids[test_idx].tolist(),
+    }
+    force_split_refresh = bool(prior_dp and split_ids_changed(prior_dp, final_split_ids))
     force_policy_refresh = bool(
         edge_cfg and (not prior_edge_policy
                       or prior_edge_policy.get("policy_hash")
@@ -1733,10 +1743,13 @@ def run_experiment(cfg, mat, cfg_path):
     if force_policy_refresh:
         print("Saved M1 best-overall split uses a different edge policy; "
               "promoting this run so downstream models receive a coherent split.")
+    if force_split_refresh:
+        print("Saved M1 best-overall split differs from this run; "
+              "promoting this run so downstream models receive the configured split.")
 
     overall_updated = save_models(final_model, final_metrics, n_pp, T_list, model_cfg,
                                   run_best_dir, overall_best_dir,
-                                  force_update=force_policy_refresh)
+                                  force_update=force_policy_refresh or force_split_refresh)
 
     # Extract f-features for the FULL cleaned dataset (all parts, incl. test)
     # so that M2 has features for every part when it evaluates its own test set.
@@ -1780,6 +1793,9 @@ def run_experiment(cfg, mat, cfg_path):
         },
         "test_fraction_requested": test_frac,
         "test_fraction_achieved": len(test_idx) / len(part_ids),
+        "val_fraction_requested": validation_fraction(train_cfg),
+        "val_fraction_achieved": len(val_idx_final) / len(dev_idx),
+        "hpo_val_fraction": validation_fraction(train_cfg, cfg.get("optuna", {})),
         "train_groups": (group_assignments(tr_idx_final, group_ids, group_cfg)
                   if group_ids is not None else {}),
         "val_groups":   (group_assignments(val_idx_final, group_ids, group_cfg)
@@ -1917,12 +1933,13 @@ def run_beta_experiments(cfg, mat, cfg_path, beta_override=None):
     previous_path = destination / "best_metrics.json"
     previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
     prior_dp = destination / "data_processing.json"
-    previous_policy = (json.loads(prior_dp.read_text()).get("edge_group_split", {})
-                       if prior_dp.exists() else {})
-    current_policy = json.loads((source / "data_processing.json").read_text()).get(
-        "edge_group_split", {})
+    previous_split = json.loads(prior_dp.read_text()) if prior_dp.exists() else {}
+    current_split = json.loads((source / "data_processing.json").read_text())
+    previous_policy = previous_split.get("edge_group_split", {})
+    current_policy = current_split.get("edge_group_split", {})
     if (winner["validation_mae_g"] < previous.get("validation_MAE", float("inf"))
-            or previous_policy.get("policy_hash") != current_policy.get("policy_hash")):
+            or previous_policy.get("policy_hash") != current_policy.get("policy_hash")
+            or split_ids_changed(previous_split, current_split)):
         destination.mkdir(parents=True, exist_ok=True)
         # Preserve the existing downstream M1 checkpoint/feature/split contract.
         for artifact in source.iterdir():

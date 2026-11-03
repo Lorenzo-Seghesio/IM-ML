@@ -70,6 +70,7 @@ try:
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from Utility.split_config import split_fraction, validation_fraction
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -80,6 +81,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from src.Utility.split_config import split_fraction, validation_fraction
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
@@ -224,6 +226,7 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
     Uses StratifiedShuffleSplit when strat_labels is provided (ALL mode)
     so that material proportions are balanced in both splits.
     """
+    test_frac = split_fraction(test_frac, "preprocessing.test_fraction")
     if group_split_required(group_cfg, edge_cfg, "test"):
         return grouped_train_test_split(n, test_frac, seed, group_values,
                                         group_cfg, strat_labels, edge_values, edge_cfg)
@@ -551,12 +554,12 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
         for fold_n, (tv_idx, test_idx) in enumerate(outer):
             if group_split_required(group_cfg, edge_cfg, "validation"):
                 tr_idx, val_idx = grouped_train_val_split(
-                    tv_idx, train_cfg["val_fraction"], seed + fold_n,
+                    tv_idx, validation_fraction(train_cfg), seed + fold_n,
                     group_values, group_cfg, strat_labels,
                     edge_values, edge_cfg)
             elif strat_labels is not None:
                 sss = StratifiedShuffleSplit(n_splits=1,
-                                            test_size=train_cfg["val_fraction"],
+                                            test_size=validation_fraction(train_cfg),
                                             random_state=seed + fold_n)
                 _tr, _val = next(sss.split(tv_idx, strat_labels[tv_idx]))
                 tr_idx  = tv_idx[_tr]
@@ -564,7 +567,7 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
             else:
                 rng     = np.random.default_rng(seed + fold_n)
                 perm    = rng.permutation(len(tv_idx))
-                n_val   = max(1, int(len(tv_idx) * train_cfg["val_fraction"]))
+                n_val   = max(1, int(len(tv_idx) * validation_fraction(train_cfg)))
                 val_idx = tv_idx[perm[:n_val]]
                 tr_idx  = tv_idx[perm[n_val:]]
             fold_triples.append((tr_idx, val_idx, test_idx))
@@ -820,12 +823,12 @@ def final_train_m2(X, Y, tr_idx: np.ndarray, val_idx: np.ndarray,
     if len(val_idx) == 0:
         if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
-                tr_idx, train_cfg["val_fraction"], seed, group_values,
+                tr_idx, validation_fraction(train_cfg), seed, group_values,
                 group_cfg, edge_values=edge_values, edge_config=edge_cfg)
         else:
             rng     = np.random.default_rng(seed)
             perm    = rng.permutation(len(tr_idx))
-            n_val   = max(1, int(len(tr_idx) * train_cfg["val_fraction"]))
+            n_val   = max(1, int(len(tr_idx) * validation_fraction(train_cfg)))
             val_idx = tr_idx[perm[:n_val]]
             tr_idx  = tr_idx[perm[n_val:]]
         print(f"  [fallback] Internal val split created from tr_idx "
@@ -927,6 +930,7 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
         "patience":    optuna_cfg["patience"],
         "print_every": 999999,          # suppress per-epoch printing during HPO
         "k_folds":     n_folds,
+        "val_fraction": validation_fraction(base_train_cfg, optuna_cfg),
     }
 
     if group_split_required(group_cfg, edge_cfg, "validation"):
@@ -944,18 +948,18 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
     for fold, (tv_idx, test_idx) in enumerate(split_iter):
         if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
-                tv_idx, base_train_cfg["val_fraction"], seed + fold,
+                tv_idx, validation_fraction(tcfg), seed + fold,
                 group_values, group_cfg, strat_labels, edge_values, edge_cfg)
         elif strat_labels is not None:
             sss = StratifiedShuffleSplit(n_splits=1,
-                                        test_size=base_train_cfg["val_fraction"],
+                                        test_size=validation_fraction(tcfg),
                                         random_state=seed + fold)
             _tr, _val = next(sss.split(tv_idx, strat_labels[tv_idx]))
             tr_idx, val_idx = tv_idx[_tr], tv_idx[_val]
         else:
             rng     = np.random.default_rng(seed + fold)
             perm    = rng.permutation(len(tv_idx))
-            n_val   = max(1, int(len(tv_idx) * base_train_cfg["val_fraction"]))
+            n_val   = max(1, int(len(tv_idx) * validation_fraction(tcfg)))
             val_idx = tv_idx[perm[:n_val]]
             tr_idx  = tv_idx[perm[n_val:]]
 

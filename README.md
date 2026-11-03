@@ -8,6 +8,9 @@ Needed packages are specified in requirements.txt
 ### How to run the code  
 - Tune your configuration inside config folder (different config files for different .py files)
 
+  See [test and validation split settings](docs/data_split_configuration.md) for
+  configuring the test share and separate HPO and final-training validation shares.
+
 - You can run the code with the following command  
 ```
 python src/[name_of_the_file_you_want_to_run].py

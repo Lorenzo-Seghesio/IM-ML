@@ -58,7 +58,7 @@ DOE1_DISPLAY_COLUMNS = (
     "Max Injection Pressure [bar]",
     "Switchover Pressure [bar]",
     "Max Clamping Force Time [s]",
-    "Max Injection Pressure Time [s]",
+    "Max Injection Speed Time [s]",
     "Cycle Time [s]",
     "Dosing Time [s]",
     "Injection Time [s]",

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -11,7 +12,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 from src.Fusion_M1M2_WPred import (
     FusionModel, M2Model, PPMLP, MergeHead, TorchMinMaxScaler,
-    finetune_m2, finetuning_split, fusion_mae_loss, resolve_finetuning,
+    finetune_m2, finetuning_split, fusion_mae_loss, resolve_finetuning, parse_args,
 )
 
 
@@ -53,19 +54,59 @@ class FusionFinetuningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resolve_finetuning({}, SimpleNamespace(alpha=invalid))
 
+    def test_validation_fraction_config_cli_precedence_and_inheritance(self):
+        _, settings = resolve_finetuning({}, SimpleNamespace())
+        self.assertIsNone(settings["val_fraction"])
+        cfg = {"finetuning": {"val_fraction": .25}}
+        with patch("sys.argv", ["fusion", "--material", "DOE1"]):
+            _, settings = resolve_finetuning(cfg, parse_args())
+        self.assertEqual(settings["val_fraction"], .25)
+        with patch("sys.argv", ["fusion", "--material", "DOE1", "--val-fraction", ".4"]):
+            _, settings = resolve_finetuning(cfg, parse_args())
+        self.assertEqual(settings["val_fraction"], .4)
+        self.assertEqual(cfg["finetuning"]["val_fraction"], .25)
+        for value in (0, 1, -1, 20, True, "0.2", float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "val_fraction"):
+                resolve_finetuning({"finetuning": {"val_fraction": value}}, SimpleNamespace())
+
     def test_split_reuses_ids_and_rejects_test_leakage(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             path = directory / "data_processing.json"
             path.write_text(json.dumps({"train_part_ids": [10, 30], "val_part_ids": [20]}))
             args = (directory, np.array([30, 20, 10, 40]), np.array([0, 1, 2]),
-                    np.array([3]), 42, 0.1)
+                    np.array([3]), 42, None)
             train, val, _ = finetuning_split(*args)
             np.testing.assert_array_equal(train, [2, 0])
             np.testing.assert_array_equal(val, [1])
             path.write_text(json.dumps({"train_part_ids": [10, 40], "val_part_ids": [20]}))
             with self.assertRaises(ValueError):
                 finetuning_split(*args)
+
+    def test_requested_fraction_overrides_saved_validation_without_changing_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            dp = {"train_part_ids": list(range(36)), "val_part_ids": list(range(36, 40))}
+            path = directory / "data_processing.json"
+            path.write_text(json.dumps(dp))
+            for fraction, expected in ((.25, 10), (.5, 20)):
+                args = (directory, np.arange(50), np.arange(40), np.arange(40, 50), 42, fraction)
+                train, val, source = finetuning_split(*args)
+                train_again, val_again, _ = finetuning_split(*args)
+                np.testing.assert_array_equal(train, train_again)
+                np.testing.assert_array_equal(val, val_again)
+                self.assertEqual(len(val), expected)
+                self.assertEqual(set(train) | set(val), set(range(40)))
+                self.assertFalse(set(train) & set(val))
+                self.assertEqual(source, "configured dev split")
+            self.assertEqual(json.loads(path.read_text()), dp)
+
+    def test_unavailable_saved_split_uses_legacy_ten_percent_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            train, val, source = finetuning_split(
+                Path(tmp), np.arange(50), np.arange(40), np.arange(40, 50), 42)
+        self.assertEqual((len(train), len(val)), (36, 4))
+        self.assertEqual(source, "reconstructed dev split")
 
     def test_protected_groups_stay_in_training_in_reconstructed_split(self):
         groups = np.repeat(np.arange(8), 2)
@@ -85,7 +126,7 @@ class FusionFinetuningTests(unittest.TestCase):
         config = {"enabled": True, "protected_group_ids": [0]}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "data_processing.json"
-            args = (Path(tmp), np.arange(8), np.arange(6), np.arange(6, 8), 42, .25)
+            args = (Path(tmp), np.arange(8), np.arange(6), np.arange(6, 8), 42, None)
             path.write_text(json.dumps({"train_part_ids": [0, 1, 2, 3], "val_part_ids": [4, 5]}))
             train, val, _ = finetuning_split(*args, groups=groups, group_cfg=config)
             np.testing.assert_array_equal(train, [0, 1, 2, 3])
@@ -93,6 +134,27 @@ class FusionFinetuningTests(unittest.TestCase):
             path.write_text(json.dumps({"train_part_ids": [2, 3, 4, 5], "val_part_ids": [0, 1]}))
             with self.assertRaisesRegex(ValueError, "protected group.*validation"):
                 finetuning_split(*args, groups=groups, group_cfg=config)
+
+    def test_requested_grouped_fraction_preserves_protected_and_edge_groups(self):
+        groups = np.repeat(np.arange(12), 2)
+        dev, test = np.arange(20), np.arange(20, 24)
+        edge_values = groups[:, None].astype(float)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "data_processing.json").write_text(json.dumps({
+                "train_part_ids": list(range(18)), "val_part_ids": [18, 19]}))
+            for fraction, expected in ((.2, 4), (.4, 8)):
+                train, val, source = finetuning_split(
+                    directory, np.arange(24), dev, test, 42, fraction,
+                    groups=groups, group_cfg={"enabled": True, "protected_group_ids": [1]},
+                    edge_values=edge_values, edge_cfg={"enabled": True, "exclude_from_test": False,
+                                                       "exclude_from_validation": True})
+                self.assertEqual(len(val), expected)
+                self.assertEqual(source, "configured grouped dev split")
+                self.assertFalse(set(groups[train]) & set(groups[val]))
+                self.assertFalse({0, 1, 9} & set(groups[val]))
+                self.assertTrue({0, 1, 9}.issubset(set(groups[train])))
+                self.assertEqual(set(train) | set(val), set(dev))
 
     def test_only_m2_changes_and_saved_checkpoint_matches_selected_model(self):
         model = self.make_model()

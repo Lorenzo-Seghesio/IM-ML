@@ -15,13 +15,14 @@ Feature targets are the saved M1 extracted sensor features, aligned by
 part ID and M2 output column. The average includes the features predicted
 by M2, excluding inactive zero-padded positions. Each alpha starts from the
 same pretrained checkpoint and seed. M1's saved train/validation split is
-reused; early stopping selects the fine-tuned epoch with the lowest validation
+reused unless finetuning.val_fraction requests a new split of development data;
+early stopping selects the fine-tuned epoch with the lowest validation
 composite loss. Epoch 0 is recorded as a separate pretrained reference, and
 test data is used only for reporting and XAI.
 
 Configure a scalar or list in finetuning.alpha in the Fusion JSON config,
 or pass --alpha 0 0.1 0.25 0.5 0.75 0.9 1. Fine-tuning settings are
-finetuning.{epochs,lr,batch_size,patience}, with matching CLI overrides.
+finetuning.{epochs,lr,batch_size,patience,val_fraction}, with matching CLI overrides.
 The default sweep is [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1].
 
 Architecture
@@ -133,6 +134,7 @@ try:
     )
     from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.split_config import split_fraction
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
@@ -141,6 +143,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     )
     from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.split_config import split_fraction
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -948,12 +951,13 @@ def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
 DEFAULT_FINETUNING = {
     "alpha": [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1],
     "epochs": 200, "lr": 1e-4, "batch_size": 64, "patience": 30,
+    "val_fraction": None,
 }
 
 
 def resolve_finetuning(cfg: dict, args) -> tuple[list[float], dict]:
     settings = {**DEFAULT_FINETUNING, **cfg.get("finetuning", {})}
-    for key in ("alpha", "epochs", "lr", "batch_size", "patience"):
+    for key in ("alpha", "epochs", "lr", "batch_size", "patience", "val_fraction"):
         override = getattr(args, key, None)
         if override is not None:
             settings[key] = override
@@ -968,15 +972,20 @@ def resolve_finetuning(cfg: dict, args) -> tuple[list[float], dict]:
             raise ValueError(f"finetuning {key} must be a positive integer")
     if not math.isfinite(settings["lr"]) or settings["lr"] <= 0:
         raise ValueError("finetuning lr must be positive and finite")
+    if settings["val_fraction"] is not None:
+        settings["val_fraction"] = split_fraction(
+            settings["val_fraction"], "finetuning.val_fraction")
     return alphas, settings
 
 
-def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction,
+def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction=None,
                      groups=None, group_cfg=None, edge_values=None, edge_cfg=None):
-    """Reuse M1's train/validation IDs; never use test data for model selection."""
+    """Split dev by the requested share, or inherit M1's IDs when it is None."""
+    if val_fraction is not None:
+        val_fraction = split_fraction(val_fraction, "finetuning.val_fraction")
     path = m1_dir / "data_processing.json"
     dp = json.loads(path.read_text()) if path.exists() else {}
-    if dp.get("train_part_ids") and dp.get("val_part_ids"):
+    if val_fraction is None and dp.get("train_part_ids") and dp.get("val_part_ids"):
         lookup = {pid: i for i, pid in enumerate(part_ids.tolist())}
         missing = set(dp["train_part_ids"] + dp["val_part_ids"]) - set(lookup)
         if missing:
@@ -984,17 +993,20 @@ def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction,
         train, val = [np.array([lookup[p] for p in dp[key]], dtype=np.intp)
                       for key in ("train_part_ids", "val_part_ids")]
         source = "M1 data_processing.json"
-    elif group_split_required(group_cfg, edge_cfg):
-        split_groups = groups if groups is not None else np.arange(len(part_ids))
-        train, val = grouped_train_val_split(
-            dev_idx, val_fraction, seed, split_groups, group_cfg,
-            edge_values=edge_values, edge_config=edge_cfg)
-        source = "reconstructed grouped dev split"
     else:
-        perm = np.random.default_rng(seed).permutation(dev_idx)
-        n_val = max(1, int(len(perm) * val_fraction))
-        val, train = perm[:n_val], perm[n_val:]
-        source = "reconstructed dev split"
+        requested = val_fraction is not None
+        val_fraction = val_fraction if requested else 0.1
+        if group_split_required(group_cfg, edge_cfg, "validation"):
+            split_groups = groups if groups is not None else np.arange(len(part_ids))
+            train, val = grouped_train_val_split(
+                dev_idx, val_fraction, seed, split_groups, group_cfg,
+                edge_values=edge_values, edge_config=edge_cfg)
+            source = "configured grouped dev split" if requested else "reconstructed grouped dev split"
+        else:
+            perm = np.random.default_rng(seed).permutation(dev_idx)
+            n_val = max(1, int(len(perm) * val_fraction))
+            val, train = perm[:n_val], perm[n_val:]
+            source = "configured dev split" if requested else "reconstructed dev split"
     train_set, val_set, test_set = map(lambda x: set(x.tolist()), (train, val, test_idx))
     if (not train_set or not val_set or train_set & val_set
             or (train_set | val_set) & test_set
@@ -1890,7 +1902,9 @@ def parse_args():
                    help="Path to M2 best_overall dir "
                         "(default: outputs/[dataset]/ProBayes/M2/{material}/best_overall)")
     p.add_argument("--seed",         type=int,   default=42)
-    p.add_argument("--val-fraction", type=float, default=0.1)
+    p.add_argument("--val-fraction", type=float, default=None,
+                   help="Fine-tuning validation fraction of M1 dev data; overrides "
+                        "finetuning.val_fraction (null/omitted reuses M1's split)")
     p.add_argument("--n-ig-steps",   type=int,   default=50)
     p.add_argument("--shap-bg",      type=int,   default=100)
     p.add_argument("--ih-samples",   type=int,   default=20)
@@ -1913,7 +1927,6 @@ def main():
     args    = parse_args()
     MAT     = args.material.upper()
     SEED    = args.seed
-    VAL_FR  = args.val_fraction
     RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'═'*60}")
@@ -1932,8 +1945,7 @@ def main():
         sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
     cfg = json.loads(cfg_path.read_text())
     alphas, finetuning_settings = resolve_finetuning(cfg, args)
-    if not 0 < VAL_FR < 1:
-        raise ValueError("val-fraction must be in (0,1)")
+    VAL_FR = finetuning_settings["val_fraction"]
 
     # ── Resolve model directories ──────────────────────────────────────────
     m1_dir = Path(args.m1_dir) if args.m1_dir else \
@@ -2115,8 +2127,17 @@ def main():
         print("  All scalers loaded from saved files (no reconstruction needed)")
     else:
         print("[warn] One or more scalers missing from files — reconstructing")
+        # Reconstruction must match pretraining, independently of the new
+        # fine-tuning validation share.
+        m1_saved_cfg_path = m1_dir / "configuration.json"
+        m1_saved_cfg = json.loads(m1_saved_cfg_path.read_text()) if m1_saved_cfg_path.exists() else {}
+        pretrained_val_fraction = split_fraction(
+            _dp_preview.get("val_fraction_requested",
+                            m1_saved_cfg.get("training", {}).get("val_fraction", 0.1)),
+            "M1 training.val_fraction")
         if m1_pp_sc is None:
-            m1_pp_sc = reconstruct_m1_pp_scaler(X_pp_m1, dev_idx_m1, SEED, VAL_FR)
+            m1_pp_sc = reconstruct_m1_pp_scaler(
+                X_pp_m1, dev_idx_m1, SEED, pretrained_val_fraction)
 
         # Need M2-joined dataset for y_sc reconstruction
         split_data_fallback = load_train_test_split(m1_dir)
@@ -2127,7 +2148,7 @@ def main():
         part_ids_m2_joined = df_f_m2.index.to_numpy()
         dev_idx_m2j, _     = map_split(split_data_fallback, part_ids_m2_joined)
         m2_x_sc_check, m2_y_sc = reconstruct_m2_scalers(
-            X_pp_m2_joined, Y_f_m2, dev_idx_m2j, SEED, VAL_FR)
+            X_pp_m2_joined, Y_f_m2, dev_idx_m2j, SEED, pretrained_val_fraction)
         _check_scalers_close(m1_pp_sc, m2_x_sc_check, "M1 pp_sc vs M2 reconstructed x_sc")
         m2_x_sc = m1_pp_sc  # x_sc always equals M1's pp_sc
 
@@ -2163,10 +2184,15 @@ def main():
         m1_dir, part_ids_m1, dev_idx_m1, test_idx_m1, SEED, VAL_FR,
         m1_groups, group_cfg, m1_edge_values, edge_cfg)
     split_info = {"source": split_source,
+                  "val_fraction_requested": VAL_FR,
+                  "val_fraction_achieved": len(val_idx) / len(dev_idx_m1),
                   "train_part_ids": part_ids_m1[train_idx].tolist(),
                   "val_part_ids": part_ids_m1[val_idx].tolist(),
                   "test_part_ids": part_ids_m1[test_idx_m1].tolist()}
     (run_dir / "finetuning_split.json").write_text(json.dumps(split_info, indent=2))
+    print(f"  Fine-tuning split ({split_source}): train={len(train_idx)}  "
+          f"val={len(val_idx)} ({len(val_idx) / len(dev_idx_m1):.1%} of dev)  "
+          f"test={len(test_idx_m1)}")
     (run_dir / "sweep_config.json").write_text(json.dumps({
         "alpha": alphas, "finetuning": finetuning_settings, "seed": SEED,
         "m1_dir": str(m1_dir), "m2_dir": str(m2_dir),
@@ -2447,6 +2473,8 @@ def main():
             "n_dev":        int(len(dev_idx_m1)),
             "seed":         SEED,
             "val_fraction": VAL_FR,
+            "val_fraction_achieved": split_info["val_fraction_achieved"],
+            "split_source": split_source,
             "n_ig_steps":   args.n_ig_steps,
             "ih_samples":   args.ih_samples,
             "shap_bg":      args.shap_bg,
