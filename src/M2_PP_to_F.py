@@ -573,6 +573,10 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
         for tr_idx, val_idx, test_idx in fold_triples:
             validate_group_disjoint(tr_idx, val_idx, test_idx,
                                     group_values=group_values, config=group_cfg)
+            validate_protected_excluded(val_idx, group_values, group_cfg,
+                                        partition="CV validation")
+            validate_protected_excluded(test_idx, group_values, group_cfg,
+                                        partition="CV holdout")
     if edge_values is not None:
         cv_scope = np.arange(len(X), dtype=np.intp)
         for tr_idx, val_idx, test_idx in fold_triples:
@@ -826,6 +830,12 @@ def final_train_m2(X, Y, tr_idx: np.ndarray, val_idx: np.ndarray,
             tr_idx  = tr_idx[perm[n_val:]]
         print(f"  [fallback] Internal val split created from tr_idx "
               f"(train={len(tr_idx)}  val={len(val_idx)})")
+
+    if group_values is not None and group_split_required(group_cfg, edge_cfg):
+        validate_group_disjoint(tr_idx, val_idx, group_values=group_values,
+                                config=group_cfg)
+        validate_protected_excluded(val_idx, group_values, group_cfg,
+                                    partition="validation")
 
     print(f"\n══ Final Training ═══════════════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  "
@@ -1128,6 +1138,8 @@ def main():
         validate_group_disjoint(tr_idx, val_idx, test_idx,
                                 group_values=group_ids, config=group_cfg)
         validate_protected_excluded(test_idx, group_ids, group_cfg)
+        validate_protected_excluded(val_idx, group_ids, group_cfg,
+                                    partition="validation")
     if edge_values is not None:
         validate_edge_groups_excluded(
             test_idx, edge_values, group_ids, edge_cfg, group_cfg,

@@ -67,6 +67,33 @@ class FusionFinetuningTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 finetuning_split(*args)
 
+    def test_protected_groups_stay_in_training_in_reconstructed_split(self):
+        groups = np.repeat(np.arange(8), 2)
+        config = {"enabled": True, "protected_group_ids": [0, 7]}
+        test = np.flatnonzero(groups == 6)
+        dev = np.flatnonzero(groups != 6)
+        with tempfile.TemporaryDirectory() as tmp:
+            train, val, _ = finetuning_split(
+                Path(tmp), np.arange(len(groups)), dev, test, 42, .25,
+                groups=groups, group_cfg=config)
+        self.assertTrue({0, 7}.issubset(set(groups[train])))
+        self.assertFalse({0, 7} & set(groups[val]))
+        self.assertEqual(set(train) | set(val), set(dev))
+
+    def test_imported_split_rejects_protected_groups_in_validation(self):
+        groups = np.repeat(np.arange(4), 2)
+        config = {"enabled": True, "protected_group_ids": [0]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "data_processing.json"
+            args = (Path(tmp), np.arange(8), np.arange(6), np.arange(6, 8), 42, .25)
+            path.write_text(json.dumps({"train_part_ids": [0, 1, 2, 3], "val_part_ids": [4, 5]}))
+            train, val, _ = finetuning_split(*args, groups=groups, group_cfg=config)
+            np.testing.assert_array_equal(train, [0, 1, 2, 3])
+            np.testing.assert_array_equal(val, [4, 5])
+            path.write_text(json.dumps({"train_part_ids": [2, 3, 4, 5], "val_part_ids": [0, 1]}))
+            with self.assertRaisesRegex(ValueError, "protected group.*validation"):
+                finetuning_split(*args, groups=groups, group_cfg=config)
+
     def test_only_m2_changes_and_saved_checkpoint_matches_selected_model(self):
         model = self.make_model()
         before = copy.deepcopy(model.state_dict())

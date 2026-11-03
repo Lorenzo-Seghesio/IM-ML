@@ -1,16 +1,20 @@
 """
 Reference_Models_W_Pred.py
 ==========================
-Four reference models that all predict injection-moulded part weight (W):
+Five reference models that all predict injection-moulded part weight (W):
 
   1. Encoder  — Conv1D stack → GlobalAvgPool → MLP head    (input: pressure curves)
   2. MLP      — fully connected MLP                         (input: process parameters)
   3. LightGBM — gradient-boosted trees                      (input: process parameters)
   4. XGBoost  — gradient-boosted trees                      (input: process parameters)
+  5. CustomGBDT — TP-aware stochastic first-order boosting   (input: process parameters)
 
-All four models are architecture-searched with Optuna (TPE sampler).
-NN models use HyperbandPruner; GBDT models use MedianPruner.
+All models support Optuna (TPE sampler); CustomGBDT also supports fixed parameters.
+NN and CustomGBDT models use HyperbandPruner; standard GBDTs use MedianPruner.
 After HPO a full K-fold CV is run for each model to produce final metrics.
+Encoder, MLP and CustomGBDT use the shared normalized within-test-point loss,
+multi-test-point mini-batches, and validation-selected beta sweeps. All models
+report complete-test-point variability metrics when test-point IDs are available.
 
 Usage
 -----
@@ -31,6 +35,7 @@ Outputs
   outputs/[dataset]/RefModels/MLP/[material]/run_best/        + best_overall/
   outputs/[dataset]/RefModels/LightGBM/[material]/run_best/   + best_overall/
   outputs/[dataset]/RefModels/XGBoost/[material]/run_best/    + best_overall/
+  outputs/[dataset]/RefModels/CustomGBDT/[material]/run_best/ + best_overall/
 
   Each folder: best_model.pt|.joblib, best_metrics.json, fold_metrics.csv,
                scatter_best_fold.png, metrics_folds.png, residuals_hist_best_fold.png,
@@ -56,10 +61,16 @@ try:
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from Utility.m1_test_point_training import (
+        TestPointMiniBatchSampler, normalization_factors, test_point_loss,
+        test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
+    )
+    from Utility.custom_test_point_gbdt import CustomTestPointGBDT, train_custom_gbdt
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.beta_comparison import save_beta_mae_comparison
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -67,10 +78,16 @@ except ModuleNotFoundError:  # package-style import from the repository root
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from src.Utility.m1_test_point_training import (
+        TestPointMiniBatchSampler, normalization_factors, test_point_loss,
+        test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
+    )
+    from src.Utility.custom_test_point_gbdt import CustomTestPointGBDT, train_custom_gbdt
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.doe1_columns import rename_doe1_scalar_columns, doe1_column_name
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.beta_comparison import save_beta_mae_comparison
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -136,7 +153,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from pathlib import Path
 
-warnings.filterwarnings("ignore")
+# Keep insufficient-variability and undersized-test-point warnings visible.
+warnings.simplefilter("always", InsufficientVariabilityWarning)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 BASE_OUT = BASE_DIR / "outputs" # It will be in main
@@ -272,12 +290,15 @@ def _mlp_prepare(x_np: np.ndarray) -> torch.Tensor:
 
 # ── Shared utilities ──────────────────────────────────────────────────────────
 
-def _metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+def _metrics(y_true: np.ndarray, y_pred: np.ndarray, test_point_ids=None) -> dict:
     mae  = float(mean_absolute_error(y_true, y_pred))
     mse  = float(mean_squared_error(y_true, y_pred))
     rmse = math.sqrt(mse)
     r2   = float(r2_score(y_true, y_pred))
-    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": y_pred}
+    metrics = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": y_pred}
+    if test_point_ids is not None:
+        metrics.update(test_point_metrics(y_true, y_pred, test_point_ids))
+    return metrics
 
 
 def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
@@ -421,9 +442,183 @@ def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
 
 # ── NN training + evaluation ──────────────────────────────────────────────────
 
+def _require_test_point_grouping(train_cfg, group_values, group_cfg):
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        if group_values is None or not (group_cfg or {}).get("enabled", False):
+            raise ValueError("Test-point-aware reference training requires test-point IDs and "
+                             "group_split.enabled=true to prevent test-point leakage")
+        encode_test_points(group_values)
+
+
+def _nn_search_space(hpo_cfg, train_cfg):
+    search_space = dict(hpo_cfg["search_space"])
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        search_space.pop("batch_size", None)
+    return search_space
+
+
+def _beta_label(beta):
+    return "beta_" + str(float(beta)).removesuffix(".0")
+
+
+def _test_point_output_dirs(label, mat_dir, train_cfg):
+    root = BASE_OUT / label / mat_dir
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        beta_dir = _beta_label(train_cfg.get("within_test_point_beta", 0.0))
+        return root / "run_best" / _RUN_TS / beta_dir, root / "best_overall" / beta_dir
+    return root / "run_best" / _RUN_TS, root / "best_overall"
+
+
+def _validate_test_point_final_split(train_idx, validation_idx, dev_idx,
+                             train_cfg, group_values, group_cfg):
+    if group_values is not None:
+        validate_protected_excluded(validation_idx, group_values, group_cfg,
+                                    partition="validation")
+    if not train_cfg.get("test_point_training", {}).get("enabled", False):
+        return
+    train_set, validation_set, dev_set = map(set, (train_idx, validation_idx, dev_idx))
+    if (not train_set or not validation_set or train_set & validation_set
+            or (train_set | validation_set) != dev_set):
+        raise ValueError("Final training and validation must partition development parts")
+    validate_group_disjoint(train_idx, validation_idx,
+                            group_values=group_values, config=group_cfg)
+
+
+def _split_contract_changed(current, previous):
+    return any(current.get(key) != previous.get(key) for key in (
+        "train_part_ids", "val_part_ids", "test_part_ids", "group_split", "edge_group_split"))
+
+
+def _save_evaluation_artifacts(metrics, out_dir, split_name):
+    """Save raw metrics calculated over complete evaluated test-point groups."""
+    (out_dir / f"{split_name}_metrics.json").write_text(json.dumps(
+        {key: value for key, value in metrics.items() if key != "pred"}, indent=2))
+    if "test_points" in metrics:
+        pd.DataFrame(metrics["test_points"]).to_csv(
+            out_dir / f"{split_name}_test_points.csv", index=False)
+        print(f"  {split_name}: MAE_w={metrics['MAE_w']:.6f} g  "
+              f"MAE_TPavg={metrics['MAE_TPavg']:.6f} g  "
+              f"MAE_within={metrics['MAE_within']:.6f} g")
+
+
+def _save_cv_training_artifacts(records, out_dir):
+    for fold, record in enumerate(records, 1):
+        if record.get("training_info") is not None:
+            (out_dir / f"cv_fold_{fold}_training.json").write_text(
+                json.dumps(record["training_info"], indent=2))
+        if record.get("test_points"):
+            pd.DataFrame(record["test_points"]).to_csv(
+                out_dir / f"cv_fold_{fold}_test_points.csv", index=False)
+
+
+def _save_test_point_training_artifacts(model, cfg, train_cfg, final_metrics, out_dir,
+                                part_ids, dev_idx, test_idx, group_cfg, edge_cfg):
+    info = model.ref_training_info
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        final_metrics["validation_MAE"] = info["best_validation_mae_g"]
+    _save_evaluation_artifacts(info["best_validation_metrics"], out_dir, "validation")
+    (out_dir / "training_history.json").write_text(json.dumps(info, indent=2))
+    (out_dir / "normalization_factors.json").write_text(json.dumps(info["normalization"], indent=2))
+    (out_dir / "configuration.json").write_text(json.dumps(
+        {**cfg, "training": info["training_config"]}, indent=2))
+    ids = np.asarray(part_ids) if part_ids is not None else np.arange(
+        max(np.concatenate([dev_idx, test_idx])) + 1)
+    split_contract = {
+        "id_col": cfg.get("data", {}).get("id_col"),
+        "group_col": cfg.get("data", {}).get("group_col"),
+        "train_part_ids": ids[info["train_indices"]].tolist(),
+        "val_part_ids": ids[info["validation_indices"]].tolist(),
+        "test_part_ids": ids[test_idx].tolist(),
+        "group_split": group_cfg, "edge_group_split": edge_cfg,
+    }
+    (out_dir / "data_processing.json").write_text(json.dumps(split_contract, indent=2))
+
+
+def resolve_beta_values(value):
+    values = value if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError("beta_values must contain at least one value")
+    values = [float(beta) for beta in values]
+    if any(not np.isfinite(beta) or beta < 0 for beta in values):
+        raise ValueError("beta_values must be finite and nonnegative")
+    if len(set(values)) != len(values):
+        raise ValueError("beta_values must be distinct")
+    return values
+
+
+def run_test_point_beta_experiments(label, cfg, mat_dir, seed, run_experiment, beta_override=None):
+    """Run validation-selected beta sweeps for NN references and CustomGBDT."""
+    tp_cfg = cfg["training"].get("test_point_training", {})
+    if not tp_cfg.get("enabled", False):
+        if beta_override is not None:
+            raise ValueError("--beta-values requires test_point_training.enabled=true")
+        print(f"[{label} compatibility] Test-point training is disabled; using legacy "
+              "random-part MAE training. Valid TP IDs and grouped splits are required to enable it.")
+        return run_experiment(copy.deepcopy(cfg))
+    beta_values = resolve_beta_values(beta_override if beta_override is not None else
+                                     tp_cfg.get("beta_values", [0, 0.1, 0.25, 0.5, 1.0]))
+    base = copy.deepcopy(cfg)
+    hpo_key = {"Encoder": "encoder_hpo", "MLP": "mlp_hpo",
+               "CustomGBDT": "custom_gbdt_hpo"}[label]
+    base.setdefault(hpo_key, {"n_trials": 0, "search_space": {}})
+    base[hpo_key]["sampler_seed"] = resolve_optuna_seed(base[hpo_key])
+    if "batch_size" in base[hpo_key].get("search_space", {}):
+        print(f"[{label} sampling] HPO batch_size search is disabled; "
+              "configure all three mini-batch sampling sizes together.")
+    results = []
+    for beta in beta_values:
+        experiment = copy.deepcopy(base)
+        experiment["training"]["within_test_point_beta"] = beta
+        hpo = experiment[hpo_key]
+        hpo["study_name"] = f"{hpo.get('study_name', label)}_{_beta_label(beta)}_{_RUN_TS}"
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        print(f"\n══ {label} within-test-point beta={beta:g} ══")
+        results.append(run_experiment(experiment))
+    winner = min(results, key=lambda result: result["validation_mae_g"])
+    selection = {"model": label, "selection_metric": "validation_absolute_part_weight_MAE_g",
+                 "selected_beta": winner["within_test_point_beta"],
+                 "selected_validation_mae_g": winner["validation_mae_g"],
+                 "experiments": results}
+    root = BASE_OUT / label / mat_dir
+    summary_dir = root / "beta_experiments" / _RUN_TS
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    (summary_dir / "beta_selection.json").write_text(json.dumps(selection, indent=2))
+    comparison_paths = save_beta_mae_comparison(
+        selection, summary_dir, f"{label} — {mat_dir} — {_RUN_TS}")
+    destination = root / "best_overall"
+    previous_path = destination / "best_metrics.json"
+    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    source = Path(winner["run_dir"])
+    current_split = json.loads((source / "data_processing.json").read_text())
+    previous_split_path = destination / "data_processing.json"
+    previous_split = (json.loads(previous_split_path.read_text())
+                      if previous_split_path.exists() else {})
+    split_changed = _split_contract_changed(current_split, previous_split)
+    if winner["validation_mae_g"] < previous.get("validation_MAE", float("inf")) or split_changed:
+        destination.mkdir(parents=True, exist_ok=True)
+        for artifact in source.iterdir():
+            if artifact.is_file():
+                shutil.copy2(artifact, destination / artifact.name)
+        (destination / "beta_selection.json").write_text(json.dumps(selection, indent=2))
+        for artifact in comparison_paths:
+            shutil.copy2(artifact, destination / artifact.name)
+    print(f"[{label}] Selected beta={selection['selected_beta']:g} by validation MAE="
+          f"{selection['selected_validation_mae_g']:.6f} g; summary: {summary_dir}")
+    return selection
+
+
+# Existing neural entry points share the TP experiment helpers with CustomGBDT.
+_nn_output_dirs = _test_point_output_dirs
+_validate_nn_final_split = _validate_test_point_final_split
+_save_nn_training_artifacts = _save_test_point_training_artifacts
+run_nn_beta_experiments = run_test_point_beta_experiments
+
+
 def train_fold_nn(model: nn.Module, prepare_x, X_tr, y_tr, X_val, y_val,
-                  tcfg: dict, device: torch.device):
-    """Generic NN fold training with MAE + L1 + AdamW + scheduler + early stopping."""
+                  tcfg: dict, device: torch.device, test_point_ids_tr=None,
+                  test_point_ids_val=None):
+    """Scalar NN training with optional TP loss; preserve L1, AdamW and early stopping."""
     criterion = nn.L1Loss()
     optimizer = torch.optim.AdamW(model.parameters(),
                                   lr=tcfg["lr"],
@@ -438,39 +633,86 @@ def train_fold_nn(model: nn.Module, prepare_x, X_tr, y_tr, X_val, y_val,
     t_X_val = prepare_x(X_val).to(device)
     t_y_val = torch.tensor(y_val, dtype=torch.float32, device=device)
 
-    loader = DataLoader(TensorDataset(t_X_tr, t_y_tr),
-                        batch_size=tcfg["batch_size"], shuffle=True, drop_last=False)
+    tp_cfg = tcfg.get("test_point_training", {})
+    tp_enabled = tp_cfg.get("enabled", False)
+    beta = tcfg.get("within_test_point_beta", 0.0)
+    if tp_enabled:
+        if test_point_ids_tr is None:
+            raise ValueError("Test-point-aware reference training requires training test-point IDs")
+        factors = normalization_factors(y_tr, test_point_ids_tr,
+                                       tp_cfg.get("normalization_epsilon", 1e-8))
+        codes, _ = encode_test_points(test_point_ids_tr)
+        tp_tensor = torch.as_tensor(codes, dtype=torch.long, device=device)
+        mini_batch_sampler = TestPointMiniBatchSampler(
+            test_point_ids_tr, tcfg["batch_size"],
+            tp_cfg.get("test_points_per_mini_batch", 4),
+            tp_cfg.get("parts_per_test_point", 16), tcfg.get("mini_batch_seed", 42))
+        loader = DataLoader(TensorDataset(t_X_tr, t_y_tr, tp_tensor),
+                            batch_sampler=mini_batch_sampler)
+    else:
+        if beta != 0:
+            raise ValueError("Nonzero within_test_point_beta requires test_point_training.enabled")
+        factors = None
+        loader = DataLoader(TensorDataset(t_X_tr, t_y_tr),
+                            batch_size=tcfg["batch_size"], shuffle=True, drop_last=False)
+    history = []
 
     l1_lambda    = float(tcfg.get("l1_lambda", 0.0))
     best_val_mae = float("inf")
+    best_validation_metrics = {}
     best_state   = copy.deepcopy(model.state_dict())
     wait         = 0
 
     for epoch in range(1, tcfg["epochs"] + 1):
         model.train()
-        epoch_loss = 0.0
-        for b_x, b_y in loader:
+        epoch_loss = epoch_weight_mae = epoch_within_mae = epoch_l1_penalty = 0.0
+        seen_parts = optimizer_steps = 0
+        for mini_batch in loader:
+            b_x, b_y = mini_batch[:2]
             optimizer.zero_grad()
-            loss = criterion(model(b_x), b_y)
+            prediction = model(b_x)
+            if tp_enabled:
+                loss, weight_mae, within_mae = test_point_loss(
+                    prediction, b_y, mini_batch[2], beta, factors)
+            else:
+                loss = weight_mae = criterion(prediction, b_y)
+                within_mae = prediction.new_zeros(())
             if l1_lambda > 0.0:
-                l1_reg = sum(p.abs().sum() for p in model.parameters())
-                loss   = loss + l1_lambda * l1_reg
+                l1_penalty = l1_lambda * sum(p.abs().sum() for p in model.parameters())
+                loss = loss + l1_penalty
+                epoch_l1_penalty += l1_penalty.item()
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * len(b_y)
-        epoch_loss /= len(y_tr)
+            optimizer.step()  # One step for the combined multi-test-point mini-batch.
+            epoch_loss += loss.item()
+            epoch_weight_mae += weight_mae.item() * len(b_y)
+            epoch_within_mae += within_mae.item()
+            seen_parts += len(b_y)
+            optimizer_steps += 1
+        epoch_loss /= optimizer_steps
 
         model.eval()
         with torch.no_grad():
-            val_mae = criterion(model(t_X_val), t_y_val).item()
+            val_pred = model(t_X_val)
+            val_mae = criterion(val_pred, t_y_val).item()
+        validation_metrics = {k: v for k, v in _metrics(
+            y_val, val_pred.cpu().numpy(), test_point_ids_val).items() if k != "pred"}
         if tcfg["scheduler_factor"] < 1:
             scheduler.step(val_mae)
 
+        history.append({"epoch": epoch, "train_loss": epoch_loss,
+                        "train_weight_mae_g": epoch_weight_mae / seen_parts,
+                        "train_within_mae_g": epoch_within_mae / optimizer_steps,
+                        "train_l1_penalty": epoch_l1_penalty / optimizer_steps,
+                        "val_mae_g": val_mae, "sampled_parts": seen_parts,
+                        "optimizer_steps": optimizer_steps,
+                        **{f"val_{key}_g": value for key, value in validation_metrics.items()
+                           if key in ("MAE_w", "MAE_TPavg", "MAE_within")}})
         if epoch % tcfg["print_every"] == 0:
             print(f"    ep {epoch:4d}  train_loss={epoch_loss:.4f}  val_mae={val_mae:.4f}")
 
         if val_mae < best_val_mae:
             best_val_mae = val_mae
+            best_validation_metrics = validation_metrics
             best_state   = copy.deepcopy(model.state_dict())
             wait         = 0
         else:
@@ -480,21 +722,27 @@ def train_fold_nn(model: nn.Module, prepare_x, X_tr, y_tr, X_val, y_val,
                 break
 
     model.load_state_dict(best_state)
+    model.ref_training_info = {"normalization": factors,
+                               "within_test_point_beta": beta,
+                               "training_config": copy.deepcopy(tcfg),
+                               "best_validation_mae_g": best_val_mae,
+                               "best_validation_metrics": best_validation_metrics,
+                               "history": history}
     return model, best_val_mae
 
 
 def evaluate_nn(model: nn.Module, prepare_x, X: np.ndarray,
-                y: np.ndarray, device: torch.device) -> dict:
+                y: np.ndarray, device: torch.device, test_point_ids=None) -> dict:
     t_X = prepare_x(X).to(device)
     model.eval()
     with torch.no_grad():
         pred = model(t_X).cpu().numpy()
-    return _metrics(y, pred)
+    return _metrics(y, pred, test_point_ids)
 
 
-def evaluate_gbdt(model, X: np.ndarray, y: np.ndarray) -> dict:
+def evaluate_gbdt(model, X: np.ndarray, y: np.ndarray, test_point_ids=None) -> dict:
     pred = model.predict(X).astype(np.float32)
-    return _metrics(y, pred)
+    return _metrics(y, pred, test_point_ids)
 
 
 # ── Plots & saves ─────────────────────────────────────────────────────────────
@@ -572,18 +820,18 @@ def _save_batch_test_artifacts(y_test: np.ndarray, preds: np.ndarray,
     )
 
 
-def _check_overall_best(final_mae: float, overall_best_dir: Path):
+def _check_overall_best(final_mae: float, overall_best_dir: Path, metric="MAE"):
     p = overall_best_dir / "best_metrics.json"
     prev_mae = float("inf")
     if p.exists():
-        prev_mae = json.loads(p.read_text()).get("MAE", float("inf"))
+        prev_mae = json.loads(p.read_text()).get(metric, float("inf"))
     return prev_mae, final_mae < prev_mae
 
 
 def save_model_nn(model: nn.Module, final_metrics: dict,
                   run_best_dir: Path, overall_best_dir: Path,
                   arch_info: dict, label: str) -> bool:
-    """Save final NN model + test metrics; update overall_best if improved."""
+    """Save NN test metrics; select TP experiments by absolute validation MAE."""
     info = {
         "MAE":    final_metrics["MAE"],
         "RMSE":   final_metrics["RMSE"],
@@ -591,20 +839,30 @@ def save_model_nn(model: nn.Module, final_metrics: dict,
         "MSE":    final_metrics["MSE"],
         "source": "final_test",
         **arch_info,
+        **{k: v for k, v in final_metrics.items() if k != "pred"},
     }
     torch.save(model.state_dict(), run_best_dir / "best_model.pt")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
     print(f"\n[{label}] Final model saved  (MAE={final_metrics['MAE']:.4f})  → {run_best_dir}")
 
-    prev_mae, update = _check_overall_best(final_metrics["MAE"], overall_best_dir)
+    selection_key = "validation_MAE" if "validation_MAE" in final_metrics else "MAE"
+    selection_mae = final_metrics[selection_key]
+    prev_mae, update = _check_overall_best(selection_mae, overall_best_dir, selection_key)
+    current_split_path = run_best_dir / "data_processing.json"
+    if "validation_MAE" in final_metrics and current_split_path.exists():
+        previous_split_path = overall_best_dir / "data_processing.json"
+        previous_split = (json.loads(previous_split_path.read_text())
+                          if previous_split_path.exists() else {})
+        update = update or _split_contract_changed(
+            json.loads(current_split_path.read_text()), previous_split)
     if update:
         torch.save(model.state_dict(), overall_best_dir / "best_model.pt")
         (overall_best_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
         print(f"[{label}] Overall best updated  "
-              f"({prev_mae:.4f} → {final_metrics['MAE']:.4f})  → {overall_best_dir}")
+              f"({prev_mae:.4f} → {selection_mae:.4f} selection MAE)  → {overall_best_dir}")
     else:
         print(f"[{label}] Overall best unchanged  "
-              f"(saved={prev_mae:.4f}, this={final_metrics['MAE']:.4f})")
+              f"(saved selection MAE={prev_mae:.4f}, this={selection_mae:.4f})")
     return update
 
 
@@ -619,6 +877,7 @@ def save_model_gbdt(model, final_metrics: dict,
         "MSE":        final_metrics["MSE"],
         "source":     "final_test",
         "best_params": best_params,
+        **{k: v for k, v in final_metrics.items() if k != "pred"},
     }
     joblib.dump(model, run_best_dir / "best_model.joblib")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
@@ -645,8 +904,12 @@ def _copy_artefacts(run_best_dir: Path, overall_best_dir: Path):
         src = run_best_dir / fname
         if src.exists():
             shutil.copy2(src, overall_best_dir / fname)
-    for src in run_best_dir.glob("cv_*diagnostics*.png"):
-        shutil.copy2(src, overall_best_dir / src.name)
+    for pattern in ("cv_*diagnostics*.png", "cv_fold_*_training.json",
+                    "*_test_points.csv", "*_metrics.json", "configuration.json",
+                    "normalization_factors.json", "training_history.json", "scalers.json",
+                    "data_processing.json"):
+        for src in run_best_dir.glob(pattern):
+            shutil.copy2(src, overall_best_dir / src.name)
 
 
 # ── XAI helpers ───────────────────────────────────────────────────────────────
@@ -895,6 +1158,7 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
                    group_values=None, group_cfg=None, edge_values=None,
                    edge_cfg=None):
     """K-fold CV for Encoder on dev data only (indicative). Scales pressure curves per-fold."""
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     K      = train_cfg["k_folds"]
     splits = _split_iter(K, seed, strat_labels, X_pt, group_values, group_cfg,
                          edge_values, edge_cfg)
@@ -922,12 +1186,17 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
         torch.manual_seed(seed + fold)
         model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
         model, _ = train_fold_nn(model, _enc_prepare, X_tr_s, y[tr_idx],
-                                 X_val_s, y[val_idx], train_cfg, device)
+                                 X_val_s, y[val_idx], {**train_cfg, "mini_batch_seed": seed + fold}, device,
+                                 group_values[tr_idx] if group_values is not None else None,
+                                 group_values[val_idx] if group_values is not None else None)
 
-        res = evaluate_nn(model, _enc_prepare, X_te_s, y[test_idx], device)
-        fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        res = evaluate_nn(model, _enc_prepare, X_te_s, y[test_idx], device,
+                          group_values[test_idx] if group_values is not None else None)
+        fold_results.append({k: v for k, v in res.items() if k not in ("pred", "test_points")})
         fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
-                     "y_pred": res["pred"].copy()})
+                     "y_pred": res["pred"].copy(),
+                     "test_points": res.get("test_points", []),
+                     "training_info": getattr(model, "ref_training_info", None)})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -942,6 +1211,7 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
                device, seed, strat_labels=None, group_values=None, group_cfg=None,
                edge_values=None, edge_cfg=None):
     """K-fold CV for MLP on dev data only (indicative). Applies MinMaxScaler per-fold."""
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     K      = train_cfg["k_folds"]
     splits = _split_iter(K, seed, strat_labels, X_pp, group_values, group_cfg,
                          edge_values, edge_cfg)
@@ -969,12 +1239,17 @@ def run_cv_mlp(X_pp, y, n_in, hidden_dims, dropout, train_cfg,
         torch.manual_seed(seed + fold)
         model = MLPModel(n_in, hidden_dims, dropout).to(device)
         model, _ = train_fold_nn(model, _mlp_prepare, X_tr_s, y[tr_idx],
-                                 X_val_s, y[val_idx], train_cfg, device)
+                                 X_val_s, y[val_idx], {**train_cfg, "mini_batch_seed": seed + fold}, device,
+                                 group_values[tr_idx] if group_values is not None else None,
+                                 group_values[val_idx] if group_values is not None else None)
 
-        res = evaluate_nn(model, _mlp_prepare, X_te_s, y[test_idx], device)
-        fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        res = evaluate_nn(model, _mlp_prepare, X_te_s, y[test_idx], device,
+                          group_values[test_idx] if group_values is not None else None)
+        fold_results.append({k: v for k, v in res.items() if k not in ("pred", "test_points")})
         fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
-                     "y_pred": res["pred"].copy()})
+                     "y_pred": res["pred"].copy(),
+                     "test_points": res.get("test_points", []),
+                     "training_info": getattr(model, "ref_training_info", None)})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -1008,10 +1283,13 @@ def run_cv_gbdt(model_class, best_params, X_pp, y, train_cfg,
         model = model_class(**best_params)
         model.fit(X_pp[train_idx], y[train_idx])
 
-        res = evaluate_gbdt(model, X_pp[test_idx], y[test_idx])
-        fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        res = evaluate_gbdt(model, X_pp[test_idx], y[test_idx],
+                            group_values[test_idx] if group_values is not None else None)
+        fold_results.append({k: v for k, v in res.items() if k not in ("pred", "test_points")})
         fold_predictions.append({"fold": fold, "y_true": y[test_idx].copy(),
-                     "y_pred": res["pred"].copy()})
+                     "y_pred": res["pred"].copy(),
+                     "test_points": res.get("test_points", []),
+                     "training_info": getattr(model, "ref_training_info", None)})
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
 
@@ -1032,16 +1310,18 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
                         fixed_val_idx=None, edge_values=None,
                         edge_cfg=None):
     """Train the final Encoder on all dev data.
-    Val split from dev used for early stopping only.
+    Val split from dev used for early stopping and beta selection.
     Returns (model, (pt_min, pt_max)).
     """
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     if fixed_train_idx is not None and fixed_val_idx is not None:
         tr_idx, val_idx = fixed_train_idx, fixed_val_idx
     else:
         tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
                                        group_values, group_cfg, edge_values, edge_cfg)
+    _validate_nn_final_split(tr_idx, val_idx, dev_idx, train_cfg, group_values, group_cfg)
     print(f"\n══ Final Encoder Training ══════════════════════════════════")
-    print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
+    print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early stopping and model selection)")
     pt_min = float(X_pt[tr_idx].min())
     pt_max = float(X_pt[tr_idx].max())
     scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
@@ -1053,8 +1333,13 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
     }
     torch.manual_seed(seed)
     model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
-    model, best_val_mae = train_fold_nn(model, _enc_prepare, X_tr_s, y[tr_idx],
-                                        X_val_s, y[val_idx], final_tcfg, device)
+    model, best_val_mae = train_fold_nn(
+        model, _enc_prepare, X_tr_s, y[tr_idx], X_val_s, y[val_idx],
+        {**final_tcfg, "mini_batch_seed": seed}, device,
+        group_values[tr_idx] if group_values is not None else None,
+        group_values[val_idx] if group_values is not None else None)
+    model.ref_training_info["train_indices"] = np.asarray(tr_idx).tolist()
+    model.ref_training_info["validation_indices"] = np.asarray(val_idx).tolist()
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
     return model, (pt_min, pt_max)
 
@@ -1066,16 +1351,18 @@ def final_train_mlp(X_pp, y, dev_idx: np.ndarray,
                     group_cfg=None, fixed_train_idx=None, fixed_val_idx=None,
                     edge_values=None, edge_cfg=None):
     """Train the final MLP on all dev data.
-    Val split from dev used for early stopping only.
+    Val split from dev used for early stopping and beta selection.
     Returns (model, sc).
     """
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     if fixed_train_idx is not None and fixed_val_idx is not None:
         tr_idx, val_idx = fixed_train_idx, fixed_val_idx
     else:
         tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
                                        group_values, group_cfg, edge_values, edge_cfg)
+    _validate_nn_final_split(tr_idx, val_idx, dev_idx, train_cfg, group_values, group_cfg)
     print(f"\n══ Final MLP Training ══════════════════════════════════════")
-    print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early-stop only)")
+    print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early stopping and model selection)")
     sc = MinMaxScaler().fit(X_pp[tr_idx])
     X_tr_s  = sc.transform(X_pp[tr_idx]).astype(np.float32)
     X_val_s = sc.transform(X_pp[val_idx]).astype(np.float32)
@@ -1086,8 +1373,13 @@ def final_train_mlp(X_pp, y, dev_idx: np.ndarray,
     }
     torch.manual_seed(seed)
     model = MLPModel(n_in, hidden_dims, dropout).to(device)
-    model, best_val_mae = train_fold_nn(model, _mlp_prepare, X_tr_s, y[tr_idx],
-                                        X_val_s, y[val_idx], final_tcfg, device)
+    model, best_val_mae = train_fold_nn(
+        model, _mlp_prepare, X_tr_s, y[tr_idx], X_val_s, y[val_idx],
+        {**final_tcfg, "mini_batch_seed": seed}, device,
+        group_values[tr_idx] if group_values is not None else None,
+        group_values[val_idx] if group_values is not None else None)
+    model.ref_training_info["train_indices"] = np.asarray(tr_idx).tolist()
+    model.ref_training_info["validation_indices"] = np.asarray(val_idx).tolist()
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
     return model, sc
 
@@ -1206,7 +1498,8 @@ def suggest_xgb_params(trial, ss: dict) -> dict:
 def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
                  group_values=None, group_cfg=None, edge_values=None,
                  edge_cfg=None):
-    ss = hpo_cfg["search_space"]
+    _require_test_point_grouping(base_tcfg, group_values, group_cfg)
+    ss = _nn_search_space(hpo_cfg, base_tcfg)
     mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
@@ -1232,9 +1525,15 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
         torch.manual_seed(seed + trial.number * 13 + fold)
         model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
         model, _ = train_fold_nn(model, _enc_prepare, X_tr_s, y[tr_idx],
-                                 X_val_s, y[val_idx], tcfg, device)
-        res = evaluate_nn(model, _enc_prepare, X_te_s, y[test_idx], device)
+                                 X_val_s, y[val_idx], {**tcfg, "mini_batch_seed": seed + fold}, device,
+                                 group_values[tr_idx] if group_values is not None else None,
+                                 group_values[val_idx] if group_values is not None else None)
+        res = evaluate_nn(model, _enc_prepare, X_te_s, y[test_idx], device,
+                          group_values[test_idx] if group_values is not None else None)
         mae_vals.append(res["MAE"])
+        if hasattr(model, "ref_training_info"):
+            trial.set_user_attr(f"fold_{fold}_training", model.ref_training_info)
+        trial.set_user_attr(f"fold_{fold}_test_point_metrics", res.get("test_points", []))
         trial.report(float(np.mean(mae_vals)), fold)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
@@ -1244,7 +1543,8 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
 def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
              group_values=None, group_cfg=None, edge_values=None,
              edge_cfg=None):
-    ss = hpo_cfg["search_space"]
+    _require_test_point_grouping(base_tcfg, group_values, group_cfg)
+    ss = _nn_search_space(hpo_cfg, base_tcfg)
     mcfg_upd, tcfg_upd = suggest_mlp_params(trial, ss)
     tcfg = {**base_tcfg, **tcfg_upd,
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
@@ -1268,9 +1568,15 @@ def _obj_mlp(trial, X_pp, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
         torch.manual_seed(seed + trial.number * 13 + fold)
         model = MLPModel(n_in, hidden_dims, dropout).to(device)
         model, _ = train_fold_nn(model, _mlp_prepare, X_tr_s, y[tr_idx],
-                                 X_val_s, y[val_idx], tcfg, device)
-        res = evaluate_nn(model, _mlp_prepare, X_te_s, y[test_idx], device)
+                                 X_val_s, y[val_idx], {**tcfg, "mini_batch_seed": seed + fold}, device,
+                                 group_values[tr_idx] if group_values is not None else None,
+                                 group_values[val_idx] if group_values is not None else None)
+        res = evaluate_nn(model, _mlp_prepare, X_te_s, y[test_idx], device,
+                          group_values[test_idx] if group_values is not None else None)
         mae_vals.append(res["MAE"])
+        if hasattr(model, "ref_training_info"):
+            trial.set_user_attr(f"fold_{fold}_training", model.ref_training_info)
+        trial.set_user_attr(f"fold_{fold}_test_point_metrics", res.get("test_points", []))
         trial.report(float(np.mean(mae_vals)), fold)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
@@ -1289,8 +1595,12 @@ def _obj_gbdt(trial, X_pp, y, hpo_cfg, model_class, suggest_fn, seed, strat_labe
     for fold, (tv_idx, test_idx) in enumerate(splits):
         model = model_class(**params)
         model.fit(X_pp[tv_idx], y[tv_idx])
-        res = evaluate_gbdt(model, X_pp[test_idx], y[test_idx])
+        res = evaluate_gbdt(model, X_pp[test_idx], y[test_idx],
+                            group_values[test_idx] if group_values is not None else None)
         mae_vals.append(res["MAE"])
+        if hasattr(model, "ref_training_info"):
+            trial.set_user_attr(f"fold_{fold}_training", model.ref_training_info)
+        trial.set_user_attr(f"fold_{fold}_test_point_metrics", res.get("test_points", []))
         trial.report(float(np.mean(mae_vals)), fold)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
@@ -1325,7 +1635,7 @@ def _run_hpo(study_name, n_trials, n_startup_trials, objective_fn, out_dir, seed
 
     if out_dir is not None:
         try:
-            df_t = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+            df_t = study.trials_dataframe(attrs=("number", "value", "params", "state", "user_attrs"))
             df_t.to_csv(out_dir / "hpo_trials.csv", index=False)
         except Exception as e:
             print(f"[warn] HPO trials CSV: {e}")
@@ -1339,11 +1649,10 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 group_values=None, group_cfg=None, fixed_train_idx=None,
                 fixed_val_idx=None, edge_values=None, edge_cfg=None,
                 part_ids=None, target_name="weight"):
-    hpo_cfg   = cfg["encoder_hpo"]
+    hpo_cfg   = copy.deepcopy(cfg["encoder_hpo"])
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
-    rb_dir    = BASE_OUT / "Encoder" / mat_dir / "run_best" / _RUN_TS
-    ob_dir    = BASE_OUT / "Encoder" / mat_dir / "best_overall"
+    rb_dir, ob_dir = _nn_output_dirs("Encoder", mat_dir, train_cfg)
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -1367,7 +1676,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
-    mcfg_u, tcfg_u = suggest_encoder_params(fixed, hpo_cfg["search_space"])
+    mcfg_u, tcfg_u = suggest_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg))
     train_cfg.update(tcfg_u)
 
     channels     = mcfg_u.get("channels",     [1, 16])
@@ -1401,13 +1710,16 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     # Final training on all dev; evaluate on held-out test
     final_model, (pt_min, pt_max) = final_train_encoder(
         X_pt, y, dev_idx, channels, kernels, pool_kernels, head_hidden,
-        dropout, train_cfg, device, seed, dev_strat, group_values, group_cfg,
+        dropout, train_cfg, device, seed, strat_labels, group_values, group_cfg,
         fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
     scale = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
-    res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[test_idx]), y[test_idx], device)
-    final_metrics = {"MAE": res["MAE"], "RMSE": res["RMSE"],
-                     "R2": res["R2"], "MSE": res["MSE"], "source": "final_test"}
+    res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[test_idx]), y[test_idx], device,
+                      group_values[test_idx] if group_values is not None else None)
+    final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    final_metrics["source"] = "final_test"
+    _save_evaluation_artifacts(res, rb_dir, "test")
+    _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[Encoder] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
@@ -1416,6 +1728,10 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
                                part_ids, test_idx, rb_dir, mat, "Encoder",
                                target_name)
+
+    _save_nn_training_artifacts(final_model, cfg, train_cfg, final_metrics, rb_dir,
+                                part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
+    (rb_dir / "scalers.json").write_text(json.dumps({"pt_min": pt_min, "pt_max": pt_max}, indent=2))
 
     arch_info = {"channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
                  "head_hidden": head_hidden, "dropout": dropout}
@@ -1433,6 +1749,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[Encoder] All artefacts copied → {ob_dir}")
+    return {"validation_mae_g": final_model.ref_training_info["best_validation_mae_g"],
+            "run_dir": str(rb_dir),
+            "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
 
 
 def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
@@ -1440,11 +1759,10 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
             group_values=None, group_cfg=None, fixed_train_idx=None,
             fixed_val_idx=None, edge_values=None, edge_cfg=None,
             part_ids=None, target_name="weight"):
-    hpo_cfg   = cfg["mlp_hpo"]
+    hpo_cfg   = copy.deepcopy(cfg["mlp_hpo"])
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
-    rb_dir    = BASE_OUT / "MLP" / mat_dir / "run_best" / _RUN_TS
-    ob_dir    = BASE_OUT / "MLP" / mat_dir / "best_overall"
+    rb_dir, ob_dir = _nn_output_dirs("MLP", mat_dir, train_cfg)
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -1469,7 +1787,7 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
-    mcfg_u, tcfg_u = suggest_mlp_params(fixed, hpo_cfg["search_space"])
+    mcfg_u, tcfg_u = suggest_mlp_params(fixed, _nn_search_space(hpo_cfg, train_cfg))
     train_cfg.update(tcfg_u)
 
     hidden_dims = mcfg_u.get("hidden_dims", [64, 32])
@@ -1499,13 +1817,16 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     # Final training on all dev; evaluate on held-out test
     final_model, sc = final_train_mlp(
         X_pp, y, dev_idx, n_in, hidden_dims, dropout,
-        train_cfg, device, seed, dev_strat, group_values, group_cfg,
+        train_cfg, device, seed, strat_labels, group_values, group_cfg,
         fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
     X_te_s = sc.transform(X_pp[test_idx]).astype(np.float32)
-    res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[test_idx], device)
-    final_metrics = {"MAE": res["MAE"], "RMSE": res["RMSE"],
-                     "R2": res["R2"], "MSE": res["MSE"], "source": "final_test"}
+    res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[test_idx], device,
+                          group_values[test_idx] if group_values is not None else None)
+    final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    final_metrics["source"] = "final_test"
+    _save_evaluation_artifacts(res, rb_dir, "test")
+    _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[MLP] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
@@ -1514,6 +1835,13 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
     _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
                                part_ids, test_idx, rb_dir, mat, "MLP",
                                target_name)
+
+    _save_nn_training_artifacts(final_model, cfg, train_cfg, final_metrics, rb_dir,
+                                part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
+    (rb_dir / "scalers.json").write_text(json.dumps({
+        "feature_range": list(sc.feature_range), "data_min_": sc.data_min_.tolist(),
+        "data_max_": sc.data_max_.tolist(), "scale_": sc.scale_.tolist(),
+        "min_": sc.min_.tolist()}, indent=2))
 
     arch_info = {"n_in": n_in, "hidden_dims": hidden_dims, "dropout": dropout}
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "MLP")
@@ -1532,6 +1860,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[MLP] All artefacts copied → {ob_dir}")
+    return {"validation_mae_g": final_model.ref_training_info["best_validation_mae_g"],
+            "run_dir": str(rb_dir),
+            "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
 
 
 def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
@@ -1595,9 +1926,12 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(lgb.LGBMRegressor, best_params,
                                      X_pp, y, dev_idx, "LightGBM")
-    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx])
-    final_metrics = {"MAE": res["MAE"], "RMSE": res["RMSE"],
-                     "R2": res["R2"], "MSE": res["MSE"], "source": "final_test"}
+    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx],
+                        group_values[test_idx] if group_values is not None else None)
+    final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    final_metrics["source"] = "final_test"
+    _save_evaluation_artifacts(res, rb_dir, "test")
+    _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[LightGBM] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
@@ -1607,6 +1941,7 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                part_ids, test_idx, rb_dir, mat, "LightGBM",
                                target_name)
 
+    (rb_dir / "configuration.json").write_text(json.dumps(cfg, indent=2))
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "LightGBM")
 
@@ -1685,9 +2020,12 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(xgb.XGBRegressor, best_params,
                                      X_pp, y, dev_idx, "XGBoost")
-    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx])
-    final_metrics = {"MAE": res["MAE"], "RMSE": res["RMSE"],
-                     "R2": res["R2"], "MSE": res["MSE"], "source": "final_test"}
+    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx],
+                        group_values[test_idx] if group_values is not None else None)
+    final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    final_metrics["source"] = "final_test"
+    _save_evaluation_artifacts(res, rb_dir, "test")
+    _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[XGBoost] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
@@ -1697,6 +2035,7 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
                                part_ids, test_idx, rb_dir, mat, "XGBoost",
                                target_name)
 
+    (rb_dir / "configuration.json").write_text(json.dumps(cfg, indent=2))
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "XGBoost")
 
@@ -1716,23 +2055,221 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def suggest_custom_gbdt_params(trial, search_space):
+    """Tree shrinkage is separate from the neural optimizer's training.lr."""
+    params = {}
+    if "learning_rate" in search_space:
+        params["learning_rate"] = _sof(trial, "boost_learning_rate", search_space["learning_rate"], log=True)
+    for key in ("max_depth", "min_samples_leaf", "min_samples_split"):
+        if key in search_space:
+            params[key] = _soi(trial, key, search_space[key])
+    if "max_features" in search_space:
+        params["max_features"] = _sof(trial, "max_features", search_space["max_features"])
+    return params
+
+
+def train_fold_custom_gbdt(X_tr, y_tr, X_val, y_val, model_params, train_cfg,
+                           test_point_ids_tr, test_point_ids_val, seed):
+    params = {**model_params, "random_state": seed}
+    return train_custom_gbdt(
+        CustomTestPointGBDT(**params), X_tr, y_tr, X_val, y_val,
+        {**train_cfg, "mini_batch_seed": seed}, test_point_ids_tr, test_point_ids_val)
+
+
+def run_cv_custom_gbdt(X_pp, y, model_params, train_cfg, seed, strat_labels=None,
+                       group_values=None, group_cfg=None, edge_values=None, edge_cfg=None):
+    """Grouped dev-only CV with training-only factors and inner early stopping."""
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
+    splits = _split_iter(train_cfg["k_folds"], seed, strat_labels, X_pp,
+                          group_values, group_cfg, edge_values, edge_cfg)
+    fold_results, records = [], []
+    best_fold_mae, best_fold_idx = float("inf"), -1
+    for fold, (tv_idx, held_out_idx) in enumerate(splits):
+        print(f"\n══ CustomGBDT CV Fold {fold + 1}/{train_cfg['k_folds']} ══")
+        tr_idx, val_idx = _inner_split(tv_idx, train_cfg, seed, fold, strat_labels,
+                                       group_values, group_cfg, edge_values, edge_cfg)
+        model, _ = train_fold_custom_gbdt(
+            X_pp[tr_idx], y[tr_idx], X_pp[val_idx], y[val_idx], model_params,
+            train_cfg, group_values[tr_idx], group_values[val_idx], seed + fold)
+        res = _metrics(y[held_out_idx], model.predict(X_pp[held_out_idx]), group_values[held_out_idx])
+        fold_results.append({k: v for k, v in res.items() if k not in ("pred", "test_points")})
+        records.append({"fold": fold, "y_true": y[held_out_idx].copy(), "y_pred": res["pred"].copy(),
+                        "training_info": model.ref_training_info, "test_points": res["test_points"]})
+        if res["MAE"] < best_fold_mae:
+            best_fold_mae, best_fold_idx = res["MAE"], fold
+    return pd.DataFrame(fold_results), best_fold_idx, best_fold_mae, records
+
+
+def _obj_custom_gbdt(trial, X_pp, y, hpo_cfg, base_train_cfg, model_params, seed,
+                     strat_labels=None, group_values=None, group_cfg=None,
+                     edge_values=None, edge_cfg=None):
+    """HPO minimizes absolute part MAE on held-out development folds only."""
+    _require_test_point_grouping(base_train_cfg, group_values, group_cfg)
+    params = {**model_params, **suggest_custom_gbdt_params(
+        trial, _nn_search_space(hpo_cfg, base_train_cfg))}
+    tcfg = {**base_train_cfg, "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
+            "print_every": 999999}
+    splits = _split_iter(hpo_cfg["n_folds"], seed, strat_labels, X_pp,
+                          group_values, group_cfg, edge_values, edge_cfg)
+    scores = []
+    for fold, (tv_idx, held_out_idx) in enumerate(splits):
+        tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
+                                       group_values, group_cfg, edge_values, edge_cfg)
+        model, _ = train_custom_gbdt(
+            CustomTestPointGBDT(**{**params, "random_state": seed + trial.number * 13 + fold}),
+            X_pp[tr_idx], y[tr_idx], X_pp[val_idx], y[val_idx],
+            {**tcfg, "mini_batch_seed": seed + fold}, group_values[tr_idx], group_values[val_idx])
+        res = _metrics(y[held_out_idx], model.predict(X_pp[held_out_idx]), group_values[held_out_idx])
+        scores.append(res["MAE"])
+        trial.set_user_attr(f"fold_{fold}_training", model.ref_training_info)
+        trial.set_user_attr(f"fold_{fold}_test_point_metrics", res["test_points"])
+        trial.report(float(np.mean(scores)), fold)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+    return float(np.mean(scores))
+
+
+def final_train_custom_gbdt(X_pp, y, dev_idx, model_params, train_cfg, seed,
+                            strat_labels=None, group_values=None, group_cfg=None,
+                            fixed_train_idx=None, fixed_val_idx=None, edge_values=None,
+                            edge_cfg=None):
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
+    if fixed_train_idx is not None and fixed_val_idx is not None:
+        tr_idx, val_idx = fixed_train_idx, fixed_val_idx
+    else:
+        tr_idx, val_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
+                                       group_values, group_cfg, edge_values, edge_cfg)
+    _validate_test_point_final_split(tr_idx, val_idx, dev_idx, train_cfg, group_values, group_cfg)
+    if edge_values is not None:
+        validate_edge_groups_excluded(val_idx, edge_values, group_values, edge_cfg, group_cfg,
+                                      scope_indices=dev_idx, partition="validation")
+    print(f"\n══ Final CustomGBDT Training: {len(tr_idx)} train / {len(val_idx)} validation parts ══")
+    tcfg = {**train_cfg, "epochs": train_cfg.get("final_epochs", train_cfg["epochs"]),
+            "patience": train_cfg.get("final_patience", train_cfg["patience"])}
+    model, _ = train_fold_custom_gbdt(
+        X_pp[tr_idx], y[tr_idx], X_pp[val_idx], y[val_idx], model_params, tcfg,
+        group_values[tr_idx], group_values[val_idx], seed)
+    model.ref_training_info["train_indices"] = np.asarray(tr_idx).tolist()
+    model.ref_training_info["validation_indices"] = np.asarray(val_idx).tolist()
+    return model
+
+
+def save_model_custom_gbdt(model, final_metrics, run_dir, overall_dir, model_params):
+    """Versioned tree checkpoint; promotion uses validation MAE, never test MAE."""
+    info = {**{k: v for k, v in final_metrics.items() if k != "pred"}, "source": "final_test",
+            "model": "CustomGBDT", "model_parameters": model_params,
+            "n_trees": len(model.trees_), "checkpoint_format": "custom_test_point_gbdt_v1"}
+    model.save(run_dir / "best_model.joblib")
+    (run_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
+    previous_path = overall_dir / "best_metrics.json"
+    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    current_split = json.loads((run_dir / "data_processing.json").read_text())
+    previous_split_path = overall_dir / "data_processing.json"
+    previous_split = json.loads(previous_split_path.read_text()) if previous_split_path.exists() else {}
+    update = (final_metrics["validation_MAE"] < previous.get("validation_MAE", float("inf"))
+              or _split_contract_changed(current_split, previous_split))
+    if update:
+        shutil.copy2(run_dir / "best_model.joblib", overall_dir / "best_model.joblib")
+        shutil.copy2(run_dir / "best_metrics.json", overall_dir / "best_metrics.json")
+    return update
+
+
+def run_custom_gbdt(X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, test_idx,
+                    pp_cols, group_values=None, group_cfg=None, fixed_train_idx=None,
+                    fixed_val_idx=None, edge_values=None, edge_cfg=None, part_ids=None,
+                    target_name="weight"):
+    train_cfg = copy.deepcopy(cfg["training"])
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
+    if not train_cfg.get("test_point_training", {}).get("enabled", False):
+        raise ValueError("CustomGBDT requires test_point_training.enabled=true")
+    params = dict(cfg.get("custom_gbdt", {}))
+    hpo_cfg = copy.deepcopy(cfg.get("custom_gbdt_hpo", {"n_trials": 0, "search_space": {}}))
+    sampler_seed = resolve_optuna_seed(hpo_cfg)
+    run_dir, overall_dir = _test_point_output_dirs("CustomGBDT", mat_dir, train_cfg)
+    for directory in (run_dir, overall_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
+    dev_groups = group_values[dev_idx]
+    dev_edges = edge_values[dev_idx] if edge_values is not None else None
+    if hpo_cfg.get("n_trials", 0) > 0:
+        study = _run_hpo(
+            hpo_cfg.get("study_name", "CustomGBDT_hpo"), hpo_cfg["n_trials"],
+            hpo_cfg["n_startup_trials"],
+            lambda trial: _obj_custom_gbdt(trial, X_pp[dev_idx], y[dev_idx], hpo_cfg,
+                train_cfg, params, seed, dev_strat, dev_groups, group_cfg, dev_edges, edge_cfg),
+            run_dir, seed, pruner_type="hyperband", n_folds=hpo_cfg["n_folds"], sampler_seed=sampler_seed)
+        params.update(suggest_custom_gbdt_params(
+            optuna.trial.FixedTrial(study.best_trial.params), _nn_search_space(hpo_cfg, train_cfg)))
+        hpo_info = {"trial": study.best_trial.number, "hpo_mae": float(study.best_trial.value),
+                    "sampler_seed": sampler_seed, "model_parameters": params}
+    else:
+        hpo_info = {"mode": "manual", "sampler_seed": sampler_seed, "model_parameters": params}
+    (run_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
+    metrics, best_fold, best_mae, records = run_cv_custom_gbdt(
+        X_pp[dev_idx], y[dev_idx], params, train_cfg, seed, dev_strat,
+        dev_groups, group_cfg, dev_edges, edge_cfg)
+    K = train_cfg["k_folds"]
+    metrics.index = [f"Fold_{fold + 1}" for fold in range(K)]
+    metrics.to_csv(run_dir / "cv_fold_metrics.csv")
+    print_summary(metrics, best_fold, best_mae, K, "CustomGBDT")
+    save_cv_plots(metrics, K, mat, run_dir, "CustomGBDT")
+    save_cv_diagnostics(records, run_dir, f"[{mat} | CustomGBDT] Indicative K-fold CV on dev set")
+    _save_cv_training_artifacts(records, run_dir)
+    model = final_train_custom_gbdt(
+        X_pp, y, dev_idx, params, train_cfg, seed, strat_labels, group_values, group_cfg,
+        fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
+    res = _metrics(y[test_idx], model.predict(X_pp[test_idx]), group_values[test_idx])
+    _save_evaluation_artifacts(res, run_dir, "test")
+    validation_idx = np.asarray(model.ref_training_info["validation_indices"])
+    validation = _metrics(y[validation_idx], model.predict(X_pp[validation_idx]), group_values[validation_idx])
+    model.ref_training_info["best_validation_metrics"] = {k: v for k, v in validation.items() if k != "pred"}
+    final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    _save_test_point_training_artifacts(
+        model, {**cfg, "custom_gbdt": model.get_params()}, train_cfg, final_metrics, run_dir,
+        part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
+    # Preserve the fitted feature schema; trees use unscaled PP inputs.
+    (run_dir / "scalers.json").write_text(json.dumps({"scaling": "none", "pp_columns": pp_cols}, indent=2))
+    (run_dir / "model_parameters.json").write_text(json.dumps(model.get_params(), indent=2))
+    pd.DataFrame({"feature": pp_cols, "importance": model.feature_importances_}).to_csv(
+        run_dir / "feature_importances.csv", index=False)
+    updated = save_model_custom_gbdt(model, final_metrics, run_dir, overall_dir, model.get_params())
+    save_final_test_plots(y[test_idx], res["pred"], final_metrics, run_dir, mat, "CustomGBDT")
+    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values, part_ids, test_idx,
+                               run_dir, mat, "CustomGBDT", target_name)
+    _save_run_info(run_dir, overall_dir, mat, "CustomGBDT", updated, seed, sampler_seed)
+    if updated:
+        for artifact in run_dir.iterdir():
+            if artifact.is_file():
+                shutil.copy2(artifact, overall_dir / artifact.name)
+    return {"validation_mae_g": model.ref_training_info["best_validation_mae_g"],
+            "run_dir": str(run_dir), "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
+
+
 def main():
     global BASE_OUT
     parser = argparse.ArgumentParser(
-        description="Reference weight-prediction models: Encoder, MLP, LightGBM, XGBoost.")
+        description="Reference models: Encoder, MLP, LightGBM, XGBoost, CustomGBDT.")
     parser.add_argument("--material", type=str.upper,
                         choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help="Material subset: PP | ABS (plain KFold) or ALL (stratified). "
                              "Case-insensitive.")
     parser.add_argument("--optuna-seed", type=int, default=None,
                         help="Optuna sampler seed for all reference studies; omit to generate fresh seeds.")
+    parser.add_argument("--beta-values", type=float, nargs="+", default=None,
+                        help="Within-test-point loss coefficients for Encoder, MLP and CustomGBDT")
+    parser.add_argument("--models", nargs="+", default=None,
+                        choices=["encoder", "mlp", "lgbm", "xgboost", "custom_gbdt"],
+                        help="Run only these models, overriding active_models in the config")
     args = parser.parse_args()
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
     cfg      = json.loads(cfg_path.read_text())
+    if args.models is not None:
+        cfg["active_models"] = {name: int(name in args.models) for name in (
+            "encoder", "mlp", "lgbm", "xgboost", "custom_gbdt")}
     if args.optuna_seed is not None:
-        for model_name in ("encoder_hpo", "mlp_hpo", "lgbm_hpo", "xgboost_hpo"):
+        for model_name in ("encoder_hpo", "mlp_hpo", "lgbm_hpo", "xgboost_hpo", "custom_gbdt_hpo"):
             if model_name in cfg:
                 cfg[model_name]["sampler_seed"] = args.optuna_seed
         print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed} for active reference studies")
@@ -1753,6 +2290,13 @@ def main():
     pp_cols, group_ids, edge_values) = load_data(cfg["data"], prep_cfg, mat)
     group_cfg = cfg["data"].get("group_split", {})
     edge_cfg = cfg["data"].get("edge_group_split", {})
+
+    _require_test_point_grouping(cfg["training"], group_ids, group_cfg)
+    if cfg["training"].get("test_point_training", {}).get("enabled", False):
+        if len(np.unique(part_ids)) != len(part_ids):
+            raise ValueError("Part IDs must be unique for distinct-part sampling")
+    elif args.beta_values is not None:
+        raise ValueError("--beta-values requires test_point_training.enabled=true")
 
     # ── One-time initial split (dev / held-out test) ──────────────────────────
     test_frac = prep_cfg.get("test_fraction", 0.2)
@@ -1795,6 +2339,8 @@ def main():
             validate_group_disjoint(m1_train_idx, m1_val_idx, test_idx,
                                     group_values=group_ids, config=group_cfg)
             validate_protected_excluded(test_idx, group_ids, group_cfg)
+            validate_protected_excluded(m1_val_idx, group_ids, group_cfg,
+                                        partition="validation")
         else:
             validate_group_disjoint(dev_idx, test_idx,
                                     group_values=group_ids, config=group_cfg)
@@ -1816,21 +2362,30 @@ def main():
     mlp_on  = bool(active.get("mlp",     1))
     lgbm_on = bool(active.get("lgbm",    1))
     xgb_on  = bool(active.get("xgboost", 1))
-    print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}")
+    custom_on = bool(active.get("custom_gbdt", 0))
+    if custom_on and not cfg["training"].get("test_point_training", {}).get("enabled", False):
+        raise ValueError("CustomGBDT requires test_point_training.enabled=true and grouped TP IDs")
+    print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}  custom_gbdt={custom_on}")
 
     if enc_on:
-        run_encoder( X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
-                 dev_idx, test_idx, group_ids, group_cfg,
-                 m1_train_idx, m1_val_idx, edge_values, edge_cfg,
-                 part_ids=part_ids, target_name=cfg["data"]["target_col"])
+        run_nn_beta_experiments("Encoder", cfg, mat_dir, seed,
+            lambda experiment: run_encoder(
+                X_pt, y, experiment, mat, mat_dir, seed, device, strat_labels,
+                dev_idx, test_idx, group_ids, group_cfg,
+                m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+                part_ids=part_ids, target_name=cfg["data"]["target_col"]),
+            args.beta_values)
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
 
     if mlp_on:
-        run_mlp(     X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
+        run_nn_beta_experiments("MLP", cfg, mat_dir, seed,
+            lambda experiment: run_mlp(
+                X_pp, y, experiment, mat, mat_dir, seed, device, strat_labels,
                 dev_idx, test_idx, pp_cols, group_ids, group_cfg,
-            m1_train_idx, m1_val_idx, edge_values, edge_cfg,
-            part_ids=part_ids, target_name=cfg["data"]["target_col"])
+                m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+                part_ids=part_ids, target_name=cfg["data"]["target_col"]),
+            args.beta_values)
     else:
         print("\n[mlp]      skipped (active_models.mlp = 0)")
 
@@ -1850,10 +2405,20 @@ def main():
     else:
         print("\n[xgboost]  skipped (active_models.xgboost = 0)")
 
-    n_active = sum([enc_on, mlp_on, lgbm_on, xgb_on])
+    if custom_on:
+        run_test_point_beta_experiments("CustomGBDT", cfg, mat_dir, seed,
+            lambda experiment: run_custom_gbdt(
+                X_pp, y, experiment, mat, mat_dir, seed, strat_labels, dev_idx, test_idx,
+                pp_cols, group_ids, group_cfg, m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+                part_ids=part_ids, target_name=cfg["data"]["target_col"]),
+            args.beta_values)
+    else:
+        print("\n[custom_gbdt] skipped (active_models.custom_gbdt = 0)")
+
+    n_active = sum([enc_on, mlp_on, lgbm_on, xgb_on, custom_on])
     print(f"\n{'═' * 60}")
-    print(f"{n_active}/4 reference model(s) complete.")
-    print(f"Results saved under: {BASE_OUT / mat_dir}")
+    print(f"{n_active}/5 reference model(s) complete.")
+    print(f"Results saved under: {BASE_OUT}")
     print(f"{'═' * 60}")
 
 

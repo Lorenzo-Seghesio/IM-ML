@@ -25,7 +25,8 @@ Architecture
 Training
 --------
   • 5-fold cross-validation on the full cleaned dataset
-  • AdamW optimiser + MAE loss + early stopping (best fold selected by lowest MAE)
+  • AdamW + absolute MAE with optional normalized within-test-point loss
+  • Multi-test-point mini-batches; beta and early stopping selected by validation MAE
   • MinMax scaling fitted on each fold's training split only
 
 Config files
@@ -118,9 +119,14 @@ try:
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from Utility.m1_test_point_training import (
+        TestPointMiniBatchSampler, normalization_factors, test_point_loss,
+        test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
+    )
     from Utility.optuna_seeding import resolve_optuna_seed
     from Utility.cv_diagnostics import save_cv_diagnostics
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from Utility.beta_comparison import save_beta_mae_comparison
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -128,11 +134,17 @@ except ModuleNotFoundError:  # package-style import from the repository root
         validate_protected_excluded, edge_group_policy_metadata,
         validate_edge_groups_excluded, group_split_required,
     )
+    from src.Utility.m1_test_point_training import (
+        TestPointMiniBatchSampler, normalization_factors, test_point_loss,
+        test_point_metrics, encode_test_points, InsufficientVariabilityWarning,
+    )
     from src.Utility.optuna_seeding import resolve_optuna_seed
     from src.Utility.cv_diagnostics import save_cv_diagnostics
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
+    from src.Utility.beta_comparison import save_beta_mae_comparison
 
-warnings.filterwarnings("ignore")
+# Do not suppress explicit sampler and insufficient-variability warnings.
+warnings.simplefilter("always", InsufficientVariabilityWarning)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -460,10 +472,19 @@ def to_tensors(X_pp: np.ndarray, X_pt_list: list[np.ndarray],
 
 # ── Training & evaluation ─────────────────────────────────────────────────────
 
+def _require_test_point_grouping(train_cfg, group_values, group_cfg):
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        if group_values is None or not (group_cfg or {}).get("enabled", False):
+            raise ValueError("Test-point-aware training requires test-point IDs and "
+                             "group_split.enabled=true to prevent test-point leakage")
+        encode_test_points(group_values)
+
+
 def train_fold(model: M1Model,
                Xpp_tr, Xpt_tr_list, y_tr,
                Xpp_val, Xpt_val_list, y_val,
-               tcfg: dict, device: torch.device):
+               tcfg: dict, device: torch.device, test_point_ids_tr=None,
+               test_point_ids_val=None):
     """Train for one fold with early stopping; returns model & best val MAE."""
     criterion = nn.L1Loss()
     optimizer = torch.optim.AdamW(model.parameters(),
@@ -477,39 +498,83 @@ def train_fold(model: M1Model,
     pp_tr,  pt_tr_list,  ty_tr  = to_tensors(Xpp_tr,  Xpt_tr_list,  y_tr,  device)
     pp_val, pt_val_list, ty_val = to_tensors(Xpp_val, Xpt_val_list, y_val, device)
 
-    loader = DataLoader(TensorDataset(pp_tr, *pt_tr_list, ty_tr),
-                        batch_size=tcfg["batch_size"], shuffle=True,
-                        drop_last=False)
+    tp_cfg = tcfg.get("test_point_training", {})
+    tp_enabled = tp_cfg.get("enabled", False)
+    beta = tcfg.get("within_test_point_beta", 0.0)
+    if tp_enabled:
+        if test_point_ids_tr is None:
+            raise ValueError("Test-point-aware M1 training requires training test-point IDs")
+        factors = normalization_factors(y_tr, test_point_ids_tr,
+                                       tp_cfg.get("normalization_epsilon", 1e-8))
+        codes, _ = encode_test_points(test_point_ids_tr)
+        tp_tensor = torch.as_tensor(codes, dtype=torch.long, device=device)
+        mini_batch_sampler = TestPointMiniBatchSampler(
+            test_point_ids_tr, tcfg["batch_size"],
+            tp_cfg.get("test_points_per_mini_batch", 4),
+            tp_cfg.get("parts_per_test_point", 16), tcfg.get("mini_batch_seed", 42))
+        loader = DataLoader(TensorDataset(pp_tr, *pt_tr_list, ty_tr, tp_tensor),
+                            batch_sampler=mini_batch_sampler)
+    else:
+        if beta != 0:
+            raise ValueError("Nonzero within_test_point_beta requires test_point_training.enabled")
+        factors = None
+        loader = DataLoader(TensorDataset(pp_tr, *pt_tr_list, ty_tr),
+                            batch_size=tcfg["batch_size"], shuffle=True, drop_last=False)
+    history = []
 
     best_val_mae = float("inf")
+    best_validation_metrics = {}
     best_state   = copy.deepcopy(model.state_dict())
     wait         = 0
 
     for epoch in range(1, tcfg["epochs"] + 1):
         model.train()
-        epoch_loss = 0.0
-        for batch in loader:
-            b_pp = batch[0]
-            b_pt_list = list(batch[1:-1])
-            b_y  = batch[-1]
+        epoch_loss = epoch_weight_mae = epoch_within_mae = 0.0
+        seen_parts = 0
+        optimizer_steps = 0
+        for mini_batch in loader:
+            b_pp = mini_batch[0]
+            b_pt_list = list(mini_batch[1:-2] if tp_enabled else mini_batch[1:-1])
+            b_y = mini_batch[-2] if tp_enabled else mini_batch[-1]
             optimizer.zero_grad()
-            loss = criterion(model(b_pt_list, b_pp), b_y)
+            prediction = model(b_pt_list, b_pp)
+            if tp_enabled:
+                loss, weight_mae, within_mae = test_point_loss(
+                    prediction, b_y, mini_batch[-1], beta, factors)
+            else:
+                loss = weight_mae = criterion(prediction, b_y)
+                within_mae = prediction.new_zeros(())
             loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item() * len(b_y)
-        epoch_loss /= len(y_tr)
+            optimizer.step()  # One step for the combined multi-test-point mini-batch.
+            epoch_loss += loss.item()
+            epoch_weight_mae += weight_mae.item() * len(b_y)
+            epoch_within_mae += within_mae.item()
+            seen_parts += len(b_y)
+            optimizer_steps += 1
+        epoch_loss /= optimizer_steps
 
         model.eval()
         with torch.no_grad():
-            val_mae = criterion(model(pt_val_list, pp_val), ty_val).item()
+            val_pred = model(pt_val_list, pp_val)
+            val_mae = criterion(val_pred, ty_val).item()
+        validation_metrics = ({"MAE_w": val_mae} if test_point_ids_val is None else
+                              test_point_metrics(y_val, val_pred.cpu().numpy(), test_point_ids_val))
         if tcfg["scheduler_factor"] < 1:
             scheduler.step(val_mae)
 
+        history.append({"epoch": epoch, "train_loss": epoch_loss,
+                        "train_weight_mae_g": epoch_weight_mae / seen_parts,
+                        "train_within_mae_g": epoch_within_mae / optimizer_steps,
+                        "val_mae_g": val_mae, "sampled_parts": seen_parts,
+                        "optimizer_steps": optimizer_steps,
+                        **{f"val_{key}_g": value for key, value in validation_metrics.items()
+                           if key != "test_points"}})
         if epoch % tcfg["print_every"] == 0:
-            print(f"    ep {epoch:4d}  train_mae={epoch_loss:.4f}  val_mae={val_mae:.4f}")
+            print(f"    ep {epoch:4d}  train_loss={epoch_loss:.4f}  val_mae={val_mae:.4f}")
 
         if val_mae < best_val_mae:
             best_val_mae = val_mae
+            best_validation_metrics = validation_metrics
             best_state   = copy.deepcopy(model.state_dict())
             wait         = 0
         else:
@@ -519,13 +584,20 @@ def train_fold(model: M1Model,
                 break
 
     model.load_state_dict(best_state)
+    model.m1_training_info = {"normalization": factors,
+                              "within_test_point_beta": beta,
+                              "training_config": copy.deepcopy(tcfg),
+                              "best_validation_mae_g": best_val_mae,
+                              "best_validation_metrics": best_validation_metrics,
+                              "history": history}
     return model, best_val_mae
 
 
 def evaluate_model(model: M1Model,
                    Xpp: np.ndarray, Xpt_list: list[np.ndarray],
-                   y_arr: np.ndarray, device: torch.device) -> dict:
-    """Return MAE / MSE / RMSE / R² and raw predictions."""
+                   y_arr: np.ndarray, device: torch.device,
+                   test_point_ids=None) -> dict:
+    """Return raw metrics; center complete evaluation test points retrospectively."""
     pp_t, pt_t_list, _ = to_tensors(Xpp, Xpt_list, y_arr, device)
     model.eval()
     with torch.no_grad():
@@ -534,7 +606,10 @@ def evaluate_model(model: M1Model,
     mse  = float(mean_squared_error(y_arr, pred))
     rmse = math.sqrt(mse)
     r2   = float(r2_score(y_arr, pred))
-    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": pred}
+    metrics = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": pred}
+    if test_point_ids is not None:
+        metrics.update(test_point_metrics(y_arr, pred, test_point_ids))
+    return metrics
 
 
 # ── Pipeline functions ────────────────────────────────────────────────────────
@@ -652,6 +727,7 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
     never be included.  The returned metrics are indicative only; the
     primary evaluation is performed by final_train_m1() on the held-out test set.
     """
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     K    = train_cfg["k_folds"]
     n_pp = X_pp.shape[1]
 
@@ -708,14 +784,21 @@ def run_cv(X_pp, X_pt_list, y, model_cfg: dict, train_cfg: dict,
         torch.manual_seed(seed + fold)
         model = M1Model(n_pp, model_cfg).to(device)
         model, _ = train_fold(model, Xpp_tr, Xpt_tr, y[tr_idx],
-                              Xpp_val, Xpt_val, y[val_idx], train_cfg, device)
+                              Xpp_val, Xpt_val, y[val_idx],
+                              {**train_cfg, "mini_batch_seed": seed + fold}, device,
+                              group_values[tr_idx] if group_values is not None else None,
+                              group_values[val_idx] if group_values is not None else None)
 
-        res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device)
-        fold_results.append({k: v for k, v in res.items() if k != "pred"})
+        res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device,
+                             group_values[test_idx] if group_values is not None else None)
+        fold_results.append({k: v for k, v in res.items()
+                             if k not in ("pred", "test_points")})
         fold_predictions.append({
             "fold": fold,
             "y_true": y[test_idx].copy(),
             "y_pred": res["pred"].copy(),
+            "training_info": model.m1_training_info,
+            "test_points": res.get("test_points", []),
         })
         print(f"  Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
               f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
@@ -814,7 +897,9 @@ def save_models(final_model: M1Model, final_metrics: dict,
                 n_pp: int, T_list: list[int], model_cfg: dict,
                 run_best_dir: Path, overall_best_dir: Path,
                 force_update: bool = False) -> bool:
-    """Save final model weights + test metrics; update overall_best if improved.
+    """Save model + test metrics; select by validation MAE for TP experiments.
+
+    Legacy runs without validation_MAE retain their original selection rule.
 
     ``force_update`` is used when the split-policy contract changes, because
     metrics from models evaluated on different held-out partitions are not
@@ -830,6 +915,7 @@ def save_models(final_model: M1Model, final_metrics: dict,
         "n_pp":     n_pp,
         "T_list":   T_list,
         "model_cfg": model_cfg,
+        **{k: v for k, v in final_metrics.items() if k not in ("pred",)},
     }
     torch.save(final_model.state_dict(), run_best_dir / "best_model.pt")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(run_info, indent=2))
@@ -838,18 +924,20 @@ def save_models(final_model: M1Model, final_metrics: dict,
     overall_path = overall_best_dir / "best_metrics.json"
     prev_mae     = float("inf")
     if overall_path.exists():
-        prev_mae = json.loads(overall_path.read_text()).get("MAE", float("inf"))
+        prev_mae = json.loads(overall_path.read_text()).get(
+            "validation_MAE" if "validation_MAE" in final_metrics else "MAE", float("inf"))
 
-    if final_metrics["MAE"] < prev_mae or force_update:
+    selection_mae = final_metrics.get("validation_MAE", final_metrics["MAE"])
+    if selection_mae < prev_mae or force_update:
         torch.save(final_model.state_dict(), overall_best_dir / "best_model.pt")
         overall_path.write_text(json.dumps(run_info, indent=2))
         reason = "split policy changed" if force_update else "MAE improved"
         print(f"Overall best updated ({reason})  "
-              f"({prev_mae:.4f} → {final_metrics['MAE']:.4f} MAE)  → {overall_best_dir}")
+              f"({prev_mae:.4f} → {selection_mae:.4f} selection MAE)  → {overall_best_dir}")
         return True
     else:
         print(f"Overall best unchanged  "
-              f"(saved MAE={prev_mae:.4f},  this run MAE={final_metrics['MAE']:.4f})")
+              f"(saved selection MAE={prev_mae:.4f}, this run={selection_mae:.4f})")
         return False
 
 
@@ -1009,12 +1097,14 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                    group_values=None, group_cfg=None, edge_values=None,
                    edge_cfg=None):
     """Train the final M1Model on all dev data.
-    A small internal validation split (val_fraction × dev) is used solely
-    for early stopping — it is never reported.  Final evaluation is always
+    A small internal validation split (val_fraction × dev) is used for
+    early stopping and beta selection. Final test evaluation is always
     performed by the caller on the held-out test set.
     Uses final_epochs / final_patience from train_cfg when present.
-    Returns (model, (pp_sc, pt_scalers)).
+    Returns model, scalers, training indices, validation indices. The full
+    validation MAE is also retained for beta selection.
     """
+    _require_test_point_grouping(train_cfg, group_values, group_cfg)
     n_pp = X_pp.shape[1]
     if group_split_required(group_cfg, edge_cfg, "validation"):
         tr_idx, val_idx = grouped_train_val_split(
@@ -1025,7 +1115,7 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                                      test_size=train_cfg["val_fraction"],
                                      random_state=seed)
         rel = np.arange(len(dev_idx))
-        _tr_rel, _val_rel = next(sss.split(rel, strat_labels))
+        _tr_rel, _val_rel = next(sss.split(rel, strat_labels[dev_idx]))
         tr_idx  = dev_idx[_tr_rel]
         val_idx = dev_idx[_val_rel]
     else:
@@ -1037,7 +1127,7 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
 
     print(f"\n══ Final Training ═══════════════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  "
-          f"(val split for early-stop only)")
+          f"(val split for early stopping and model selection)")
 
     X_pt_tr_list = [x[tr_idx] for x in X_pt_list]
     X_pt_val_list = [x[val_idx] for x in X_pt_list]
@@ -1055,7 +1145,10 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
     model = M1Model(n_pp, model_cfg).to(device)
     model, best_val_mae = train_fold(
         model, Xpp_tr, Xpt_tr, y[tr_idx],
-        Xpp_val, Xpt_val, y[val_idx], final_tcfg, device)
+        Xpp_val, Xpt_val, y[val_idx],
+        {**final_tcfg, "mini_batch_seed": seed}, device,
+        group_values[tr_idx] if group_values is not None else None,
+        group_values[val_idx] if group_values is not None else None)
     print(f"  Best dev-val MAE (early-stop criterion) = {best_val_mae:.4f}")
     return model, (pp_sc, pt_scalers), tr_idx, val_idx
 
@@ -1230,8 +1323,11 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
                      seed, device, strat_labels=None,
                      group_values=None, group_cfg=None, edge_values=None,
                      edge_cfg=None):
-    """Optuna objective: mini K-fold CV, returns mean test MAE (minimize)."""
-    ss      = optuna_cfg["search_space"]
+    """Optuna objective: minimize held-out development-fold absolute part MAE."""
+    _require_test_point_grouping(base_train_cfg, group_values, group_cfg)
+    ss = dict(optuna_cfg["search_space"])
+    if base_train_cfg.get("test_point_training", {}).get("enabled", False):
+        ss.pop("batch_size", None)
     n_folds = optuna_cfg["n_folds"]
     n_pp    = X_pp.shape[1]
 
@@ -1289,10 +1385,16 @@ def optuna_objective(trial, X_pp, X_pt_list, y,
         torch.manual_seed(seed + trial.number * 13 + fold)
         model = M1Model(n_pp, mcfg).to(device)
         model, _ = train_fold(model, Xpp_tr, Xpt_tr, y[tr_idx],
-                              Xpp_val, Xpt_val, y[val_idx], tcfg, device)
+                              Xpp_val, Xpt_val, y[val_idx],
+                              {**tcfg, "mini_batch_seed": seed + fold}, device,
+                              group_values[tr_idx] if group_values is not None else None,
+                              group_values[val_idx] if group_values is not None else None)
 
-        res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device)
+        res = evaluate_model(model, Xpp_te, Xpt_te, y[test_idx], device,
+                             group_values[test_idx] if group_values is not None else None)
         mae_vals.append(res["MAE"])
+        trial.set_user_attr(f"fold_{fold}_training", model.m1_training_info)
+        trial.set_user_attr(f"fold_{fold}_test_point_metrics", res.get("test_points", []))
 
         trial.report(float(np.mean(mae_vals)), fold)
         if trial.should_prune():
@@ -1353,7 +1455,7 @@ def run_hpo(X_pp, X_pt_list, y, optuna_cfg, base_model_cfg, base_train_cfg,
 
     if out_dir is not None:
         try:
-            df_t = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+            df_t = study.trials_dataframe(attrs=("number", "value", "params", "state", "user_attrs"))
             df_t.to_csv(out_dir / "hpo_trials.csv", index=False)
             print(f"HPO trials saved → {out_dir / 'hpo_trials.csv'}")
         except Exception as e:
@@ -1367,8 +1469,11 @@ def best_cfg_from_study(study, optuna_cfg: dict,
                         n_pp: int):
     """Reconstruct best (model_cfg, train_cfg) by replaying best trial params."""
     fixed_trial = optuna.trial.FixedTrial(study.best_trial.params)
+    search_space = dict(optuna_cfg["search_space"])
+    if base_train_cfg.get("test_point_training", {}).get("enabled", False):
+        search_space.pop("batch_size", None)
     m_upd, t_upd = suggest_hyperparams(
-        fixed_trial, optuna_cfg["search_space"], n_pp, base_model_cfg)
+        fixed_trial, search_space, n_pp, base_model_cfg)
     return {**base_model_cfg, **m_upd}, {**base_train_cfg, **t_upd}
 
 
@@ -1414,6 +1519,8 @@ def main():
                               "Case-insensitive."))
     parser.add_argument("--optuna-seed", type=int, default=None,
                         help="Optuna sampler seed; omit to generate a fresh seed.")
+    parser.add_argument("--beta-values", type=float, nargs="+", default=None,
+                        help="One or more within-test-point loss coefficients")
     args = parser.parse_args()
     mat  = args.material
 
@@ -1423,10 +1530,16 @@ def main():
         cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
         print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
 
+    run_beta_experiments(cfg, mat, cfg_path, args.beta_values)
+
+
+def run_experiment(cfg, mat, cfg_path):
     data_cfg  = cfg["data"]
     prep_cfg  = cfg["preprocessing"]
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        cfg.get("optuna", {}).get("search_space", {}).pop("batch_size", None)
     out_cfg   = cfg["output"]
     _validate_curve_encoder_config(data_cfg, model_cfg)
 
@@ -1440,6 +1553,9 @@ def main():
 
     out_dir          = BASE_DIR / out_cfg["output_dir"]
     run_best_dir     = BASE_DIR / out_cfg["run_best_dir"] / _RUN_TS
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        beta_label = "beta_" + str(float(train_cfg.get("within_test_point_beta", 0.0))).removesuffix(".0")
+        run_best_dir = run_best_dir / beta_label
     overall_best_dir = BASE_DIR / out_cfg["best_overall_dir"]
     for d in [out_dir, run_best_dir, overall_best_dir]:
         d.mkdir(parents=True, exist_ok=True)
@@ -1448,6 +1564,13 @@ def main():
      group_ids, edge_values) = load_data(data_cfg)
     group_cfg = data_cfg.get("group_split", {})
     edge_cfg = data_cfg.get("edge_group_split", {})
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        if group_ids is None or not group_cfg.get("enabled", False):
+            raise ValueError("Test-point-aware training requires data.group_col and "
+                             "data.group_split.enabled=true to prevent test-point leakage")
+        encode_test_points(group_ids)
+        if len(np.unique(part_ids)) != len(part_ids):
+            raise ValueError("Part IDs must be unique for distinct-part sampling")
     n_pp = X_pp.shape[1]
     T_list = [arr.shape[1] for arr in X_pt_list]
 
@@ -1540,7 +1663,13 @@ def main():
         cv_predictions, run_best_dir,
         f"[{mat}] Indicative K-fold CV on dev set")
 
-    # ── Final training on all dev; evaluation on held-out test ───────────────
+    for fold, predictions in enumerate(cv_predictions):
+        (run_best_dir / f"cv_fold_{fold + 1}_training.json").write_text(
+            json.dumps(predictions["training_info"], indent=2))
+        pd.DataFrame(predictions["test_points"]).to_csv(
+            run_best_dir / f"cv_fold_{fold + 1}_test_points.csv", index=False)
+
+    # ── Final training on dev; complete validation and held-out test metrics ──
     final_model, final_scalers, tr_idx_final, val_idx_final = final_train_m1(
         X_pp, X_pt_list, y, dev_idx, model_cfg, train_cfg, seed, device,
         strat_labels, group_ids, group_cfg, edge_values, edge_cfg)
@@ -1550,7 +1679,30 @@ def main():
             scope_indices=dev_idx, partition="validation")
     pp_sc, pt_scalers = final_scalers
     Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], [x[test_idx] for x in X_pt_list], pp_sc, pt_scalers)
-    final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[test_idx], device)
+    final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[test_idx], device,
+                                   group_ids[test_idx] if group_ids is not None else None)
+    Xpp_val, Xpt_val = apply_scalers(
+        X_pp[val_idx_final], [x[val_idx_final] for x in X_pt_list], pp_sc, pt_scalers)
+    validation_metrics = evaluate_model(
+        final_model, Xpp_val, Xpt_val, y[val_idx_final], device,
+        group_ids[val_idx_final] if group_ids is not None else None)
+    if train_cfg.get("test_point_training", {}).get("enabled", False):
+        final_metrics["validation_MAE"] = validation_metrics["MAE"]
+    (run_best_dir / "validation_metrics.json").write_text(json.dumps(
+        {k: v for k, v in validation_metrics.items() if k != "pred"}, indent=2))
+    for split_name, split_metrics in (("validation", validation_metrics), ("test", final_metrics)):
+        if "test_points" in split_metrics:
+            pd.DataFrame(split_metrics["test_points"]).to_csv(
+                run_best_dir / f"{split_name}_test_points.csv", index=False)
+            print(f"  {split_name}: MAE_w={split_metrics['MAE_w']:.6f} g  "
+                  f"MAE_TPavg={split_metrics['MAE_TPavg']:.6f} g  "
+                  f"MAE_within={split_metrics['MAE_within']:.6f} g")
+    (run_best_dir / "training_history.json").write_text(
+        json.dumps(final_model.m1_training_info, indent=2))
+    (run_best_dir / "normalization_factors.json").write_text(
+        json.dumps(final_model.m1_training_info["normalization"], indent=2))
+    (run_best_dir / "configuration.json").write_text(json.dumps(
+        {**cfg, "model": model_cfg, "training": train_cfg}, indent=2))
 
     print(f"\n{'═' * 60}")
     print(f"Final Test  MAE={final_metrics['MAE']:.4f}  "
@@ -1689,9 +1841,100 @@ def main():
             src_trials = run_best_dir / "hpo_trials.csv"
             if src_trials.exists():
                 shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
+        for pattern in ("training_history.json", "normalization_factors.json",
+                        "configuration.json", "validation_metrics.json",
+                        "*_test_points.csv", "cv_fold_*_training.json"):
+            for artifact in run_best_dir.glob(pattern):
+                shutil.copy2(artifact, overall_best_dir / artifact.name)
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
+
+    return {"validation_mae_g": final_model.m1_training_info["best_validation_mae_g"],
+            "run_dir": str(run_best_dir), "within_test_point_beta":
+            train_cfg.get("within_test_point_beta", 0.0)}
+
+
+def resolve_beta_values(value):
+    """Accept one coefficient or a list; never conflate it with optimizer betas."""
+    values = value if isinstance(value, (list, tuple)) else [value]
+    if not values:
+        raise ValueError("beta_values must contain at least one value")
+    resolved = [float(beta) for beta in values]
+    if any(not np.isfinite(beta) or beta < 0 for beta in resolved):
+        raise ValueError("beta_values must be finite and nonnegative")
+    if len(set(resolved)) != len(resolved):
+        raise ValueError("beta_values must be distinct")
+    return resolved
+
+
+def run_beta_experiments(cfg, mat, cfg_path, beta_override=None):
+    """Run isolated M1 experiments and select solely by validation part MAE."""
+    tp_cfg = cfg["training"].get("test_point_training", {})
+    if not tp_cfg.get("enabled", False):
+        if beta_override is not None:
+            raise ValueError("--beta-values requires test_point_training.enabled=true")
+        print("[M1 compatibility] Test-point training is disabled. Legacy random-part "
+              "MAE training is used; valid test-point IDs and grouped splits are "
+              "required to enable the beta experiment.")
+        return run_experiment(copy.deepcopy(cfg), mat, cfg_path)
+
+    beta_values = resolve_beta_values(beta_override if beta_override is not None else
+                                     tp_cfg.get("beta_values", [0, 0.1, 0.25, 0.5, 1.0]))
+    # Resolve once so every beta uses the same HPO sampler seed and split seed.
+    base = copy.deepcopy(cfg)
+    if base.get("mode", "manual").lower() == "optuna":
+        base["optuna"]["sampler_seed"] = resolve_optuna_seed(base["optuna"])
+        if "batch_size" in base["optuna"].get("search_space", {}):
+            print("[M1 sampling] HPO batch_size search is disabled for the fixed "
+                  "test-point sampler; configure all three sampling sizes together.")
+    results = []
+    for beta in beta_values:
+        experiment = copy.deepcopy(base)
+        experiment["training"]["within_test_point_beta"] = beta
+        label = "beta_" + str(beta).removesuffix(".0")
+        for key, path in base["output"].items():
+            if key in ("output_dir", "best_overall_dir"):
+                experiment["output"][key] = str(Path(path) / label)
+        if "optuna" in experiment:
+            original = experiment["optuna"].get("study_name", "M1_hpo")
+            experiment["optuna"]["study_name"] = f"{original}_{label}_{_RUN_TS}"
+        print(f"\n══ M1 within-test-point beta={beta:g} ══")
+        results.append(run_experiment(experiment, mat, cfg_path))
+
+    # Only this validation field participates in beta selection. Test metrics
+    # are deliberately absent from the returned experiment selection record.
+    winner = min(results, key=lambda result: result["validation_mae_g"])
+    selection = {"selection_metric": "validation_absolute_part_weight_MAE_g",
+                 "selected_beta": winner["within_test_point_beta"],
+                 "selected_validation_mae_g": winner["validation_mae_g"],
+                 "experiments": results}
+    summary_dir = BASE_DIR / base["output"]["output_dir"] / "beta_experiments" / _RUN_TS
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    (summary_dir / "beta_selection.json").write_text(json.dumps(selection, indent=2))
+    comparison_paths = save_beta_mae_comparison(
+        selection, summary_dir, f"M1 — {mat} — {_RUN_TS}")
+    source = Path(winner["run_dir"])
+    destination = BASE_DIR / base["output"]["best_overall_dir"]
+    previous_path = destination / "best_metrics.json"
+    previous = json.loads(previous_path.read_text()) if previous_path.exists() else {}
+    prior_dp = destination / "data_processing.json"
+    previous_policy = (json.loads(prior_dp.read_text()).get("edge_group_split", {})
+                       if prior_dp.exists() else {})
+    current_policy = json.loads((source / "data_processing.json").read_text()).get(
+        "edge_group_split", {})
+    if (winner["validation_mae_g"] < previous.get("validation_MAE", float("inf"))
+            or previous_policy.get("policy_hash") != current_policy.get("policy_hash")):
+        destination.mkdir(parents=True, exist_ok=True)
+        # Preserve the existing downstream M1 checkpoint/feature/split contract.
+        for artifact in source.iterdir():
+            if artifact.is_file():
+                shutil.copy2(artifact, destination / artifact.name)
+        (destination / "beta_selection.json").write_text(json.dumps(selection, indent=2))
+        for artifact in comparison_paths:
+            shutil.copy2(artifact, destination / artifact.name)
+    print(f"Selected beta={selection['selected_beta']:g} by validation MAE="
+          f"{selection['selected_validation_mae_g']:.6f} g; summary: {summary_dir}")
+    return selection
 
 
 if __name__ == "__main__":
     main()
-

@@ -196,7 +196,7 @@ def _excluded_group_keys(group_values: Iterable, group_config: dict | None,
                          partition: str = "validation") -> set[str]:
     config = group_config or {}
     protected = ({_normalise(v) for v in config.get("protected_group_ids", [])}
-                 if partition == "test" and grouping_enabled(config) else set())
+                 if grouping_enabled(config) else set())
     if protected:
         protected = {"protected:" + "+".join(sorted(protected))}
     if edge_values is not None and edge_grouping_enabled(edge_config, partition):
@@ -260,7 +260,7 @@ def grouped_train_val_split(indices: np.ndarray, val_fraction: float, seed: int,
                             group_values: Iterable, config: dict | None = None,
                             strat_labels=None, edge_values=None,
                             edge_config: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Split an existing partition into whole-group train and validation sets."""
+    """Split whole groups, keeping configured protected IDs in training only."""
     indices = np.asarray(indices, dtype=np.intp)
     values = np.asarray(group_values, dtype=object)
     keys = make_group_keys(values, config)
@@ -289,6 +289,7 @@ def grouped_kfold(indices: np.ndarray, n_splits: int, seed: int,
     Groups are assigned as indivisible units using a largest-first greedy
     bin-packing strategy.  When labels are supplied, each fold also tracks
     per-label counts to retain material balance as far as group sizes allow.
+    Configured protected IDs remain in training in every fold.
     """
     indices = np.asarray(indices, dtype=np.intp)
     keys = make_group_keys(np.asarray(group_values, dtype=object), config)
@@ -300,7 +301,7 @@ def grouped_kfold(indices: np.ndarray, n_splits: int, seed: int,
     eligible_groups = [g for g in groups if g not in protected]
     if len(eligible_groups) < n_splits:
         raise ValueError(
-            f"Need at least {n_splits} non-edge groups for grouped K-fold, "
+            f"Need at least {n_splits} eligible groups for grouped K-fold, "
             f"got {len(eligible_groups)} (total groups: {len(groups)})")
 
     rng = np.random.default_rng(seed)
@@ -374,16 +375,22 @@ def validate_group_disjoint(*partitions: np.ndarray,
 
 
 def validate_protected_excluded(indices: np.ndarray, group_values: Iterable,
-                                config: dict | None = None) -> None:
-    """Raise if a configured protected group is present in a test partition."""
+                                config: dict | None = None, *,
+                                partition: str = "final test") -> None:
+    """Raise if a configured protected group is present in a held-out partition."""
     config = config or {}
+    if not grouping_enabled(config):
+        return
     protected = {_normalise(v) for v in config.get("protected_group_ids", [])}
     if not protected:
         return
     keys = make_group_keys(np.asarray(group_values, dtype=object), config)
     protected_key = "protected:" + "+".join(sorted(protected))
     if protected_key in set(keys[np.asarray(indices, dtype=np.intp)].tolist()):
-        raise ValueError("A protected group is present in the final test partition")
+        raise ValueError(
+            f"A protected group is present in the {partition} partition. "
+            "Regenerate the source split with protected groups in training only "
+            "(rerun M1 when reusing its split).")
 
 
 def group_assignments(indices: np.ndarray, group_values: Iterable,

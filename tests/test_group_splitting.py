@@ -10,7 +10,81 @@ from src.Utility.group_splitting import (
     make_group_keys,
     group_split_required,
     validate_group_disjoint,
+    validate_protected_excluded,
 )
+
+
+class ProtectedGroupSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.values = np.repeat(np.arange(8), 2)
+        self.indices = np.arange(len(self.values))
+        self.config = {"enabled": True, "protected_group_ids": [0.0, "7"]}
+        self.protected_rows = set(self.indices[np.isin(self.values, [0, 7])])
+
+    def assert_training_only(self, train, held_out, scope):
+        self.assertTrue(self.protected_rows.issubset(set(train)))
+        self.assertFalse(self.protected_rows & set(held_out))
+        self.assertEqual(set(train) | set(held_out), set(scope))
+        validate_group_disjoint(train, held_out, group_values=self.values,
+                                config=self.config)
+
+    def test_protected_groups_stay_in_training_through_test_and_validation(self):
+        for seed in range(10):
+            dev, test = grouped_train_test_split(
+                len(self.values), .25, seed, self.values, self.config)
+            self.assert_training_only(dev, test, self.indices)
+            train, val = grouped_train_val_split(
+                dev, .25, seed, self.values, self.config)
+            self.assert_training_only(train, val, dev)
+
+    def test_nested_cv_keeps_protected_groups_in_every_training_split(self):
+        folds = grouped_kfold(self.indices, 3, 42, self.values, self.config)
+        tested = []
+        for outer_train, holdout in folds:
+            self.assert_training_only(outer_train, holdout, self.indices)
+            train, val = grouped_train_val_split(
+                outer_train, .25, 42, self.values, self.config)
+            self.assert_training_only(train, val, outer_train)
+            tested.extend(holdout)
+        self.assertEqual(len(tested), len(set(tested)))
+        self.assertEqual(set(tested), set(self.indices) - self.protected_rows)
+
+    def test_disabled_grouping_does_not_protect_configured_ids(self):
+        config = {**self.config, "enabled": False}
+        folds = grouped_kfold(self.indices, 8, 42, self.values, config)
+        self.assertEqual(set(np.concatenate([held_out for _, held_out in folds])),
+                         set(self.indices))
+        validate_protected_excluded(self.indices, self.values, config)
+
+    def test_imported_holdouts_reject_protected_groups(self):
+        for partition in ("validation", "CV validation", "CV holdout", "final test"):
+            with self.subTest(partition=partition):
+                with self.assertRaisesRegex(ValueError, partition):
+                    validate_protected_excluded(self.indices, self.values,
+                                                self.config, partition=partition)
+                validate_protected_excluded(np.array([2, 3]), self.values,
+                                            self.config, partition=partition)
+
+    def test_exclusion_combines_with_edges(self):
+        edges = np.repeat(np.array([3, 0, 2, 3, 4, 5, 6, 4]), 2)[:, None]
+        edge_config = {"enabled": True}
+        excluded = set(self.indices[np.isin(self.values, [0, 1, 6, 7])])
+        for split in (grouped_train_val_split(
+                self.indices, .25, 42, self.values, self.config,
+                edge_values=edges, edge_config=edge_config), *grouped_kfold(
+                self.indices, 4, 42, self.values, self.config,
+                edge_values=edges, edge_config=edge_config)):
+            train, held_out = split
+            self.assertTrue(excluded.issubset(set(train)))
+            self.assertFalse(excluded & set(held_out))
+
+    def test_impossible_splits_raise_without_using_protected_groups(self):
+        all_protected = {"enabled": True, "protected_group_ids": list(range(8))}
+        with self.assertRaisesRegex(ValueError, "non-empty partitions"):
+            grouped_train_val_split(self.indices, .25, 42, self.values,
+                                    all_protected)
+        with self.assertRaisesRegex(ValueError, "eligible groups"):
+            grouped_kfold(self.indices, 7, 42, self.values, self.config)
 
 
 class EdgeGroupSplitTests(unittest.TestCase):

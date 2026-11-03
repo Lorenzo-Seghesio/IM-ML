@@ -1002,6 +1002,8 @@ def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction,
         raise ValueError("Fine-tuning requires nonempty, disjoint train/val/test partitions")
     if groups is not None and group_split_required(group_cfg, edge_cfg):
         validate_group_disjoint(train, val, test_idx, group_values=groups, config=group_cfg)
+        validate_protected_excluded(val, groups, group_cfg, partition="validation")
+        validate_protected_excluded(test_idx, groups, group_cfg)
     if edge_values is not None:
         validate_edge_groups_excluded(val, edge_values, groups, edge_cfg, group_cfg,
                                      scope_indices=dev_idx, partition="validation")
@@ -1967,6 +1969,7 @@ def main():
 
     # Peek at M1 data_processing.json early to extract y_filter params
     _dp_path = m1_dir / "data_processing.json"
+    _dp_preview = {}
     _removed_y_ids: set = set()
     _pp_cols_from_m1 = None
     if _dp_path.exists():
@@ -2043,6 +2046,12 @@ def main():
         validate_group_disjoint(dev_idx_m1, test_idx_m1,
                                 group_values=m1_groups, config=group_cfg)
         validate_protected_excluded(test_idx_m1, m1_groups, group_cfg)
+        _id_to_idx = {pid: i for i, pid in enumerate(part_ids_m1.tolist())}
+        _m1_val_idx = np.array(
+            [_id_to_idx[p] for p in _dp_preview.get("val_part_ids", []) if p in _id_to_idx],
+            dtype=np.intp)
+        validate_protected_excluded(_m1_val_idx, m1_groups, group_cfg,
+                                    partition="validation")
         print("  Group integrity verified for M1 dev/test split")
     if m1_edge_values is not None:
         validate_edge_groups_excluded(
