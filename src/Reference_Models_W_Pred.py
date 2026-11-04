@@ -3,7 +3,7 @@ Reference_Models_W_Pred.py
 ==========================
 Five reference models that all predict injection-moulded part weight (W):
 
-  1. Encoder  — Conv1D stack → GlobalAvgPool → MLP head    (input: pressure curves)
+  1. Encoder  — Conv1D stack → GlobalAvgPool → MLP head    (input: configured time-series signals)
   2. MLP      — fully connected MLP                         (input: process parameters)
   3. LightGBM — gradient-boosted trees                      (input: process parameters)
   4. XGBoost  — gradient-boosted trees                      (input: process parameters)
@@ -12,8 +12,10 @@ Five reference models that all predict injection-moulded part weight (W):
 All models support Optuna (TPE sampler); CustomGBDT also supports fixed parameters.
 NN and CustomGBDT models use HyperbandPruner; standard GBDTs use MedianPruner.
 After HPO a full K-fold CV is run for each model to produce final metrics.
-Encoder, MLP and CustomGBDT use the shared normalized within-test-point loss,
-multi-test-point mini-batches, and validation-selected beta sweeps. All models
+With test-point training enabled, Encoder, MLP and CustomGBDT use the shared
+normalized within-test-point loss, multi-test-point mini-batches, and
+validation-selected beta sweeps. Otherwise the original four models use legacy
+training and CustomGBDT is skipped. All models
 report complete-test-point variability metrics when test-point IDs are available.
 
 Usage
@@ -304,8 +306,25 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, test_point_ids=None) -> dic
     return metrics
 
 
+def _timeseries_sources(data_cfg: dict) -> list[dict]:
+    """Resolve configured signals, including legacy pressure-only keys."""
+    sources = data_cfg.get("timeseries_csvs")
+    if sources is None:
+        sources = data_cfg.get("pressure_csvs")
+    if sources is None:
+        pressure_csv = data_cfg.get("pressure_csv")
+        if pressure_csv is None:
+            raise ValueError(
+                "data must define 'timeseries_csvs', 'pressure_csvs', or 'pressure_csv'."
+            )
+        sources = [{"name": "pressure", "path": pressure_csv}]
+    if not sources:
+        raise ValueError("At least one time-series source must be configured in data.")
+    return sources
+
+
 def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
-    """Join scalar + pressure CSVs; clean; return (part_ids, X_pp, X_pt, y, strat_labels)."""
+    """Join scalar and configured time-series CSVs and return aligned model arrays."""
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
     if material.upper() == "DOE1":
@@ -327,19 +346,17 @@ def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
                    if edge_cols and all(c in df_scalar.columns for c in edge_cols) else None)
     drop_cols = list(dict.fromkeys([*drop_cols, *edge_cols]))
     df_scalar = df_scalar.drop(columns=drop_cols, errors="ignore")
-    pressure_sources = data_cfg.get("pressure_csvs")
-    if pressure_sources is None:
-        pressure_sources = [{"name": "pressure", "path": data_cfg["pressure_csv"]}]
+    timeseries_sources = _timeseries_sources(data_cfg)
 
-    pressure_frames = []
-    for i, src in enumerate(pressure_sources):
+    timeseries_frames = []
+    for i, src in enumerate(timeseries_sources):
         curve_name = src.get("name", f"curve_{i + 1}")
         curve_path = src.get("path")
         if curve_path is None:
-            raise ValueError("Each entry in data.pressure_csvs must define a 'path'.")
+            raise ValueError("Each configured time-series source must define a 'path'.")
         df_curve = pd.read_csv(BASE_DIR / curve_path, index_col=data_cfg["id_col"])
         df_curve.columns = [f"{curve_name}__{c}" for c in df_curve.columns]
-        pressure_frames.append(df_curve)
+        timeseries_frames.append(df_curve)
 
     mat_col    = data_cfg.get("material_col")
 
@@ -350,13 +367,13 @@ def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
         df_scalar[mat_col] = df_scalar[mat_col].map(mat_map)
 
     df = df_scalar.copy()
-    for df_curve in pressure_frames:
+    for df_curve in timeseries_frames:
         df = df.join(df_curve, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
 
-    pressure_cols = []
-    for df_curve in pressure_frames:
-        pressure_cols.extend(list(df_curve.columns))
+    timeseries_cols = []
+    for df_curve in timeseries_frames:
+        timeseries_cols.extend(list(df_curve.columns))
     pp_cols       = [c for c in df_scalar.columns
                      if c != target_col and c != group_col]
 
@@ -386,7 +403,7 @@ def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
-    X_pt         = df[pressure_cols].to_numpy(dtype=np.float32)
+    X_pt         = df[timeseries_cols].to_numpy(dtype=np.float32)
     y            = df[target_col].to_numpy(dtype=np.float32)
     strat_labels = df[mat_col].to_numpy() if mat_col else None
 
@@ -2370,7 +2387,9 @@ def main():
     xgb_on  = bool(active.get("xgboost", 1))
     custom_on = bool(active.get("custom_gbdt", 0))
     if custom_on and not cfg["training"].get("test_point_training", {}).get("enabled", False):
-        raise ValueError("CustomGBDT requires test_point_training.enabled=true and grouped TP IDs")
+        print("\n[custom_gbdt] skipped (test_point_training.enabled=false; "
+              "CustomGBDT requires TP-aware training)")
+        custom_on = False
     print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}  custom_gbdt={custom_on}")
 
     if enc_on:
@@ -2418,7 +2437,7 @@ def main():
                 pp_cols, group_ids, group_cfg, m1_train_idx, m1_val_idx, edge_values, edge_cfg,
                 part_ids=part_ids, target_name=cfg["data"]["target_col"]),
             args.beta_values)
-    else:
+    elif not active.get("custom_gbdt", 0):
         print("\n[custom_gbdt] skipped (active_models.custom_gbdt = 0)")
 
     n_active = sum([enc_on, mlp_on, lgbm_on, xgb_on, custom_on])

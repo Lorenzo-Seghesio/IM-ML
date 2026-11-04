@@ -20,7 +20,9 @@ This launches the configured training/HPO jobs; it is not a lightweight test.
 configuration remains the default when `--models` is omitted. Configurations
 without the new active-model key keep CustomGBDT off for compatibility.
 ProBayes keeps it explicitly disabled until valid TP IDs and grouped splits are
-supplied. A requested CustomGBDT run with TP training disabled raises an error.
+supplied. When TP training is disabled, the reference-model entry point skips
+CustomGBDT with a message, even if its active-model flag is set. The original
+four reference models continue with their legacy training behavior.
 
 ## Exactly the shared loss
 

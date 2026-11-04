@@ -24,7 +24,16 @@ The DoE1 reference configuration enables:
 }
 ```
 
-These settings belong in `training`. `beta_values` accepts a scalar or list;
+These settings belong in `training`. Set `enabled` to `false` (or omit
+`test_point_training`) to run the original four references as before: Encoder
+and MLP use shuffled part mini-batches, MAE plus L1 regularization, and the
+configured HPO batch-size search, with one run each and no beta sweep.
+LightGBM/XGBoost keep their standard fitting methods. CustomGBDT is skipped
+with a message in this mode, even if `active_models.custom_gbdt` is set.
+Existing split settings and M1 split reuse still apply. Omit `--beta-values`
+when TP training is disabled.
+
+`beta_values` accepts a scalar or list;
 `within_test_point_beta` records the active coefficient in each experiment.
 For example:
 

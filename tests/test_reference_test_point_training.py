@@ -108,6 +108,32 @@ class ReferenceTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(history['train_weight_mae_g'], expected, places=5)
         self.assertAlmostEqual(history['train_l1_penalty'], l1_penalty, places=6)
 
+    def test_legacy_training_uses_part_batches_and_mae_plus_l1_without_tp_ids(self):
+        cfg = {**tiny_config(), 'lr': 0., 'batch_size': 3,
+               'within_test_point_beta': 0.,
+               'test_point_training': {'enabled': False, 'beta_values': [0, .25]}}
+        model = TinyNN()
+        x, y = self.x[:8], self.y[:8]
+        with torch.no_grad():
+            expected_mae = nn.L1Loss()(model(torch.tensor(x)), torch.tensor(y)).item()
+            expected_l1 = cfg['l1_lambda'] * sum(p.abs().sum().item() for p in model.parameters())
+        with patch.object(ref, 'TestPointMiniBatchSampler') as sampler, \
+                patch.object(ref, 'normalization_factors') as factors, \
+                patch.object(ref, 'test_point_loss') as tp_loss:
+            trained, _ = ref.train_fold_nn(model, ref._mlp_prepare, x, y,
+                self.x[8:12], self.y[8:12], cfg, self.device)
+        sampler.assert_not_called()
+        factors.assert_not_called()
+        tp_loss.assert_not_called()
+        info = trained.ref_training_info
+        self.assertIsNone(info['normalization'])
+        self.assertEqual(info['history'][0]['sampled_parts'], 8)
+        self.assertEqual(info['history'][0]['optimizer_steps'], 3)
+        self.assertAlmostEqual(info['history'][0]['train_weight_mae_g'], expected_mae, places=5)
+        self.assertAlmostEqual(info['history'][0]['train_l1_penalty'], expected_l1, places=6)
+        hpo = {'search_space': {'batch_size': [2, 8]}}
+        self.assertEqual(ref._nn_search_space(hpo, cfg), hpo['search_space'])
+
     def test_cv_and_hpo_recompute_training_only_factors_for_both_networks(self):
         hpo_cfg = {'search_space': {'batch_size': [1, 1]}, 'n_folds': 2,
                    'epochs': 1, 'patience': 2}
@@ -381,6 +407,42 @@ class ReferenceArtifactTests(unittest.TestCase):
             self.assertEqual(sweeps.call_count, 2)
             self.assertEqual([call.args[0] for call in sweeps.call_args_list], ['Encoder', 'MLP'])
             self.assertTrue(all(tree.call_count == 1 for tree in trees))
+
+    def test_main_legacy_mode_runs_original_models_and_skips_configured_custom(self):
+        for tp_cfg in ({'test_point_training': {'enabled': False, 'beta_values': [0, .25]}}, {}):
+            for grouped in (False, True):
+                with self.subTest(tp_cfg=tp_cfg, grouped=grouped), \
+                        tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                    cfg_path = Path(directory) / 'ref_config.json'
+                    cfg = {'data': {'target_col': 'weight', 'group_split': {'enabled': grouped}},
+                           'preprocessing': {'random_seed': 42},
+                           'training': {**tiny_config(), **tp_cfg},
+                           'output_base_dir': directory,
+                           'active_models': dict.fromkeys(
+                               ('encoder', 'mlp', 'lgbm', 'xgboost', 'custom_gbdt'), 1)}
+                    if not tp_cfg:
+                        cfg['training'].pop('test_point_training')
+                    cfg_path.write_text(json.dumps(cfg))
+                    x = np.arange(24, dtype=np.float32).reshape(-1, 1)
+                    ids = np.repeat(np.arange(12), 2) if grouped else None
+                    stack.enter_context(patch.object(ref, '_CFG_MAP', {'DOE1': str(cfg_path)}))
+                    stack.enter_context(patch.object(ref, 'load_data', return_value=(
+                        np.arange(24), x, x, x[:, 0], None, ['x'], ids, None)))
+                    stack.enter_context(patch.object(ref, 'BASE_OUT', Path(directory)))
+                    stack.enter_context(patch('sys.argv', ['ref', '--material', 'DOE1']))
+                    runners = [stack.enter_context(patch.object(ref, name)) for name in
+                               ('run_encoder', 'run_mlp', 'run_lgbm', 'run_xgboost')]
+                    custom = stack.enter_context(patch.object(ref, 'run_custom_gbdt'))
+                    comparison = stack.enter_context(patch.object(ref, 'save_beta_mae_comparison'))
+                    output = stack.enter_context(redirect_stdout(io.StringIO()))
+                    ref.main()
+                    for runner in runners:
+                        runner.assert_called_once()
+                        self.assertEqual(runner.call_args.args[2], cfg)
+                    custom.assert_not_called()
+                    comparison.assert_not_called()
+                    self.assertIn('CustomGBDT requires TP-aware training', output.getvalue())
+                    self.assertIn('4/5 reference model(s) complete', output.getvalue())
 
 
 if __name__ == '__main__':
