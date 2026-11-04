@@ -148,6 +148,11 @@ except ModuleNotFoundError:  # package-style import from the repository root
 # Do not suppress explicit sampler and insufficient-variability warnings.
 warnings.simplefilter("always", InsufficientVariabilityWarning)
 
+try:
+    from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+except ModuleNotFoundError:
+    from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -333,12 +338,16 @@ class M1Model(nn.Module):
             ])
             self.n_f_total = int(mcfg["n_f_features"])
         self.n_curves = len(self.encoders)
-        pp_hidden_dims, self.pp_latent_dim = _resolve_pp_branch_dims(mcfg)
-        self.pp_mlp  = PPMLP(
-            input_dim=n_pp,
-            hidden_dims=[*pp_hidden_dims, self.pp_latent_dim],
-            dropout=mcfg["dropout"],
-        )
+        if mcfg.get("pp_branch", "mlp") == "direct":
+            self.pp_latent_dim = n_pp
+            self.pp_mlp = nn.Identity()
+        else:
+            pp_hidden_dims, self.pp_latent_dim = _resolve_pp_branch_dims(mcfg)
+            self.pp_mlp = PPMLP(
+                input_dim=n_pp,
+                hidden_dims=[*pp_hidden_dims, self.pp_latent_dim],
+                dropout=mcfg["dropout"],
+            )
         merge_in     = self.n_f_total + self.pp_latent_dim
         self.merge   = MergeHead(
             input_dim=merge_in,
@@ -610,6 +619,7 @@ def evaluate_model(model: M1Model,
     rmse = math.sqrt(mse)
     r2   = float(r2_score(y_arr, pred))
     metrics = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": pred}
+    metrics["relative_MAE_percent"] = 100 * mae / abs(float(np.mean(y_arr))) if np.mean(y_arr) else None
     if test_point_ids is not None:
         metrics.update(test_point_metrics(y_arr, pred, test_point_ids))
     return metrics
@@ -847,6 +857,7 @@ def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str, plots_dir: Pa
 def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
                           final_metrics: dict, plots_dir: Path, material: str):
     """Scatter + residual plots from the final model on the held-out test set (primary output)."""
+    partition_label = "Validation Set" if final_metrics.get("source") == "validation" else "Held-out Test Set"
     # Scatter: measured vs predicted
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(y_test, preds_test, color=_PLT_C["scatter"],
@@ -858,7 +869,7 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
     ax.set_xlabel("Measured weight [g]")
     ax.set_ylabel("Predicted weight [g]")
     ax.set_title(
-        f"[{material}] Final Model — Held-out Test Set\n"
+        f"[{material}] Final Model — {partition_label}\n"
         f"MAE={final_metrics['MAE']:.4f} g   R²={final_metrics['R2']:.4f}",
     )
     ax.legend()
@@ -874,7 +885,7 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
     ax.axhline(0, color=_PLT_C["zero_line"], linestyle="--", linewidth=1.5)
     ax.set_xlabel("Predicted weight [g]")
     ax.set_ylabel("Residual (pred − real) [g]")
-    ax.set_title(f"[{material}] Residuals vs Predicted (final test)")
+    ax.set_title(f"[{material}] Residuals vs Predicted ({partition_label})")
     fig.tight_layout()
     fig.savefig(plots_dir / "residuals_scatter_final_test.png")
     plt.close(fig)
@@ -887,7 +898,7 @@ def save_final_test_plots(y_test: np.ndarray, preds_test: np.ndarray,
                linewidth=1.5, label=f"Mean={residuals.mean():.4f}")
     ax.set_xlabel("Residual (pred − real) [g]")
     ax.set_ylabel("Count")
-    ax.set_title(f"[{material}] Residuals Distribution (final test)\n"
+    ax.set_title(f"[{material}] Residuals Distribution ({partition_label})\n"
                  f"std={residuals.std():.4f} g")
     ax.legend()
     fig.tight_layout()
@@ -1098,7 +1109,7 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
                    model_cfg: dict, train_cfg: dict,
                    seed: int, device: torch.device, strat_labels=None,
                    group_values=None, group_cfg=None, edge_values=None,
-                   edge_cfg=None):
+                   edge_cfg=None, split_seed=None):
     """Train the final M1Model on all dev data.
     A small internal validation split (val_fraction × dev) is used for
     early stopping and beta selection. Final test evaluation is always
@@ -1108,21 +1119,22 @@ def final_train_m1(X_pp, X_pt_list, y, dev_idx: np.ndarray,
     validation MAE is also retained for beta selection.
     """
     _require_test_point_grouping(train_cfg, group_values, group_cfg)
+    split_seed = seed if split_seed is None else split_seed
     n_pp = X_pp.shape[1]
     if group_split_required(group_cfg, edge_cfg, "validation"):
         tr_idx, val_idx = grouped_train_val_split(
-            dev_idx, validation_fraction(train_cfg), seed, group_values,
+            dev_idx, validation_fraction(train_cfg), split_seed, group_values,
             group_cfg, strat_labels, edge_values, edge_cfg)
     elif strat_labels is not None:
         sss = StratifiedShuffleSplit(n_splits=1,
                                      test_size=validation_fraction(train_cfg),
-                                     random_state=seed)
+                                     random_state=split_seed)
         rel = np.arange(len(dev_idx))
         _tr_rel, _val_rel = next(sss.split(rel, strat_labels[dev_idx]))
         tr_idx  = dev_idx[_tr_rel]
         val_idx = dev_idx[_val_rel]
     else:
-        rng     = np.random.default_rng(seed)
+        rng     = np.random.default_rng(split_seed)
         perm    = rng.permutation(len(dev_idx))
         n_val   = max(1, int(len(dev_idx) * validation_fraction(train_cfg)))
         val_idx = dev_idx[perm[:n_val]]
@@ -1177,6 +1189,8 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int,
     Rule: scalar in search_space → fixed; [min, max] → suggested by Optuna.
     Keys absent from search_space are not returned (caller keeps base config value).
     """
+    if (base_model_cfg or {}).get("pp_branch") == "direct":
+        ss = {key: value for key, value in ss.items() if not key.startswith("pp_")}
     m_upd = {}   # model cfg overrides
     t_upd = {}   # training cfg overrides
 
@@ -1529,7 +1543,7 @@ def main():
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
-    cfg      = json.loads(cfg_path.read_text())
+    cfg, cfg_path = load_pipeline_config(cfg_path, "M1", mat)
     if args.optuna_seed is not None:
         cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
         print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
@@ -1581,7 +1595,7 @@ def run_experiment(cfg, mat, cfg_path):
     # ── Initial train/test split (done once; test data NEVER used in HPO or CV) ──
     test_frac = prep_cfg.get("test_fraction", 0.2)
     dev_idx, test_idx = _initial_split(
-        len(part_ids), test_frac, seed, strat_labels, group_ids, group_cfg,
+        len(part_ids), test_frac, prep_cfg.get("split_seed", seed), strat_labels, group_ids, group_cfg,
         edge_values, edge_cfg)
     if group_split_required(group_cfg, edge_cfg, "test") and group_ids is not None:
         validate_group_disjoint(dev_idx, test_idx,
@@ -1676,25 +1690,29 @@ def run_experiment(cfg, mat, cfg_path):
     # ── Final training on dev; complete validation and held-out test metrics ──
     final_model, final_scalers, tr_idx_final, val_idx_final = final_train_m1(
         X_pp, X_pt_list, y, dev_idx, model_cfg, train_cfg, seed, device,
-        strat_labels, group_ids, group_cfg, edge_values, edge_cfg)
+        strat_labels, group_ids, group_cfg, edge_values, edge_cfg,
+        split_seed=prep_cfg.get("split_seed", seed))
     if edge_values is not None:
         validate_edge_groups_excluded(
             val_idx_final, edge_values, group_ids, edge_cfg, group_cfg,
             scope_indices=dev_idx, partition="validation")
     pp_sc, pt_scalers = final_scalers
-    Xpp_te, Xpt_te = apply_scalers(X_pp[test_idx], [x[test_idx] for x in X_pt_list], pp_sc, pt_scalers)
-    final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[test_idx], device,
-                                   group_ids[test_idx] if group_ids is not None else None)
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx if test_enabled else val_idx_final
+    Xpp_te, Xpt_te = apply_scalers(X_pp[eval_idx], [x[eval_idx] for x in X_pt_list], pp_sc, pt_scalers)
+    final_metrics = evaluate_model(final_model, Xpp_te, Xpt_te, y[eval_idx], device,
+                                   group_ids[eval_idx] if group_ids is not None else None)
     Xpp_val, Xpt_val = apply_scalers(
         X_pp[val_idx_final], [x[val_idx_final] for x in X_pt_list], pp_sc, pt_scalers)
     validation_metrics = evaluate_model(
         final_model, Xpp_val, Xpt_val, y[val_idx_final], device,
         group_ids[val_idx_final] if group_ids is not None else None)
-    if train_cfg.get("test_point_training", {}).get("enabled", False):
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    if "evaluation" in cfg or train_cfg.get("test_point_training", {}).get("enabled", False):
         final_metrics["validation_MAE"] = validation_metrics["MAE"]
     (run_best_dir / "validation_metrics.json").write_text(json.dumps(
         {k: v for k, v in validation_metrics.items() if k != "pred"}, indent=2))
-    for split_name, split_metrics in (("validation", validation_metrics), ("test", final_metrics)):
+    for split_name, split_metrics in (("validation", validation_metrics), ("test" if test_enabled else "validation", final_metrics)):
         if "test_points" in split_metrics:
             pd.DataFrame(split_metrics["test_points"]).to_csv(
                 run_best_dir / f"{split_name}_test_points.csv", index=False)
@@ -1714,14 +1732,14 @@ def run_experiment(cfg, mat, cfg_path):
           f"R²={final_metrics['R2']:.4f}  MSE={final_metrics['MSE']:.4f}")
     print(f"{'═' * 60}")
 
-    save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
+    save_final_test_plots(y[eval_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat)
     save_batch_test_diagnostics(
-        y[test_idx], final_metrics["pred"],
-        group_ids[test_idx] if group_ids is not None else None,
-        part_ids[test_idx], run_best_dir,
+        y[eval_idx], final_metrics["pred"],
+        group_ids[eval_idx] if group_ids is not None else None,
+        part_ids[eval_idx], run_best_dir,
         target_names=[data_cfg["target_col"]],
-        title=f"[{mat} | M1] Final held-out test",
+        title=f"[{mat} | M1] {'Test' if test_enabled else 'Validation'} evaluation",
     )
 
     edge_policy_metadata = edge_group_policy_metadata(
@@ -1779,7 +1797,8 @@ def run_experiment(cfg, mat, cfg_path):
     dp = {
         "run_ts":         _RUN_TS,
         "id_col":         data_cfg["id_col"],
-        "random_seed":    seed,
+        "random_seed":    prep_cfg.get("split_seed", seed),
+        "training_seed":  seed,
         "pp_cols":        pp_cols,
         "train_part_ids": part_ids[tr_idx_final].tolist(),
         "val_part_ids":   part_ids[val_idx_final].tolist(),
@@ -1821,7 +1840,8 @@ def run_experiment(cfg, mat, cfg_path):
     run_info = {
         "run_ts":       _RUN_TS,
         "material":     mat,
-        "split_seed":   seed,
+        "split_seed":   prep_cfg.get("split_seed", seed),
+        "training_seed": seed,
         "sampler_seed": sampler_seed,
         "run_best_dir": str(run_best_dir.relative_to(BASE_DIR)),
     }
@@ -1829,14 +1849,14 @@ def run_experiment(cfg, mat, cfg_path):
     print(f"Run info saved → {run_best_dir / 'run_info.json'}")
 
     if overall_updated:
-        save_final_test_plots(y[test_idx], final_metrics["pred"], final_metrics,
+        save_final_test_plots(y[eval_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat)
         save_batch_test_diagnostics(
-            y[test_idx], final_metrics["pred"],
-            group_ids[test_idx] if group_ids is not None else None,
-            part_ids[test_idx], overall_best_dir,
+            y[eval_idx], final_metrics["pred"],
+            group_ids[eval_idx] if group_ids is not None else None,
+            part_ids[eval_idx], overall_best_dir,
             target_names=[data_cfg["target_col"]],
-            title=f"[{mat} | M1] Final held-out test",
+            title=f"[{mat} | M1] {'Test' if test_enabled else 'Validation'} evaluation",
         )
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
         for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
@@ -1864,6 +1884,9 @@ def run_experiment(cfg, mat, cfg_path):
                 shutil.copy2(artifact, overall_best_dir / artifact.name)
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
 
+    finalize_evaluation(run_best_dir, test_enabled)
+    if overall_updated:
+        finalize_evaluation(overall_best_dir, test_enabled)
     return {"validation_mae_g": final_model.m1_training_info["best_validation_mae_g"],
             "run_dir": str(run_best_dir), "within_test_point_beta":
             train_cfg.get("within_test_point_beta", 0.0)}

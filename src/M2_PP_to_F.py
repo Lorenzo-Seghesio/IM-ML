@@ -148,6 +148,11 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
+try:
+    from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+except ModuleNotFoundError:
+    from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -299,6 +304,8 @@ def train_fold(model: M2Model,
     best_val_mae = float("inf")
     best_state   = copy.deepcopy(model.state_dict())
     wait         = 0
+    history = []
+    best_epoch = 0
 
     for epoch in range(1, tcfg["epochs"] + 1):
         model.train()
@@ -321,11 +328,16 @@ def train_fold(model: M2Model,
         if tcfg["scheduler_factor"] < 1:
             scheduler.step(val_mae)
 
+        history.append({"epoch": epoch, "train_loss": epoch_loss,
+                        "validation_scaled_MAE": val_mae,
+                        "learning_rate": optimizer.param_groups[0]["lr"]})
+
         if epoch % tcfg["print_every"] == 0:
             print(f"    ep {epoch:4d}  train_loss={epoch_loss:.4f}  val_mae={val_mae:.4f}")
 
         if val_mae < best_val_mae:
             best_val_mae = val_mae
+            best_epoch = epoch
             best_state   = copy.deepcopy(model.state_dict())
             wait         = 0
         else:
@@ -335,6 +347,8 @@ def train_fold(model: M2Model,
                 break
 
     model.load_state_dict(best_state)
+    model.m2_training_info = {"history": history, "best_epoch": best_epoch,
+                             "best_validation_scaled_MAE": best_val_mae}
     return model, best_val_mae
 
 
@@ -698,6 +712,7 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
                           final_metrics: dict, plots_dir: Path,
                           material: str, f_cols: list):
     """Scatter + residual-hist plots evaluated on the held-out test set (PRIMARY)."""
+    partition_label = "Validation" if final_metrics.get("source") == "validation" else "Final Test"
     n_f   = len(f_cols)
     ncols = min(n_f, 3)
     nrows = math.ceil(n_f / ncols)
@@ -722,7 +737,7 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
     for i in range(n_f, nrows * ncols):
         axes[i // ncols][i % ncols].set_visible(False)
     fig.suptitle(
-        f"[{material}] Final Test — Measured vs Predicted\n"
+        f"[{material}] {partition_label} — Measured vs Predicted\n"
         f"mean_MAE={final_metrics['mean_MAE']:.4f}",
         fontsize=12)
     fig.tight_layout()
@@ -745,7 +760,7 @@ def save_final_test_plots(Y_test: np.ndarray, preds_test: np.ndarray,
         ax.legend()
     for i in range(n_f, nrows * ncols):
         axes[i // ncols][i % ncols].set_visible(False)
-    fig.suptitle(f"[{material}] Residuals by f-target (final test)", fontsize=12)
+    fig.suptitle(f"[{material}] Residuals by f-target ({partition_label})", fontsize=12)
     fig.tight_layout()
     fig.savefig(plots_dir / "residuals_hist_final_test.png")
     plt.close(fig)
@@ -766,8 +781,9 @@ def save_models(final_model: M2Model, final_metrics: dict,
         "mean_R2":    final_metrics["mean_R2"],
         "mean_MSE":   final_metrics["mean_MSE"],
         "per_target": final_metrics.get("per_target", {}),
-        "source":     "final_test",
-        "selection_metric": "mean_NMAE",
+        "source":     final_metrics.get("source", "final_test"),
+        "selection_metric": "validation_NMAE" if "validation_NMAE" in final_metrics else "mean_NMAE",
+        **({"validation_NMAE": final_metrics["validation_NMAE"]} if "validation_NMAE" in final_metrics else {}),
         "n_in":       n_in,
         "n_out":      n_out,
         "pp_cols":    pp_cols,
@@ -777,7 +793,7 @@ def save_models(final_model: M2Model, final_metrics: dict,
     torch.save(final_model.state_dict(), run_best_dir / "best_model.pt")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(run_info, indent=2))
     mae = final_metrics["mean_MAE"]
-    nmae = final_metrics["mean_NMAE"]
+    nmae = final_metrics.get("validation_NMAE", final_metrics["mean_NMAE"])
     print(f"\nRun best model saved  (test mean_MAE={mae:.4f}, "
           f"mean_NMAE={nmae:.4f})  → {run_best_dir}")
 
@@ -785,8 +801,9 @@ def save_models(final_model: M2Model, final_metrics: dict,
     prev_nmae = float("inf")
     if overall_path.exists():
         previous_metrics = json.loads(overall_path.read_text())
-        if "mean_NMAE" in previous_metrics:
-            prev_nmae = float(previous_metrics["mean_NMAE"])
+        selection_key = "validation_NMAE" if "validation_NMAE" in final_metrics else "mean_NMAE"
+        if selection_key in previous_metrics:
+            prev_nmae = float(previous_metrics[selection_key])
         else:
             print("Existing best metrics have no mean_NMAE; treating the model as "
                   "unscored for normalized selection.")
@@ -1096,7 +1113,7 @@ def main():
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
-    cfg      = json.loads(cfg_path.read_text())
+    cfg, cfg_path = load_pipeline_config(cfg_path, "M2", mat)
     if args.optuna_seed is not None:
         cfg.setdefault("optuna", {})["sampler_seed"] = args.optuna_seed
         print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed}")
@@ -1248,8 +1265,15 @@ def main():
         X, Y, tr_idx, val_idx, x_sc, model_cfg, train_cfg, seed, device,
         group_ids, group_cfg, edge_values, edge_cfg)
 
-    X_te_s = x_sc.transform(X[test_idx]).astype(np.float32)
-    final_metrics = evaluate_model(final_model, X_te_s, Y[test_idx], y_sc, f_cols, device)
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx if test_enabled else val_idx
+    X_te_s = x_sc.transform(X[eval_idx]).astype(np.float32)
+    final_metrics = evaluate_model(final_model, X_te_s, Y[eval_idx], y_sc, f_cols, device)
+    if "evaluation" in cfg:
+        validation = evaluate_model(final_model, x_sc.transform(X[val_idx]), Y[val_idx], y_sc, f_cols, device)
+        final_metrics["validation_NMAE"] = validation["mean_NMAE"]
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    (run_best_dir / "configuration.json").write_text(json.dumps(cfg, indent=2))
     print(f"\n{'═' * 60}")
     print(f"Final Test  mean_MAE={final_metrics['mean_MAE']:.4f}  "
           f"mean_NMAE={final_metrics['mean_NMAE']:.4f}  "
@@ -1260,14 +1284,14 @@ def main():
         print(f"  {fc}  MAE={m['MAE']:.4f}  R²={m['R2']:.4f}")
     print(f"{'═' * 60}")
 
-    save_final_test_plots(Y[test_idx], final_metrics["pred"], final_metrics,
+    save_final_test_plots(Y[eval_idx], final_metrics["pred"], final_metrics,
                           run_best_dir, mat, f_cols)
     save_batch_test_diagnostics(
-        Y[test_idx], final_metrics["pred"],
-        group_ids[test_idx] if group_ids is not None else None,
-        part_ids[test_idx], run_best_dir,
+        Y[eval_idx], final_metrics["pred"],
+        group_ids[eval_idx] if group_ids is not None else None,
+        part_ids[eval_idx], run_best_dir,
         target_names=f_cols,
-        title=f"[{mat} | M2] Final held-out test",
+        title=f"[{mat} | M2] {'Test' if test_enabled else 'Validation'} evaluation",
     )
 
     overall_updated = save_models(
@@ -1303,14 +1327,14 @@ def main():
         run_best_dir / "f_predictions.csv", data_cfg["id_col"], device)
 
     if overall_updated:
-        save_final_test_plots(Y[test_idx], final_metrics["pred"], final_metrics,
+        save_final_test_plots(Y[eval_idx], final_metrics["pred"], final_metrics,
                               overall_best_dir, mat, f_cols)
         save_batch_test_diagnostics(
-            Y[test_idx], final_metrics["pred"],
-            group_ids[test_idx] if group_ids is not None else None,
-            part_ids[test_idx], overall_best_dir,
+            Y[eval_idx], final_metrics["pred"],
+            group_ids[eval_idx] if group_ids is not None else None,
+            part_ids[eval_idx], overall_best_dir,
             target_names=f_cols,
-            title=f"[{mat} | M2] Final held-out test",
+            title=f"[{mat} | M2] {'Test' if test_enabled else 'Validation'} evaluation",
         )
         save_cv_plots(metrics_df, K, mat, overall_best_dir)
         for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
@@ -1326,6 +1350,10 @@ def main():
             if src_trials.exists():
                 shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
+
+    finalize_evaluation(run_best_dir, test_enabled)
+    if overall_updated:
+        finalize_evaluation(overall_best_dir, test_enabled)
 
 
 if __name__ == "__main__":

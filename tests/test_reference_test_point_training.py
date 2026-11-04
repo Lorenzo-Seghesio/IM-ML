@@ -307,9 +307,9 @@ class ReferenceArtifactTests(unittest.TestCase):
                 hpo_key = label.lower() + '_hpo'
                 self.assertEqual(calls[0][hpo_key]['sampler_seed'], calls[1][hpo_key]['sampler_seed'])
                 self.assertNotEqual(calls[0][hpo_key]['study_name'], calls[1][hpo_key]['study_name'])
-                promoted = json.loads((Path(directory) / label / 'DOE1' / 'best_overall' / 'best_metrics.json').read_text())
+                promoted = json.loads((Path(directory) / label / 'best_overall' / 'best_metrics.json').read_text())
                 self.assertEqual(promoted['MAE'], 100.)
-                model_root = Path(directory) / label / 'DOE1'
+                model_root = Path(directory) / label
                 for name in ('beta_mae_comparison.png', 'beta_mae_comparison.csv'):
                     self.assertTrue((model_root / 'beta_experiments' / ref._RUN_TS / name).exists())
                     self.assertTrue((model_root / 'best_overall' / name).exists())
@@ -363,7 +363,7 @@ class ReferenceArtifactTests(unittest.TestCase):
                 for record in result['experiments']:
                     run_dir = Path(record['run_dir'])
                     beta_dir = ref._beta_label(record['within_test_point_beta'])
-                    model_root = Path(directory) / 'outputs' / label / 'DOE1'
+                    model_root = Path(directory) / 'outputs' / label
                     self.assertEqual(run_dir, model_root / 'run_best' / ref._RUN_TS / beta_dir)
                     self.assertTrue((model_root / 'best_overall' / beta_dir / 'best_model.pt').exists())
                     for name in ('best_model.pt', 'best_metrics.json', 'configuration.json',
@@ -381,7 +381,7 @@ class ReferenceArtifactTests(unittest.TestCase):
                     selected = json.loads((run_dir / 'best_metrics.json').read_text())
                     self.assertEqual(selected['validation_MAE'], record['validation_mae_g'])
                     self.assertIn('MAE_within', selected)
-                root = Path(directory) / 'outputs' / label / 'DOE1' / 'best_overall'
+                root = Path(directory) / 'outputs' / label / 'best_overall'
                 self.assertTrue((root / 'beta_selection.json').exists())
                 self.assertTrue((root / 'scalers.json').exists())
 

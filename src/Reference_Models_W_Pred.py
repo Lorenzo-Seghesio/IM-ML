@@ -160,6 +160,11 @@ from pathlib import Path
 # Keep insufficient-variability and undersized-test-point warnings visible.
 warnings.simplefilter("always", InsufficientVariabilityWarning)
 
+try:
+    from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+except ModuleNotFoundError:
+    from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 BASE_OUT = BASE_DIR / "outputs" # It will be in main
 _RUN_TS  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -301,6 +306,7 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, test_point_ids=None) -> dic
     rmse = math.sqrt(mse)
     r2   = float(r2_score(y_true, y_pred))
     metrics = {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": y_pred}
+    metrics["relative_MAE_percent"] = 100 * mae / abs(float(np.mean(y_true))) if np.mean(y_true) else None
     if test_point_ids is not None:
         metrics.update(test_point_metrics(y_true, y_pred, test_point_ids))
     return metrics
@@ -482,7 +488,7 @@ def _beta_label(beta):
 
 
 def _test_point_output_dirs(label, mat_dir, train_cfg):
-    root = BASE_OUT / label / mat_dir
+    root = stage_directory(BASE_OUT, label, mat_dir)
     if train_cfg.get("test_point_training", {}).get("enabled", False):
         beta_dir = _beta_label(train_cfg.get("within_test_point_beta", 0.0))
         return root / "run_best" / _RUN_TS / beta_dir, root / "best_overall" / beta_dir
@@ -600,7 +606,7 @@ def run_test_point_beta_experiments(label, cfg, mat_dir, seed, run_experiment, b
                  "selected_beta": winner["within_test_point_beta"],
                  "selected_validation_mae_g": winner["validation_mae_g"],
                  "experiments": results}
-    root = BASE_OUT / label / mat_dir
+    root = stage_directory(BASE_OUT, label, mat_dir)
     summary_dir = root / "beta_experiments" / _RUN_TS
     summary_dir.mkdir(parents=True, exist_ok=True)
     (summary_dir / "beta_selection.json").write_text(json.dumps(selection, indent=2))
@@ -792,6 +798,7 @@ def save_final_test_plots(y_test: np.ndarray, preds: np.ndarray,
                           final_metrics: dict, out_dir: Path,
                           material: str, label: str):
     """Scatter + residuals from the final model on the held-out test set (primary output)."""
+    partition_label = "Validation" if final_metrics.get("source") == "validation" else "Held-out Test"
     # Scatter: measured vs predicted
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.scatter(y_test, preds, color=_PLT_C["scatter"],
@@ -802,7 +809,7 @@ def save_final_test_plots(y_test: np.ndarray, preds: np.ndarray,
     ax.set_xlabel("Measured weight [g]")
     ax.set_ylabel("Predicted weight [g]")
     ax.set_title(
-        f"[{material} | {label}] Final Model — Held-out Test\n"
+        f"[{material} | {label}] Final Model — {partition_label}\n"
         f"MAE={final_metrics['MAE']:.4f} g   R²={final_metrics['R2']:.4f}",
     )
     ax.legend()
@@ -829,14 +836,14 @@ def save_final_test_plots(y_test: np.ndarray, preds: np.ndarray,
 def _save_batch_test_artifacts(y_test: np.ndarray, preds: np.ndarray,
                                group_ids, part_ids, test_idx: np.ndarray,
                                out_dir: Path, material: str, label: str,
-                               target_name: str):
+                               target_name: str, partition: str = "test"):
     """Save batch diagnostics for one reference model's held-out predictions."""
     sample_ids = part_ids[test_idx] if part_ids is not None else test_idx
     batch_ids = group_ids[test_idx] if group_ids is not None else None
     save_batch_test_diagnostics(
         y_test, preds, batch_ids, sample_ids, out_dir,
         target_names=[target_name],
-        title=f"[{material} | {label}] Final held-out test",
+        title=f"[{material} | {label}] {partition.title()} evaluation",
     )
 
 
@@ -903,7 +910,8 @@ def save_model_gbdt(model, final_metrics: dict,
     (run_best_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
     print(f"\n[{label}] Final model saved  (MAE={final_metrics['MAE']:.4f})  → {run_best_dir}")
 
-    prev_mae, update = _check_overall_best(final_metrics["MAE"], overall_best_dir)
+    selection_key = "validation_MAE" if "validation_MAE" in final_metrics else "MAE"
+    prev_mae, update = _check_overall_best(final_metrics[selection_key], overall_best_dir, selection_key)
     if update:
         joblib.dump(model, overall_best_dir / "best_model.joblib")
         (overall_best_dir / "best_metrics.json").write_text(json.dumps(info, indent=2))
@@ -1736,20 +1744,24 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
     scale = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
-    res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[test_idx]), y[test_idx], device,
-                      group_values[test_idx] if group_values is not None else None)
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx if test_enabled else np.asarray(final_model.ref_training_info["validation_indices"])
+    res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[eval_idx]), y[eval_idx], device,
+                      group_values[eval_idx] if group_values is not None else None)
     final_metrics = {k: v for k, v in res.items() if k != "pred"}
-    final_metrics["source"] = "final_test"
-    _save_evaluation_artifacts(res, rb_dir, "test")
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    if "evaluation" in cfg:
+        final_metrics["validation_MAE"] = final_model.ref_training_info["best_validation_mae_g"]
+    _save_evaluation_artifacts(res, rb_dir, "test" if test_enabled else "validation")
     _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[Encoder] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
-    save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "Encoder")
-    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                               part_ids, test_idx, rb_dir, mat, "Encoder",
-                               target_name)
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, "Encoder")
+    _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                               part_ids, eval_idx, rb_dir, mat, "Encoder",
+                               target_name, partition="test" if test_enabled else "validation")
 
     _save_nn_training_artifacts(final_model, cfg, train_cfg, final_metrics, rb_dir,
                                 part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
@@ -1760,17 +1772,20 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "Encoder")
 
     # XAI — GradCAM on the last Conv1d layer
-    _xai_gradcam_encoder(final_model, scale(X_pt[test_idx]), rb_dir, "Encoder", device)
+    _xai_gradcam_encoder(final_model, scale(X_pt[eval_idx]), rb_dir, "Encoder", device)
 
     _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated, seed, sampler_seed)
     if updated:
-        save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
-        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                                   part_ids, test_idx, ob_dir, mat, "Encoder",
-                                   target_name)
+        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
+        _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                                   part_ids, eval_idx, ob_dir, mat, "Encoder",
+                                   target_name, partition="test" if test_enabled else "validation")
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[Encoder] All artefacts copied → {ob_dir}")
+    finalize_evaluation(rb_dir, test_enabled)
+    if updated:
+        finalize_evaluation(ob_dir, test_enabled)
     return {"validation_mae_g": final_model.ref_training_info["best_validation_mae_g"],
             "run_dir": str(rb_dir),
             "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
@@ -1842,21 +1857,25 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         train_cfg, device, seed, strat_labels, group_values, group_cfg,
         fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
 
-    X_te_s = sc.transform(X_pp[test_idx]).astype(np.float32)
-    res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[test_idx], device,
-                          group_values[test_idx] if group_values is not None else None)
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx if test_enabled else np.asarray(final_model.ref_training_info["validation_indices"])
+    X_te_s = sc.transform(X_pp[eval_idx]).astype(np.float32)
+    res = evaluate_nn(final_model, _mlp_prepare, X_te_s, y[eval_idx], device,
+                          group_values[eval_idx] if group_values is not None else None)
     final_metrics = {k: v for k, v in res.items() if k != "pred"}
-    final_metrics["source"] = "final_test"
-    _save_evaluation_artifacts(res, rb_dir, "test")
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    if "evaluation" in cfg:
+        final_metrics["validation_MAE"] = final_model.ref_training_info["best_validation_mae_g"]
+    _save_evaluation_artifacts(res, rb_dir, "test" if test_enabled else "validation")
     _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[MLP] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
-    save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "MLP")
-    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                               part_ids, test_idx, rb_dir, mat, "MLP",
-                               target_name)
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, "MLP")
+    _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                               part_ids, eval_idx, rb_dir, mat, "MLP",
+                               target_name, partition="test" if test_enabled else "validation")
 
     _save_nn_training_artifacts(final_model, cfg, train_cfg, final_metrics, rb_dir,
                                 part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
@@ -1875,13 +1894,16 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
 
     _save_run_info(rb_dir, ob_dir, mat, "MLP", updated, seed, sampler_seed)
     if updated:
-        save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "MLP")
-        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                                   part_ids, test_idx, ob_dir, mat, "MLP",
-                                   target_name)
+        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, "MLP")
+        _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                                   part_ids, eval_idx, ob_dir, mat, "MLP",
+                                   target_name, partition="test" if test_enabled else "validation")
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[MLP] All artefacts copied → {ob_dir}")
+    finalize_evaluation(rb_dir, test_enabled)
+    if updated:
+        finalize_evaluation(ob_dir, test_enabled)
     return {"validation_mae_g": final_model.ref_training_info["best_validation_mae_g"],
             "run_dir": str(rb_dir),
             "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
@@ -1894,8 +1916,8 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     hpo_cfg   = cfg["lgbm_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
-    rb_dir    = BASE_OUT / "LightGBM" / mat_dir / "run_best" / _RUN_TS
-    ob_dir    = BASE_OUT / "LightGBM" / mat_dir / "best_overall"
+    rb_dir    = stage_directory(BASE_OUT, "LightGBM", mat_dir) / "run_best" / _RUN_TS
+    ob_dir    = stage_directory(BASE_OUT, "LightGBM", mat_dir) / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -1945,40 +1967,53 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     save_cv_diagnostics(cv_predictions, rb_dir,
                         f"[{mat} | LightGBM] Indicative K-fold CV on dev set")
 
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    if test_enabled:
+        fit_idx, eval_idx = dev_idx, test_idx
+    else:
+        fit_idx, eval_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
+            group_values, group_cfg, edge_values, edge_cfg)
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(lgb.LGBMRegressor, best_params,
-                                     X_pp, y, dev_idx, "LightGBM")
-    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx],
-                        group_values[test_idx] if group_values is not None else None)
+                                     X_pp, y, fit_idx, "LightGBM")
+    res = evaluate_gbdt(final_model, X_pp[eval_idx], y[eval_idx],
+                        group_values[eval_idx] if group_values is not None else None)
     final_metrics = {k: v for k, v in res.items() if k != "pred"}
-    final_metrics["source"] = "final_test"
-    _save_evaluation_artifacts(res, rb_dir, "test")
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    if "evaluation" in cfg:
+        final_metrics["validation_MAE"] = float(metrics_df["MAE"].mean())
+    _save_evaluation_artifacts(res, rb_dir, "test" if test_enabled else "validation")
     _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[LightGBM] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
-    save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "LightGBM")
-    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                               part_ids, test_idx, rb_dir, mat, "LightGBM",
-                               target_name)
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, "LightGBM")
+    _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                               part_ids, eval_idx, rb_dir, mat, "LightGBM",
+                               target_name, partition="test" if test_enabled else "validation")
 
     (rb_dir / "configuration.json").write_text(json.dumps(cfg, indent=2))
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "LightGBM")
 
     # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
-    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "LightGBM")
+    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[eval_idx], pp_cols, rb_dir, "LightGBM")
 
     _save_run_info(rb_dir, ob_dir, mat, "LightGBM", updated, seed, sampler_seed)
     if updated:
-        save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "LightGBM")
-        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                                   part_ids, test_idx, ob_dir, mat, "LightGBM",
-                                   target_name)
+        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, "LightGBM")
+        _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                                   part_ids, eval_idx, ob_dir, mat, "LightGBM",
+                                   target_name, partition="test" if test_enabled else "validation")
         save_cv_plots(metrics_df, K, mat, ob_dir, "LightGBM")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[LightGBM] All artefacts copied → {ob_dir}")
+
+
+    finalize_evaluation(rb_dir, test_enabled)
+    if updated:
+        finalize_evaluation(ob_dir, test_enabled)
 
 
 def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
@@ -1988,8 +2023,8 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     hpo_cfg   = cfg["xgboost_hpo"]
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"]
-    rb_dir    = BASE_OUT / "XGBoost" / mat_dir / "run_best" / _RUN_TS
-    ob_dir    = BASE_OUT / "XGBoost" / mat_dir / "best_overall"
+    rb_dir    = stage_directory(BASE_OUT, "XGBoost", mat_dir) / "run_best" / _RUN_TS
+    ob_dir    = stage_directory(BASE_OUT, "XGBoost", mat_dir) / "best_overall"
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -2039,43 +2074,56 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
     save_cv_diagnostics(cv_predictions, rb_dir,
                         f"[{mat} | XGBoost] Indicative K-fold CV on dev set")
 
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    if test_enabled:
+        fit_idx, eval_idx = dev_idx, test_idx
+    else:
+        fit_idx, eval_idx = _inner_split(dev_idx, train_cfg, seed, 0, strat_labels,
+            group_values, group_cfg, edge_values, edge_cfg)
     # Final retrain on all dev; evaluate on held-out test
     final_model = final_retrain_gbdt(xgb.XGBRegressor, best_params,
-                                     X_pp, y, dev_idx, "XGBoost")
-    res = evaluate_gbdt(final_model, X_pp[test_idx], y[test_idx],
-                        group_values[test_idx] if group_values is not None else None)
+                                     X_pp, y, fit_idx, "XGBoost")
+    res = evaluate_gbdt(final_model, X_pp[eval_idx], y[eval_idx],
+                        group_values[eval_idx] if group_values is not None else None)
     final_metrics = {k: v for k, v in res.items() if k != "pred"}
-    final_metrics["source"] = "final_test"
-    _save_evaluation_artifacts(res, rb_dir, "test")
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
+    if "evaluation" in cfg:
+        final_metrics["validation_MAE"] = float(metrics_df["MAE"].mean())
+    _save_evaluation_artifacts(res, rb_dir, "test" if test_enabled else "validation")
     _save_cv_training_artifacts(cv_predictions, rb_dir)
     print(f"\n{'═' * 60}")
     print(f"[XGBoost] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
-    save_final_test_plots(y[test_idx], res["pred"], final_metrics, rb_dir, mat, "XGBoost")
-    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                               part_ids, test_idx, rb_dir, mat, "XGBoost",
-                               target_name)
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, "XGBoost")
+    _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                               part_ids, eval_idx, rb_dir, mat, "XGBoost",
+                               target_name, partition="test" if test_enabled else "validation")
 
     (rb_dir / "configuration.json").write_text(json.dumps(cfg, indent=2))
     updated = save_model_gbdt(final_model, final_metrics, rb_dir, ob_dir,
                               best_params, "XGBoost")
 
     # XAI — SHAP TreeExplainer on raw (unscaled) process parameters
-    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[test_idx], pp_cols, rb_dir, "XGBoost")
+    _xai_shap_gbdt(final_model, X_pp[dev_idx], X_pp[eval_idx], pp_cols, rb_dir, "XGBoost")
 
     _save_run_info(rb_dir, ob_dir, mat, "XGBoost", updated, seed, sampler_seed)
     if updated:
-        save_final_test_plots(y[test_idx], res["pred"], final_metrics, ob_dir, mat, "XGBoost")
-        _save_batch_test_artifacts(y[test_idx], res["pred"], group_values,
-                                   part_ids, test_idx, ob_dir, mat, "XGBoost",
-                                   target_name)
+        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, "XGBoost")
+        _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
+                                   part_ids, eval_idx, ob_dir, mat, "XGBoost",
+                                   target_name, partition="test" if test_enabled else "validation")
         save_cv_plots(metrics_df, K, mat, ob_dir, "XGBoost")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[XGBoost] All artefacts copied → {ob_dir}")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+    finalize_evaluation(rb_dir, test_enabled)
+    if updated:
+        finalize_evaluation(ob_dir, test_enabled)
+
 
 def suggest_custom_gbdt_params(trial, search_space):
     """Tree shrinkage is separate from the neural optimizer's training.lr."""
@@ -2241,12 +2289,15 @@ def run_custom_gbdt(X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, tes
     model = final_train_custom_gbdt(
         X_pp, y, dev_idx, params, train_cfg, seed, strat_labels, group_values, group_cfg,
         fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
-    res = _metrics(y[test_idx], model.predict(X_pp[test_idx]), group_values[test_idx])
-    _save_evaluation_artifacts(res, run_dir, "test")
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx if test_enabled else np.asarray(model.ref_training_info["validation_indices"])
+    res = _metrics(y[eval_idx], model.predict(X_pp[eval_idx]), group_values[eval_idx])
+    _save_evaluation_artifacts(res, run_dir, "test" if test_enabled else "validation")
     validation_idx = np.asarray(model.ref_training_info["validation_indices"])
     validation = _metrics(y[validation_idx], model.predict(X_pp[validation_idx]), group_values[validation_idx])
     model.ref_training_info["best_validation_metrics"] = {k: v for k, v in validation.items() if k != "pred"}
     final_metrics = {k: v for k, v in res.items() if k != "pred"}
+    final_metrics["source"] = "final_test" if test_enabled else "validation"
     _save_test_point_training_artifacts(
         model, {**cfg, "custom_gbdt": model.get_params()}, train_cfg, final_metrics, run_dir,
         part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
@@ -2256,14 +2307,17 @@ def run_custom_gbdt(X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, tes
     pd.DataFrame({"feature": pp_cols, "importance": model.feature_importances_}).to_csv(
         run_dir / "feature_importances.csv", index=False)
     updated = save_model_custom_gbdt(model, final_metrics, run_dir, overall_dir, model.get_params())
-    save_final_test_plots(y[test_idx], res["pred"], final_metrics, run_dir, mat, "CustomGBDT")
-    _save_batch_test_artifacts(y[test_idx], res["pred"], group_values, part_ids, test_idx,
-                               run_dir, mat, "CustomGBDT", target_name)
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, run_dir, mat, "CustomGBDT")
+    _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values, part_ids, eval_idx,
+                               run_dir, mat, "CustomGBDT", target_name, partition="test" if test_enabled else "validation")
     _save_run_info(run_dir, overall_dir, mat, "CustomGBDT", updated, seed, sampler_seed)
     if updated:
         for artifact in run_dir.iterdir():
             if artifact.is_file():
                 shutil.copy2(artifact, overall_dir / artifact.name)
+    finalize_evaluation(run_dir, test_enabled)
+    if updated:
+        finalize_evaluation(overall_dir, test_enabled)
     return {"validation_mae_g": model.ref_training_info["best_validation_mae_g"],
             "run_dir": str(run_dir), "within_test_point_beta": train_cfg.get("within_test_point_beta", 0.0)}
 
@@ -2287,7 +2341,7 @@ def main():
     mat  = args.material
 
     cfg_path = BASE_DIR / "config" / _CFG_MAP[mat]
-    cfg      = json.loads(cfg_path.read_text())
+    cfg, cfg_path = load_pipeline_config(cfg_path, "RefModels", mat)
     if args.models is not None:
         cfg["active_models"] = {name: int(name in args.models) for name in (
             "encoder", "mlp", "lgbm", "xgboost", "custom_gbdt")}

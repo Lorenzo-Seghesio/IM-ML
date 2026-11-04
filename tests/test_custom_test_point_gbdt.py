@@ -315,7 +315,7 @@ class CustomPipelineTests(unittest.TestCase):
                 self.assertEqual(split['train_part_ids'], list(range(100, 116)))
                 self.assertEqual(split['val_part_ids'], list(range(116, 124)))
                 self.assertEqual(split['test_part_ids'], list(range(124, 132)))
-            root = Path(directory) / 'outputs' / 'CustomGBDT' / 'DOE1' / 'best_overall'
+            root = Path(directory) / 'outputs' / 'CustomGBDT' / 'best_overall'
             self.assertTrue((root / 'best_model.joblib').exists())
             self.assertTrue((root / 'beta_selection.json').exists())
 
@@ -363,7 +363,7 @@ class CustomPipelineTests(unittest.TestCase):
                 return {'validation_mae_g': val_mae, 'run_dir': str(output), 'within_test_point_beta': beta}
             selected = ref.run_test_point_beta_experiments('CustomGBDT', cfg, 'DOE1', 42, run, [0, .25])
             self.assertEqual(selected['selected_beta'], .25)
-            root = Path(directory) / 'CustomGBDT' / 'DOE1' / 'best_overall'
+            root = Path(directory) / 'CustomGBDT' / 'best_overall'
             self.assertEqual(json.loads((root / 'best_metrics.json').read_text())['MAE'], 100.)
 
     def test_main_registers_custom_model_and_passes_shared_split(self):

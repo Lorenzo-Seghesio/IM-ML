@@ -209,6 +209,13 @@ from sklearn.preprocessing import MinMaxScaler
 
 warnings.filterwarnings("ignore")
 
+try:
+    from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+    from Utility.m1_test_point_training import test_point_metrics
+except ModuleNotFoundError:
+    from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+    from src.Utility.m1_test_point_training import test_point_metrics
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
@@ -1136,7 +1143,8 @@ def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
     print(f"    R²   = {r2:.4f}")
     print(f"    MSE  = {mse:.4f}")
     print(f"{'═'*55}")
-    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": preds}
+    return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": preds,
+            "relative_MAE_percent": 100 * mae / abs(float(np.mean(y))) if np.mean(y) else None}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1424,7 +1432,8 @@ def _save_scatter(y_true, y_pred, metrics, out_path: Path, material: str):
             linewidth=1.5, label="Perfect prediction")
     ax.set_xlabel("Measured weight [g]")
     ax.set_ylabel("Predicted weight [g]")
-    ax.set_title(f"[{material}] Fusion Model — Test Set\n"
+    partition_label = "Validation Set" if metrics.get("source") == "validation" else "Test Set"
+    ax.set_title(f"[{material}] Fusion Model — {partition_label}\n"
                  f"MAE={metrics['MAE']:.4f} g   R²={metrics['R2']:.4f}")
     ax.legend()
     fig.tight_layout()
@@ -1463,7 +1472,8 @@ def _save_residuals_hist(y_true, y_pred, out_path: Path, material: str):
 
 
 def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
-                          pp_cols: list, title: str, out_path: Path):
+                          pp_cols: list, title: str, out_path: Path,
+                          direct_label: str = "Direct (via PPMLP)"):
     """Stacked horizontal bar: direct (left) + indirect (right), sorted by total."""
     # Sort ascending so highest total appears at the top of the horizontal bar chart
     order  = np.argsort(mean_abs_dir + mean_abs_ind)
@@ -1473,7 +1483,7 @@ def _bar_direct_indirect(mean_abs_ind: np.ndarray, mean_abs_dir: np.ndarray,
     n  = len(pp_cols)
     y  = np.arange(n)
     fig, ax = plt.subplots(figsize=(9, max(4, n * 0.45)))
-    ax.barh(y, mean_abs_dir, label="Direct (via PPMLP)", color=_PLT_C["direct"], alpha=0.85)
+    ax.barh(y, mean_abs_dir, label=direct_label, color=_PLT_C["direct"], alpha=0.85)
     ax.barh(y, mean_abs_ind, left=mean_abs_dir, label="Indirect (via M2)",
             color=_PLT_C["indirect"], alpha=0.85)
     ax.set_yticks(y)
@@ -1943,7 +1953,11 @@ def main():
     cfg_path = BASE_DIR / cfg_map[MAT]
     if not cfg_path.exists():
         sys.exit(f"[ERROR] Fusion config not found: {cfg_path}")
-    cfg = json.loads(cfg_path.read_text())
+    cfg, cfg_path = load_pipeline_config(cfg_path, "Fusion", MAT)
+    SEED = cfg.get("preprocessing", {}).get("random_seed", SEED)
+    for option in ("n_ig_steps", "shap_bg", "ih_samples", "eg_bg"):
+        if "--" + option.replace("_", "-") not in sys.argv and option in cfg.get("xai", {}):
+            setattr(args, option, cfg["xai"][option])
     alphas, finetuning_settings = resolve_finetuning(cfg, args)
     VAL_FR = finetuning_settings["val_fraction"]
 
@@ -2199,8 +2213,11 @@ def main():
         "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx_m1),
     }, indent=2))
     pretrained_m2_state = copy.deepcopy(fusion.m2.state_dict())
+    test_enabled = cfg.get("evaluation", {}).get("enabled", True)
+    eval_idx = test_idx_m1 if test_enabled else val_idx
+    eval_partition = "test" if test_enabled else "validation"
     baseline_metrics = evaluate_fusion(
-        fusion, X_pp_m1[test_idx_m1], y_m1[test_idx_m1], device)
+        fusion, X_pp_m1[eval_idx], y_m1[eval_idx], device)
     baseline_metrics.pop("pred")
     (run_dir / "pretrained_test_metrics.json").write_text(json.dumps(baseline_metrics, indent=2))
     sweep_results = []
@@ -2230,21 +2247,24 @@ def main():
         # Step 6 — Evaluate on test set
         # ══════════════════════════════════════════════════════════════════════
         print("\n── Step 6: Test evaluation ─────────────────────────────────")
-        X_test   = X_pp_m1[test_idx_m1]
-        y_test   = y_m1[test_idx_m1]
-        ids_test = part_ids_m1[test_idx_m1]
+        X_test   = X_pp_m1[eval_idx]
+        y_test   = y_m1[eval_idx]
+        ids_test = part_ids_m1[eval_idx]
 
         X_dev    = X_pp_m1[dev_idx_m1]
         y_dev    = y_m1[dev_idx_m1]
 
         metrics = evaluate_fusion(fusion, X_test, y_test, device)
         preds   = metrics.pop("pred")
+        metrics["source"] = "final_test" if test_enabled else "validation"
+        if m1_groups is not None:
+            metrics.update(test_point_metrics(y_test, preds, m1_groups[eval_idx]))
 
         with torch.no_grad():
             test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
             _, pred_features = fusion(test_pp, test_pp, return_features=True)
         pred_features = pred_features.cpu().numpy()
-        true_features = feature_targets[test_idx_m1]
+        true_features = feature_targets[eval_idx]
         per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
         feature_mae = float(per_feature_mae.mean())
         metrics["feature_MAE"] = feature_mae
@@ -2274,156 +2294,157 @@ def main():
                              out_dir / "residuals_hist_test.png", MAT)
         save_batch_test_diagnostics(
             y_test, preds,
-            m1_groups[test_idx_m1] if m1_groups is not None else None,
+            m1_groups[eval_idx] if m1_groups is not None else None,
             ids_test, out_dir,
             target_names=[target_col],
-            title=f"[{MAT} | Fusion] Final held-out test",
+            title=f"[{MAT} | Fusion] {eval_partition.title()} evaluation",
         )
         print("  Test plots saved.")
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 7 — XAI setup
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 7: XAI setup ───────────────────────────────────────")
-        # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
-        X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
-        X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
-        flat_cols   = _flat_col_names(pp_cols)
+        if cfg.get("xai", {}).get("enabled", True):
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 7 — XAI setup
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 7: XAI setup ───────────────────────────────────────")
+            # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
+            X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
+            X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
+            flat_cols   = _flat_col_names(pp_cols)
 
-        # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
-        baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
-        print(f"  Test flat shape : {X_test_flat.shape}")
-        print(f"  Dev  flat shape : {X_dev_flat.shape}")
-        print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
-        print(f"  IG/IH baseline  : mean of dev set")
+            # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
+            baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
+            print(f"  Test flat shape : {X_test_flat.shape}")
+            print(f"  Dev  flat shape : {X_dev_flat.shape}")
+            print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
+            print(f"  IG/IH baseline  : mean of dev set")
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 8 — SHAP
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 8: SHAP ────────────────────────────────────────────")
-        shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
-                             args.shap_bg, device)
-        shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
-                                       args.shap_bg, device)
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 8 — SHAP
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 8: SHAP ────────────────────────────────────────────")
+            shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
+                                 args.shap_bg, device)
+            shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
+                                           args.shap_bg, device)
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 9 — Expected Gradients
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 9: Expected Gradients ──────────────────────────────")
-        ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
-                         args.n_ig_steps, args.eg_bg, device)
-        eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
-                                   args.n_ig_steps, args.eg_bg, device)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 10 — Integrated Hessians
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 10: Integrated Hessians ────────────────────────────")
-        ih_matrix = run_integrated_hessians(
-            flat_fusion, X_test_flat, baseline_flat,
-            args.n_ig_steps, args.ih_samples, device)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 11 — Jacobian pathway analysis
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
-        jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 12 — Save XAI results
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 12: Saving XAI results ─────────────────────────────")
-
-        # per-sample CSVs
-        if shap_vals is not None:
-            build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
-                out_dir / "shap_values.csv", index=False)
-        if ig_vals is not None:
-            build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
-                out_dir / "eg_values.csv", index=False)
-        if shap_single_pp_vals is not None:
-            build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
-                out_dir / "shap_single_pp_values.csv", index=False)
-        if eg_single_pp_vals is not None:
-            build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
-                out_dir / "eg_single_pp_values.csv", index=False)
-        build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
-            out_dir / "jacobian_values.csv", index=False)
-
-        # IH matrix
-        ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
-        ih_df.to_csv(out_dir / "ih_matrix.csv")
-
-        # summary (mean |attr| per feature)
-        summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
-        summary.to_csv(out_dir / "feature_attributions.csv")
-        print(f"  feature_attributions.csv saved")
-        print(summary.to_string())
-        single_pp_summary = build_single_pp_summary(
-            pp_cols, shap_single_pp_vals, eg_single_pp_vals)
-        single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
-        split_labeled_summary = summary.rename(columns={
-            col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
-            for col in summary.columns
-        })
-        split_labeled_summary.join(single_pp_summary, how="left").to_csv(
-            out_dir / "feature_attributions_comparison.csv")
-        print("  Single-PP and comparison attribution summaries saved")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 13 — XAI plots
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 13: XAI plots ──────────────────────────────────────")
-        save_xai_bars(summary, pp_cols, out_dir, MAT)
-        save_net_effect_bars(summary, pp_cols, out_dir, MAT)
-        save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
-        save_cancellation_bars(summary, pp_cols, out_dir, MAT)
-        if shap_vals is not None:
-            save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
-        if shap_single_pp_vals is not None:
-            save_single_pp_shap_beeswarm(
-                shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
-        save_total_effect_plot(summary, pp_cols, out_dir, MAT)
-        save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
-        save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # M1-merge XAI — f features (M2 output) + pp_direct → W
-        # Shows how much each encoder f_i feature and each raw pp feature
-        # individually contributes to the weight prediction via the merge head.
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
-        m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
-        m1_wrap.eval()
-
-        # Compute f_full from M2 predictions for dev and test sets
-        f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
-        f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
-
-        # Build [f_full | pp_raw] inputs for M1MergeWrapper
-        X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
-        X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
-        f_col_names      = [f"f_{i}" for i in range(n_f)]
-        m1merge_cols     = f_col_names + pp_cols
-        baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
-
-        print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
-              f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
-        print(f"  Active f positions   : {f_positions}  (others zero by construction)")
-
-        shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
-                                        args.shap_bg, device)
-        ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 9 — Expected Gradients
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 9: Expected Gradients ──────────────────────────────")
+            ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
+                             args.n_ig_steps, args.eg_bg, device)
+            eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
                                        args.n_ig_steps, args.eg_bg, device)
 
-        if shap_m1merge is not None:
-            build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
-                out_dir / "shap_m1merge_values.csv", index=False)
-        if ig_m1merge is not None:
-            build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
-                out_dir / "eg_m1merge_values.csv", index=False)
-        save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
-        print("  M1-merge XAI done.")
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 10 — Integrated Hessians
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 10: Integrated Hessians ────────────────────────────")
+            ih_matrix = run_integrated_hessians(
+                flat_fusion, X_test_flat, baseline_flat,
+                args.n_ig_steps, args.ih_samples, device)
+
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 11 — Jacobian pathway analysis
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
+            jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
+
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 12 — Save XAI results
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 12: Saving XAI results ─────────────────────────────")
+
+            # per-sample CSVs
+            if shap_vals is not None:
+                build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
+                    out_dir / "shap_values.csv", index=False)
+            if ig_vals is not None:
+                build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
+                    out_dir / "eg_values.csv", index=False)
+            if shap_single_pp_vals is not None:
+                build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
+                    out_dir / "shap_single_pp_values.csv", index=False)
+            if eg_single_pp_vals is not None:
+                build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
+                    out_dir / "eg_single_pp_values.csv", index=False)
+            build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
+                out_dir / "jacobian_values.csv", index=False)
+
+            # IH matrix
+            ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
+            ih_df.to_csv(out_dir / "ih_matrix.csv")
+
+            # summary (mean |attr| per feature)
+            summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
+            summary.to_csv(out_dir / "feature_attributions.csv")
+            print(f"  feature_attributions.csv saved")
+            print(summary.to_string())
+            single_pp_summary = build_single_pp_summary(
+                pp_cols, shap_single_pp_vals, eg_single_pp_vals)
+            single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
+            split_labeled_summary = summary.rename(columns={
+                col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
+                for col in summary.columns
+            })
+            split_labeled_summary.join(single_pp_summary, how="left").to_csv(
+                out_dir / "feature_attributions_comparison.csv")
+            print("  Single-PP and comparison attribution summaries saved")
+
+            # ══════════════════════════════════════════════════════════════════════
+            # Step 13 — XAI plots
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── Step 13: XAI plots ──────────────────────────────────────")
+            save_xai_bars(summary, pp_cols, out_dir, MAT)
+            save_net_effect_bars(summary, pp_cols, out_dir, MAT)
+            save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
+            save_cancellation_bars(summary, pp_cols, out_dir, MAT)
+            if shap_vals is not None:
+                save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
+            if shap_single_pp_vals is not None:
+                save_single_pp_shap_beeswarm(
+                    shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
+            save_total_effect_plot(summary, pp_cols, out_dir, MAT)
+            save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
+            save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
+
+            # ══════════════════════════════════════════════════════════════════════
+            # M1-merge XAI — f features (M2 output) + pp_direct → W
+            # Shows how much each encoder f_i feature and each raw pp feature
+            # individually contributes to the weight prediction via the merge head.
+            # ══════════════════════════════════════════════════════════════════════
+            print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
+            m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
+            m1_wrap.eval()
+
+            # Compute f_full from M2 predictions for dev and test sets
+            f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
+            f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
+
+            # Build [f_full | pp_raw] inputs for M1MergeWrapper
+            X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
+            X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
+            f_col_names      = [f"f_{i}" for i in range(n_f)]
+            m1merge_cols     = f_col_names + pp_cols
+            baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
+
+            print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
+                  f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
+            print(f"  Active f positions   : {f_positions}  (others zero by construction)")
+
+            shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                            args.shap_bg, device)
+            ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                           args.n_ig_steps, args.eg_bg, device)
+
+            if shap_m1merge is not None:
+                build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
+                    out_dir / "shap_m1merge_values.csv", index=False)
+            if ig_m1merge is not None:
+                build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
+                    out_dir / "eg_m1merge_values.csv", index=False)
+            save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
+            print("  M1-merge XAI done.")
 
         # ══════════════════════════════════════════════════════════════════════
         # Step 14 — Copy model files; save fusion info
@@ -2448,7 +2469,7 @@ def main():
         shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
 
         # Save test data
-        df_test_data = df_m1.iloc[test_idx_m1].copy()
+        df_test_data = df_m1.iloc[eval_idx].copy()
         df_test_data["y_pred"] = preds
         df_test_data.to_csv(out_dir / "test_data_with_pred.csv")
 
@@ -2468,7 +2489,8 @@ def main():
             "f_positions":  f_positions,
             "m2_f_cols":    m2_f_cols,
             "pp_cols":      pp_cols,
-            "test_metrics": metrics,
+            f"{eval_partition}_metrics": metrics,
+            "evaluation_partition": eval_partition,
             "n_test":       int(len(test_idx_m1)),
             "n_dev":        int(len(dev_idx_m1)),
             "seed":         SEED,
@@ -2511,11 +2533,12 @@ def main():
     ax.plot(comparison["alpha"], comparison["MAE"], "o-", label="Fine-tuned Fusion")
     ax.axhline(baseline_metrics["MAE"], color=_PLT_C["ideal_line"], linestyle="--",
                label="Pretrained Fusion")
-    ax.set(xlabel="Alpha", ylabel="Test weight MAE (g)", title=f"{MAT}: alpha comparison")
+    ax.set(xlabel="Alpha", ylabel=f"{eval_partition.title()} weight MAE (g)", title=f"{MAT}: alpha comparison")
     ax.legend()
     fig.tight_layout()
     fig.savefig(run_dir / "alpha_comparison.png")
     plt.close(fig)
+    finalize_evaluation(run_dir, test_enabled)
     print(f"\nAlpha sweep complete → {run_dir}\n{comparison.to_string(index=False)}")
 
 
