@@ -25,8 +25,9 @@ Architecture
 
 Training
 --------
-  • MAE loss + explicit L1 weight regularisation
+  • MinMax-scaled MAE loss + explicit L1 weight regularisation
   • AdamW optimiser (weight_decay) + ReduceLROnPlateau scheduler
+  • HPO and model selection use range-normalized MAE; reported MAE stays in original units
   • K-fold cross-validation; early stopping per fold (monitored on val MAE, scaled space)
   • MinMaxScaler fitted per fold on training inputs AND training targets
   • Optuna HPO (TPE sampler + Hyperband pruner) or manual config
@@ -343,13 +344,16 @@ def evaluate_model(model: M2Model,
                    device: torch.device) -> dict:
     """Predict in scaled space, inverse-transform, return per-target and mean metrics.
 
-    All reported metrics (MAE, RMSE, R², MSE) are in the original f-feature space.
+    Per-target and mean raw metrics are in the original f-feature space. mean_NMAE
+    averages errors after scaling each target by its training-fold range.
     """
     t_x = torch.tensor(X_scaled, dtype=torch.float32, device=device)
     model.eval()
     with torch.no_grad():
         pred_scaled = model(t_x).cpu().numpy()
     pred = y_sc.inverse_transform(pred_scaled)
+    Y_scaled = y_sc.transform(Y_orig).astype(np.float32)
+    mean_nmae = float(np.mean(np.abs(pred_scaled - Y_scaled)))
 
     per_target = {}
     for i, fc in enumerate(f_cols):
@@ -369,6 +373,7 @@ def evaluate_model(model: M2Model,
 
     return {
         "mean_MAE":  mean_mae,
+        "mean_NMAE": mean_nmae,
         "mean_RMSE": mean_rmse,
         "mean_R2":   mean_r2,
         "mean_MSE":  mean_mse,
@@ -600,7 +605,7 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
 
     fold_results  = []
     fold_predictions = []
-    best_fold_mae = float("inf")
+    best_fold_nmae = float("inf")
     best_fold_idx = -1
     best_model_cv = None
     best_scalers  = None
@@ -630,17 +635,19 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
         })
         fold_results.append({
             "mean_MAE":  res["mean_MAE"],
+            "mean_NMAE": res["mean_NMAE"],
             "mean_RMSE": res["mean_RMSE"],
             "mean_R2":   res["mean_R2"],
             "mean_MSE":  res["mean_MSE"],
         })
-        print(f"  Test  mean_MAE={res['mean_MAE']:.4f}  mean_RMSE={res['mean_RMSE']:.4f}  "
+        print(f"  Test  mean_NMAE={res['mean_NMAE']:.4f}  "
+              f"mean_MAE={res['mean_MAE']:.4f}  mean_RMSE={res['mean_RMSE']:.4f}  "
               f"mean_R²={res['mean_R2']:.4f}  mean_MSE={res['mean_MSE']:.4f}")
         for fc, m in res["per_target"].items():
             print(f"    {fc}  MAE={m['MAE']:.4f}  R²={m['R2']:.4f}")
 
-        if res["mean_MAE"] < best_fold_mae:
-            best_fold_mae = res["mean_MAE"]
+        if res["mean_NMAE"] < best_fold_nmae:
+            best_fold_nmae = res["mean_NMAE"]
             best_fold_idx = fold
             best_model_cv = copy.deepcopy(model)
             best_scalers  = (x_sc, y_sc)
@@ -648,18 +655,18 @@ def run_cv(X, Y, model_cfg: dict, train_cfg: dict, f_cols: list,
             best_preds_cv = res["pred"]
 
     return (pd.DataFrame(fold_results),
-            best_fold_idx, best_fold_mae,
+            best_fold_idx, best_fold_nmae,
             best_model_cv, best_scalers,
             best_Y_test, best_preds_cv, fold_predictions)
 
 
 def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
-                  best_fold_mae: float, K: int):
+                  best_fold_nmae: float, K: int):
     print("\n" + "═" * 60)
     print(f"{K}-fold CV summary  (best fold: {best_fold_idx + 1}  "
-          f"mean_MAE={best_fold_mae:.4f})")
+          f"mean_NMAE={best_fold_nmae:.4f})")
     print("─" * 60)
-    for m in ["mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE"]:
+    for m in ["mean_NMAE", "mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE"]:
         print(f"  {m:12s}  {metrics_df[m].mean():.4f} ± {metrics_df[m].std():.4f}")
     print("═" * 60)
 
@@ -668,10 +675,11 @@ def print_summary(metrics_df: pd.DataFrame, best_fold_idx: int,
 
 def save_cv_plots(metrics_df: pd.DataFrame, K: int, material: str, plots_dir: Path):
     """Bar chart of K-fold CV metrics (indicative — dev data only)."""
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4.5))
     fold_labels = [f"F{i + 1}" for i in range(K)] + ["Mean"]
     bar_colors  = [_PLT_C["fold"]] * K + [_PLT_C["fold_mean"]]
-    for ax, metric in zip(axes, ["mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE"]):
+    for ax, metric in zip(
+            axes, ["mean_NMAE", "mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE"]):
         vals = list(metrics_df[metric]) + [metrics_df[metric].mean()]
         bars = ax.bar(fold_labels, vals, color=bar_colors, edgecolor="none", width=0.65)
         ax.set_title(metric)
@@ -750,14 +758,16 @@ def save_models(final_model: M2Model, final_metrics: dict,
                 run_best_dir: Path, overall_best_dir: Path,
                 n_in: int, n_out: int, pp_cols: list, f_cols: list,
                 model_cfg: dict, id_col: str) -> bool:
-    """Save final model weights + metadata to run_best; update overall_best if improved."""
+    """Save final model; promote overall_best by normalized MAE."""
     run_info = {
         "mean_MAE":   final_metrics["mean_MAE"],
+        "mean_NMAE":  final_metrics["mean_NMAE"],
         "mean_RMSE":  final_metrics["mean_RMSE"],
         "mean_R2":    final_metrics["mean_R2"],
         "mean_MSE":   final_metrics["mean_MSE"],
         "per_target": final_metrics.get("per_target", {}),
         "source":     "final_test",
+        "selection_metric": "mean_NMAE",
         "n_in":       n_in,
         "n_out":      n_out,
         "pp_cols":    pp_cols,
@@ -767,21 +777,29 @@ def save_models(final_model: M2Model, final_metrics: dict,
     torch.save(final_model.state_dict(), run_best_dir / "best_model.pt")
     (run_best_dir / "best_metrics.json").write_text(json.dumps(run_info, indent=2))
     mae = final_metrics["mean_MAE"]
-    print(f"\nRun best model saved  (test mean_MAE={mae:.4f})  → {run_best_dir}")
+    nmae = final_metrics["mean_NMAE"]
+    print(f"\nRun best model saved  (test mean_MAE={mae:.4f}, "
+          f"mean_NMAE={nmae:.4f})  → {run_best_dir}")
 
     overall_path = overall_best_dir / "best_metrics.json"
-    prev_mae     = float("inf")
+    prev_nmae = float("inf")
     if overall_path.exists():
-        prev_mae = json.loads(overall_path.read_text()).get("mean_MAE", float("inf"))
+        previous_metrics = json.loads(overall_path.read_text())
+        if "mean_NMAE" in previous_metrics:
+            prev_nmae = float(previous_metrics["mean_NMAE"])
+        else:
+            print("Existing best metrics have no mean_NMAE; treating the model as "
+                  "unscored for normalized selection.")
 
-    if mae < prev_mae:
+    if nmae < prev_nmae:
         torch.save(final_model.state_dict(), overall_best_dir / "best_model.pt")
         overall_path.write_text(json.dumps(run_info, indent=2))
-        print(f"Overall best updated  ({prev_mae:.4f} → {mae:.4f} mean_MAE)  "
+        print(f"Overall best updated  ({prev_nmae:.4f} → {nmae:.4f} mean_NMAE)  "
               f"→ {overall_best_dir}")
         return True
     else:
-        print(f"Overall best unchanged  (saved={prev_mae:.4f},  this run={mae:.4f})")
+        print(f"Overall best unchanged  (saved={prev_nmae:.4f},  "
+              f"this run={nmae:.4f} mean_NMAE)")
         return False
 
 
@@ -915,7 +933,7 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
                      f_cols, seed, device, strat_labels=None,
                      group_values=None, group_cfg=None, edge_values=None,
                      edge_cfg=None):
-    """Optuna objective: mini K-fold CV; returns mean test mean_MAE (minimise)."""
+    """Optuna objective: mini K-fold CV; returns mean test mean_NMAE (minimise)."""
     ss      = optuna_cfg["search_space"]
     n_folds = optuna_cfg["n_folds"]
     n_in    = X.shape[1]
@@ -944,7 +962,7 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
         kf         = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
         split_iter = list(kf.split(X))
 
-    mae_vals = []
+    nmae_vals = []
     for fold, (tv_idx, test_idx) in enumerate(split_iter):
         if group_split_required(group_cfg, edge_cfg, "validation"):
             tr_idx, val_idx = grouped_train_val_split(
@@ -973,20 +991,20 @@ def optuna_objective(trial, X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
         model, _ = train_fold(model, X_tr_s, Y_tr_s, X_val_s, Y_val_s, tcfg, device)
 
         res = evaluate_model(model, X_te_s, Y[test_idx], y_sc, f_cols, device)
-        mae_vals.append(res["mean_MAE"])
+        nmae_vals.append(res["mean_NMAE"])
 
-        trial.report(float(np.mean(mae_vals)), fold)
+        trial.report(float(np.mean(nmae_vals)), fold)
         if trial.should_prune():
             raise optuna.exceptions.TrialPruned()
 
-    return float(np.mean(mae_vals))
+    return float(np.mean(nmae_vals))
 
 
 def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
             f_cols, seed, device, strat_labels=None, out_dir=None,
             group_values=None, group_cfg=None, sampler_seed=None,
             edge_values=None, edge_cfg=None):
-    """Create Optuna study (TPE sampler + HyperbandPruner), run HPO, return study."""
+    """Create and run an Optuna study, using a new name for persisted NMAE studies."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     sampler = optuna.samplers.TPESampler(
@@ -998,6 +1016,8 @@ def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
     )
     storage    = optuna_cfg.get("storage")
     study_name = optuna_cfg.get("study_name", "M2_hpo")
+    if storage:
+        study_name = f"{study_name}_nmae"
     study = optuna.create_study(
         direction="minimize",
         sampler=sampler,
@@ -1027,7 +1047,7 @@ def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
     )
 
     best = study.best_trial
-    print(f"\nBest trial #{best.number}  HPO-mean-MAE = {best.value:.6f}")
+    print(f"\nBest trial #{best.number}  HPO-mean-NMAE = {best.value:.6f}")
     print("Best sampled params:")
     for k, v in best.params.items():
         print(f"  {k}: {v}")
@@ -1204,7 +1224,7 @@ def main():
         print("Using manual model config — skipping HPO.")
 
     # ── Indicative K-fold CV (dev only) ──────────────────────────────────────
-    metrics_df, best_fold_idx, best_fold_mae, _, _, _, _, cv_predictions = run_cv(
+    metrics_df, best_fold_idx, best_fold_nmae, _, _, _, _, cv_predictions = run_cv(
         X[dev_idx], Y[dev_idx], model_cfg, train_cfg,
         f_cols, device, seed, dev_strat,
         group_values=group_ids[dev_idx] if group_ids is not None else None,
@@ -1216,7 +1236,7 @@ def main():
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(run_best_dir / "cv_fold_metrics.csv")
 
-    print_summary(metrics_df, best_fold_idx, best_fold_mae, K)
+    print_summary(metrics_df, best_fold_idx, best_fold_nmae, K)
     save_cv_plots(metrics_df, K, mat, run_best_dir)
     save_cv_diagnostics(
         cv_predictions, run_best_dir,
@@ -1232,6 +1252,7 @@ def main():
     final_metrics = evaluate_model(final_model, X_te_s, Y[test_idx], y_sc, f_cols, device)
     print(f"\n{'═' * 60}")
     print(f"Final Test  mean_MAE={final_metrics['mean_MAE']:.4f}  "
+          f"mean_NMAE={final_metrics['mean_NMAE']:.4f}  "
           f"mean_RMSE={final_metrics['mean_RMSE']:.4f}  "
           f"mean_R²={final_metrics['mean_R2']:.4f}  "
           f"mean_MSE={final_metrics['mean_MSE']:.4f}")

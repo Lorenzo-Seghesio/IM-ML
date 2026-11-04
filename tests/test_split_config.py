@@ -124,6 +124,7 @@ class PhaseSplitTests(unittest.TestCase):
                         metrics = {key: 0. for key in ("MAE", "RMSE", "R2", "MSE")}
                         if module is m2:
                             metrics = {"mean_" + key: value for key, value in metrics.items()}
+                            metrics["mean_NMAE"] = 0.
                             metrics["per_target"] = {}
                         return {**metrics, "pred": np.zeros_like(target)}
 
