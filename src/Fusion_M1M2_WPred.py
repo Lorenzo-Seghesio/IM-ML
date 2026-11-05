@@ -17,8 +17,10 @@ by M2, excluding inactive zero-padded positions. Each alpha starts from the
 same pretrained checkpoint and seed. M1's saved train/validation split is
 reused unless finetuning.val_fraction requests a new split of development data;
 early stopping selects the fine-tuned epoch with the lowest validation
-composite loss. Epoch 0 is recorded as a separate pretrained reference, and
-test data is used only for reporting and XAI.
+composite loss. After all alphas finish, the lowest validation weight MAE
+selects between unchanged pretrained Fusion and the fine-tuned alphas. Only
+that checkpoint is evaluated on test data and passed through XAI, under
+best_fusion/. The pretrained candidate is saved under no_finetuning/.
 
 Configure a scalar or list in finetuning.alpha in the Fusion JSON config,
 or pass --alpha 0 0.1 0.25 0.5 0.75 0.9 1. Fine-tuning settings are
@@ -74,19 +76,30 @@ Arguments
 
 Outputs (under outputs/[dataset]/Fusion/{timestamp}_{material}/)
 ---------
-  alpha_comparison.csv / .png    Held-out metrics for every alpha
-  pretrained_test_metrics.json   Weight metrics before fine-tuning
+  alpha_comparison.csv / .png    Validation metrics for pretrained Fusion and every alpha
+  pretrained_validation_metrics.json  Validation metrics before fine-tuning
+  best_alpha_selection.json      Winner, fine-tuning flag and validation selection criterion
   finetuning_split.json          Exact train/validation/test part IDs
   sweep_config.json              Resolved settings and checkpoint sources
 
-Each alpha_{value}/ subfolder contains all test and XAI outputs below, plus:
+Each alpha_{value}/ subfolder contains training and validation artifacts:
   training_history.csv           Train/validation loss and both MAE components
   finetuning_info.json           Settings and selected epoch/validation loss
   fusion_model.pt                Full tuned Fusion state_dict, including scalers
   m2_best_model.pt               Selected fine-tuned M2 state_dict
+  validation_metrics.json        Weight metrics used to select alpha
+  validation_predictions.csv    Validation part IDs, targets and predictions
+
+no_finetuning/ contains the unchanged pretrained checkpoint, validation metrics,
+predictions and plots, and finetuning_info.json with enabled=false and alpha=null.
+It is eligible for selection alongside every alpha. Ties favor no fine-tuning.
+
+best_fusion/ contains a copy of the winner and its validation artifacts,
+selection.json, and is the only folder with final test and XAI outputs:
   m2_pretrained_best_model.pt    Original M2 checkpoint for reference
   test_feature_metrics.csv       Held-out MAE per M1 extracted feature
   test_feature_predictions.csv   Held-out feature targets and predictions
+  m2_reconstruction/             Selected M2's feature metrics, predictions and diagnostic plots
 
   test_metrics.json              Fusion model metrics on held-out test set
   test_predictions.csv           ID_Part, y_true, y_pred
@@ -123,6 +136,9 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -135,6 +151,7 @@ try:
     from Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from Utility.batch_test_diagnostics import save_batch_test_diagnostics
     from Utility.split_config import split_fraction
+    from Utility.fusion_reconstruction import save_fusion_reconstruction
 except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.group_splitting import (
         validate_group_disjoint, validate_protected_excluded,
@@ -144,6 +161,7 @@ except ModuleNotFoundError:  # package-style import from the repository root
     from src.Utility.doe1_columns import doe1_column_name, rename_doe1_scalar_columns
     from src.Utility.batch_test_diagnostics import save_batch_test_diagnostics
     from src.Utility.split_config import split_fraction
+    from src.Utility.fusion_reconstruction import save_fusion_reconstruction
 
 # ── Publication plot style ────────────────────────────────────────────────────
 _PLT_C: dict = {
@@ -168,6 +186,12 @@ _PLT_C: dict = {
 
 
 def _strip_prefix(name: str) -> str:
+    for suffix in ("_indirect", "_direct"):
+        if name.endswith(suffix):
+            name = doe1_column_name(name[:-len(suffix)]) + suffix
+            break
+    else:
+        name = doe1_column_name(name)
     for pfx in ("TCE_", "TCN_"):
         if name.startswith(pfx):
             return name[len(pfx):] + pfx[:-1]   # e.g. TCN_Foo → FooTCN
@@ -210,10 +234,10 @@ from sklearn.preprocessing import MinMaxScaler
 warnings.filterwarnings("ignore")
 
 try:
-    from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+    from Utility.pipeline_runtime import model_config as load_pipeline_config
     from Utility.m1_test_point_training import test_point_metrics
 except ModuleNotFoundError:
-    from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation
+    from src.Utility.pipeline_runtime import model_config as load_pipeline_config
     from src.Utility.m1_test_point_training import test_point_metrics
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -1125,8 +1149,8 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
 
 
 def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
-                    device: torch.device) -> dict:
-    """Forward test data through FusionModel; return metrics + predictions."""
+                    device: torch.device, partition: str = "test") -> dict:
+    """Forward a specified evaluation partition; return metrics + predictions."""
     t_pp_indirect = torch.tensor(X_pp, dtype=torch.float32, device=device)
     t_pp_direct   = t_pp_indirect.clone()   # separate tensor so gradients never mix
     fusion.eval()
@@ -1137,7 +1161,7 @@ def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
     rmse = math.sqrt(mse)
     r2   = float(r2_score(y, preds))
     print(f"\n{'═'*55}")
-    print(f"  Fusion test metrics:")
+    print(f"  Fusion {partition} metrics:")
     print(f"    MAE  = {mae:.4f} g")
     print(f"    RMSE = {rmse:.4f} g")
     print(f"    R²   = {r2:.4f}")
@@ -1145,6 +1169,109 @@ def evaluate_fusion(fusion: FusionModel, X_pp: np.ndarray, y: np.ndarray,
     print(f"{'═'*55}")
     return {"MAE": mae, "MSE": mse, "RMSE": rmse, "R2": r2, "pred": preds,
             "relative_MAE_percent": 100 * mae / abs(float(np.mean(y))) if np.mean(y) else None}
+
+
+def train_alpha_sweep(fusion, X, y, features, train_idx, val_idx, alphas,
+                      settings, seed, device, run_dir, part_ids, groups=None,
+                      material="", plots=True):
+    """Compare pretrained Fusion and every alpha by validation weight MAE.
+
+    No test evaluation or XAI occurs here. Epoch selection within each alpha
+    still follows its validation composite loss.
+    """
+    pretrained_m2_state = copy.deepcopy(fusion.m2.state_dict())
+    rows, tuning_by_folder = [], {}
+
+    def save_candidate(out_dir, alpha, tuning_info, report):
+        pred = report.pop("pred")
+        if not math.isfinite(report["MAE"]):
+            raise ValueError(f"Non-finite validation MAE for {out_dir.name}")
+        fine_tuned = alpha is not None
+        report.update(source="validation", alpha=alpha, candidate=out_dir.name, fine_tuned=fine_tuned,
+                      feature_MAE=tuning_info["val_metrics"]["mae_f"],
+                      composite_loss=tuning_info["best_val_loss"])
+        if groups is not None:
+            report.update(test_point_metrics(y[val_idx], pred, groups[val_idx]))
+        (out_dir / "validation_metrics.json").write_text(json.dumps(report, indent=2))
+        pd.DataFrame({"ID_Part": part_ids[val_idx], "y_true": y[val_idx], "y_pred": pred}).to_csv(
+            out_dir / "validation_predictions.csv", index=False)
+        if plots:
+            _save_scatter(y[val_idx], pred, report, out_dir / "scatter_validation.png", material)
+            _save_residuals_scatter(y[val_idx], pred, out_dir / "residuals_scatter_validation.png", material)
+            _save_residuals_hist(y[val_idx], pred, out_dir / "residuals_hist_validation.png", material)
+            save_batch_test_diagnostics(y[val_idx], pred, groups[val_idx] if groups is not None else None,
+                part_ids[val_idx], out_dir, target_names=["weight"],
+                title=f"[{material} | Fusion {out_dir.name}] Validation evaluation", partition="validation")
+        rows.append({"alpha": alpha, "folder": out_dir.name, "validation_MAE": report["MAE"],
+                     "best_epoch": tuning_info["best_epoch"], "best_val_loss": tuning_info["best_val_loss"],
+                     **{key: value for key, value in report.items() if key != "test_points"}})
+        tuning_by_folder[out_dir.name] = tuning_info
+        pd.DataFrame(rows).to_csv(run_dir / "alpha_comparison.csv", index=False)
+        return report
+
+    # The unchanged pretrained model competes on exactly the same validation IDs.
+    baseline_dir = run_dir / "no_finetuning"
+    baseline_dir.mkdir()
+    baseline = evaluate_fusion(fusion, X[val_idx], y[val_idx], device, partition="validation")
+    with torch.inference_mode():
+        val_pp = torch.as_tensor(X[val_idx], dtype=torch.float32, device=device)
+        _, baseline_features = fusion(val_pp, val_pp, return_features=True)
+    feature_mae = float(np.abs(baseline_features.cpu().numpy() - features[val_idx]).mean())
+    baseline_info = {"enabled": False, "alpha": None, "seed": seed, "best_epoch": 0,
+                     "epochs_run": 0, "best_val_loss": None, "m1_frozen": True,
+                     "val_metrics": {"mae_w": baseline["MAE"], "mae_f": feature_mae}}
+    torch.save(fusion.state_dict(), baseline_dir / "fusion_model.pt")
+    torch.save(pretrained_m2_state, baseline_dir / "m2_best_model.pt")
+    (baseline_dir / "finetuning_info.json").write_text(json.dumps(baseline_info, indent=2))
+    baseline = save_candidate(baseline_dir, None, baseline_info, baseline)
+    (run_dir / "pretrained_validation_metrics.json").write_text(json.dumps(baseline, indent=2))
+
+    for alpha in alphas:
+        fusion.m2.load_state_dict(pretrained_m2_state)
+        out_dir = run_dir / f"alpha_{alpha}"
+        out_dir.mkdir()
+        print(f"\n── Fine-tuning M2: alpha={alpha:g} → {out_dir} ──", flush=True)
+        tuning_info = finetune_m2(fusion, X, y, features, train_idx, val_idx,
+                                 alpha, settings, seed, device, out_dir)
+        tuning_info["enabled"] = True
+        (out_dir / "finetuning_info.json").write_text(json.dumps(tuning_info, indent=2))
+        report = evaluate_fusion(fusion, X[val_idx], y[val_idx], device, partition="validation")
+        save_candidate(out_dir, alpha, tuning_info, report)
+
+    # Stable ties prefer no fine-tuning, then the configured alpha order.
+    winner = min(rows, key=lambda row: row["validation_MAE"])
+    selection = {"alpha": winner["alpha"], "selection_metric": "validation_MAE",
+                 "validation_MAE": winner["validation_MAE"], "source_folder": winner["folder"],
+                 "candidate": winner["candidate"], "fine_tuned": winner["fine_tuned"],
+                 "best_epoch": winner["best_epoch"], "n_alphas": len(alphas), "n_candidates": len(rows),
+                 "tie_breaker": "no fine-tuning first, then configured alpha order",
+                 "test_used_for_selection": False}
+    out_dir = run_dir / "best_fusion"
+    shutil.copytree(run_dir / winner["folder"], out_dir)
+    (out_dir / "selection.json").write_text(json.dumps(selection, indent=2))
+    (run_dir / "best_alpha_selection.json").write_text(json.dumps(selection, indent=2))
+    fusion.load_state_dict(torch.load(out_dir / "fusion_model.pt", map_location=device, weights_only=True))
+    fusion.eval()
+    for parameter in fusion.parameters():
+        parameter.requires_grad_(False)
+    comparison = pd.DataFrame(rows)
+    comparison["selected"] = comparison["folder"] == winner["folder"]
+    comparison.to_csv(run_dir / "alpha_comparison.csv", index=False)
+    if plots:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        positions = np.arange(len(comparison))
+        ax.plot(positions, comparison["validation_MAE"], "o-", label="Fusion candidates")
+        ax.scatter([rows.index(winner)], [winner["validation_MAE"]], marker="*", s=160,
+                   color=_PLT_C["ideal_line"], label="Selected model", zorder=4)
+        ax.set_xticks(positions, ["No fine-tuning", *[f"α={alpha:g}" for alpha in alphas]])
+        ax.axhline(baseline["MAE"], color=_PLT_C["ideal_line"], linestyle="--", label="Pretrained Fusion")
+        ax.set(xlabel="Fusion candidate", ylabel="Validation weight MAE (g)", title=f"{material}: Fusion comparison")
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(run_dir / "alpha_comparison.png")
+        plt.close(fig)
+    print(f"\nSelected {winner['candidate']} by validation MAE={winner['validation_MAE']:.6f} g → {out_dir}")
+    return selection, tuning_by_folder[winner["folder"]]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1900,6 +2027,181 @@ def build_per_sample_df(vals: np.ndarray, part_ids: np.ndarray,
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
+def run_fusion_xai(fusion, X_dev, X_test, ids_test, pp_cols, n_f,
+                   f_positions, args, device, out_dir, material, shap_only=False):
+    """Explain only the validation-selected Fusion checkpoint."""
+    n_pp = len(pp_cols)
+    flat_fusion = FlatFusionWrapper(fusion, n_pp).to(device).eval()
+    single_pp_fusion = SinglePPFusionWrapper(fusion, n_pp).to(device).eval()
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 7 — XAI setup
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 7: XAI setup ───────────────────────────────────────")
+    # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
+    X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
+    X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
+    flat_cols   = _flat_col_names(pp_cols)
+
+    # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
+    baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
+    print(f"  Test flat shape : {X_test_flat.shape}")
+    print(f"  Dev  flat shape : {X_dev_flat.shape}")
+    print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
+    print(f"  IG/IH baseline  : mean of dev set")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 8 — SHAP
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 8: SHAP ────────────────────────────────────────────")
+    shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
+                         args.shap_bg, device)
+    shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
+                                   args.shap_bg, device)
+    if shap_only:
+        flat_cols = _flat_col_names(pp_cols)
+        split_summary = None
+        if shap_vals is not None:
+            build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(out_dir / "shap_values.csv", index=False)
+            summary = build_summary(pp_cols, shap_vals, None, None, n_pp)
+            split_summary = summary
+            summary.to_csv(out_dir / "feature_attributions.csv")
+            save_xai_bars(summary, pp_cols, out_dir, material)
+            save_total_effect_plot(summary, pp_cols, out_dir, material)
+            save_net_effect_bars(summary, pp_cols, out_dir, material)
+            save_pathway_agreement_scatter(summary, pp_cols, out_dir, material)
+            save_cancellation_bars(summary, pp_cols, out_dir, material)
+            save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, material, n_pp)
+        if shap_single_pp_vals is not None:
+            build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(out_dir / "shap_single_pp_values.csv", index=False)
+            summary = build_single_pp_summary(pp_cols, shap_single_pp_vals, None)
+            summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
+            save_single_pp_shap_beeswarm(shap_single_pp_vals, X_test, pp_cols, out_dir, material)
+            save_single_pp_importance_plot(summary, pp_cols, out_dir, material)
+            if split_summary is not None:
+                split_summary.join(summary).to_csv(out_dir / "feature_attributions_comparison.csv")
+        return
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 9 — Expected Gradients
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 9: Expected Gradients ──────────────────────────────")
+    ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
+                     args.n_ig_steps, args.eg_bg, device)
+    eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
+                               args.n_ig_steps, args.eg_bg, device)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 10 — Integrated Hessians
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 10: Integrated Hessians ────────────────────────────")
+    ih_matrix = run_integrated_hessians(
+        flat_fusion, X_test_flat, baseline_flat,
+        args.n_ig_steps, args.ih_samples, device)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 11 — Jacobian pathway analysis
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
+    jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 12 — Save XAI results
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 12: Saving XAI results ─────────────────────────────")
+
+    # per-sample CSVs
+    if shap_vals is not None:
+        build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
+            out_dir / "shap_values.csv", index=False)
+    if ig_vals is not None:
+        build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
+            out_dir / "eg_values.csv", index=False)
+    if shap_single_pp_vals is not None:
+        build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
+            out_dir / "shap_single_pp_values.csv", index=False)
+    if eg_single_pp_vals is not None:
+        build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
+            out_dir / "eg_single_pp_values.csv", index=False)
+    build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
+        out_dir / "jacobian_values.csv", index=False)
+
+    # IH matrix
+    ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
+    ih_df.to_csv(out_dir / "ih_matrix.csv")
+
+    # summary (mean |attr| per feature)
+    summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
+    summary.to_csv(out_dir / "feature_attributions.csv")
+    print(f"  feature_attributions.csv saved")
+    print(summary.to_string())
+    single_pp_summary = build_single_pp_summary(
+        pp_cols, shap_single_pp_vals, eg_single_pp_vals)
+    single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
+    split_labeled_summary = summary.rename(columns={
+        col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
+        for col in summary.columns
+    })
+    split_labeled_summary.join(single_pp_summary, how="left").to_csv(
+        out_dir / "feature_attributions_comparison.csv")
+    print("  Single-PP and comparison attribution summaries saved")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 13 — XAI plots
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 13: XAI plots ──────────────────────────────────────")
+    save_xai_bars(summary, pp_cols, out_dir, material)
+    save_net_effect_bars(summary, pp_cols, out_dir, material)
+    save_pathway_agreement_scatter(summary, pp_cols, out_dir, material)
+    save_cancellation_bars(summary, pp_cols, out_dir, material)
+    if shap_vals is not None:
+        save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, material, n_pp)
+    if shap_single_pp_vals is not None:
+        save_single_pp_shap_beeswarm(
+            shap_single_pp_vals, X_test, pp_cols, out_dir, material)
+    save_total_effect_plot(summary, pp_cols, out_dir, material)
+    save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, material)
+    save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", material)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # M1-merge XAI — f features (M2 output) + pp_direct → W
+    # Shows how much each encoder f_i feature and each raw pp feature
+    # individually contributes to the weight prediction via the merge head.
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
+    m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
+    m1_wrap.eval()
+
+    # Compute f_full from M2 predictions for dev and test sets
+    f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
+    f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
+
+    # Build [f_full | pp_raw] inputs for M1MergeWrapper
+    X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
+    X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
+    f_col_names      = [f"f_{i}" for i in range(n_f)]
+    m1merge_cols     = f_col_names + pp_cols
+    baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
+
+    print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
+          f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
+    print(f"  Active f positions   : {f_positions}  (others zero by construction)")
+
+    shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                    args.shap_bg, device)
+    ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
+                                   args.n_ig_steps, args.eg_bg, device)
+
+    if shap_m1merge is not None:
+        build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
+            out_dir / "shap_m1merge_values.csv", index=False)
+    if ig_m1merge is not None:
+        build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
+            out_dir / "eg_m1merge_values.csv", index=False)
+    save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, material)
+    print("  M1-merge XAI done.")
+
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Fusion M1+M2 weight prediction + XAI")
     p.add_argument("--material", required=True,
@@ -2000,6 +2302,12 @@ def main():
     _pp_cols_from_m1 = None
     if _dp_path.exists():
         _dp_preview = json.loads(_dp_path.read_text())
+        from src.Utility.dataset_layout import divided_dataset, training_data_identity, dataset_root
+        if divided_dataset(cfg["data"]):
+            source_data = json.loads((m1_dir / "configuration.json").read_text())["data"]
+            current_data = {**source_data, "dataset_dir": str(dataset_root(cfg["data"]))}
+            if _dp_preview.get("training_data_identity") != training_data_identity(current_data):
+                raise ValueError("M1 checkpoint belongs to different data; retrain original on the current Train folder")
         _pp_cols_from_m1 = _dp_preview.get("pp_cols")
         if "y_filter" in _dp_preview:
             _removed_y_ids = set(_dp_preview["y_filter"]["removed_ids"])
@@ -2212,334 +2520,227 @@ def main():
         "m1_dir": str(m1_dir), "m2_dir": str(m2_dir),
         "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx_m1),
     }, indent=2))
-    pretrained_m2_state = copy.deepcopy(fusion.m2.state_dict())
+    selection, tuning_info = train_alpha_sweep(
+        fusion, X_pp_m1, y_m1, feature_targets, train_idx, val_idx, alphas,
+        finetuning_settings, SEED, device, run_dir, part_ids_m1, m1_groups,
+        material=MAT, plots=cfg.get("evaluation", {}).get("plots", True))
+    alpha = selection["alpha"]
+    out_dir = run_dir / "best_fusion"
     test_enabled = cfg.get("evaluation", {}).get("enabled", True)
     eval_idx = test_idx_m1 if test_enabled else val_idx
     eval_partition = "test" if test_enabled else "validation"
-    baseline_metrics = evaluate_fusion(
-        fusion, X_pp_m1[eval_idx], y_m1[eval_idx], device)
-    baseline_metrics.pop("pred")
-    (run_dir / "pretrained_test_metrics.json").write_text(json.dumps(baseline_metrics, indent=2))
-    sweep_results = []
-    for alpha in alphas:
-        # Independent runs: reset M2 and the random streams for each alpha.
-        fusion.m2.load_state_dict(pretrained_m2_state)
-        out_dir = run_dir / f"alpha_{alpha}"
-        out_dir.mkdir()
-        print(f"\n── Fine-tuning M2: alpha={alpha:g} → {out_dir} ──", flush=True)
-        tuning_info = finetune_m2(
-            fusion, X_pp_m1, y_m1, feature_targets, train_idx, val_idx,
-            alpha, finetuning_settings, SEED, device, out_dir)
-        # Give every model the same random XAI draws for a fair comparison.
-        torch.manual_seed(SEED)
-        np.random.seed(SEED)
-        flat_fusion = FlatFusionWrapper(fusion, n_pp).to(device)
-        flat_fusion.eval()
-        single_pp_fusion = SinglePPFusionWrapper(fusion, n_pp).to(device)
-        single_pp_fusion.eval()
+    # Run final evaluation and XAI only after all alphas have been ranked.
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
-        print(f"  FusionModel ready  "
-              f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
-        print(f"  MergeHead input = n_f + pp_latent_dim = "
-              f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
+    print(f"  FusionModel ready  "
+          f"[n_pp={n_pp}  n_f={n_f}  f_positions={f_positions}]")
+    print(f"  MergeHead input = n_f + pp_latent_dim = "
+          f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
 
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 6 — Evaluate on test set
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 6: Test evaluation ─────────────────────────────────")
-        X_test   = X_pp_m1[eval_idx]
-        y_test   = y_m1[eval_idx]
-        ids_test = part_ids_m1[eval_idx]
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 6 — Evaluate on test set
+    # ══════════════════════════════════════════════════════════════════════
+    print(f"\n── Step 6: Selected Fusion {eval_partition} evaluation ──────────")
+    X_test   = X_pp_m1[eval_idx]
+    y_test   = y_m1[eval_idx]
+    ids_test = part_ids_m1[eval_idx]
 
-        X_dev    = X_pp_m1[dev_idx_m1]
-        y_dev    = y_m1[dev_idx_m1]
+    X_dev    = X_pp_m1[dev_idx_m1]
 
-        metrics = evaluate_fusion(fusion, X_test, y_test, device)
-        preds   = metrics.pop("pred")
-        metrics["source"] = "final_test" if test_enabled else "validation"
-        if m1_groups is not None:
-            metrics.update(test_point_metrics(y_test, preds, m1_groups[eval_idx]))
+    metrics = evaluate_fusion(fusion, X_test, y_test, device, partition=eval_partition)
+    preds   = metrics.pop("pred")
+    metrics["source"] = "final_test" if test_enabled else "validation"
+    metrics.update(alpha=alpha, validation_MAE=selection["validation_MAE"],
+                   candidate=selection["candidate"], fine_tuned=selection["fine_tuned"],
+                   alpha_selection_metric="validation_MAE")
+    if m1_groups is not None:
+        metrics.update(test_point_metrics(y_test, preds, m1_groups[eval_idx]))
 
-        with torch.no_grad():
-            test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
-            _, pred_features = fusion(test_pp, test_pp, return_features=True)
-        pred_features = pred_features.cpu().numpy()
-        true_features = feature_targets[eval_idx]
-        per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
-        feature_mae = float(per_feature_mae.mean())
-        metrics["feature_MAE"] = feature_mae
-        metrics["composite_loss"] = alpha * metrics["MAE"] + (1-alpha) * feature_mae
-        pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
-            out_dir / "test_feature_metrics.csv", index=False)
-        feature_predictions = pd.DataFrame({"ID_Part": ids_test})
-        for i, name in enumerate(m2_f_cols):
-            feature_predictions[f"{name}_true"] = true_features[:, i]
-            feature_predictions[f"{name}_pred"] = pred_features[:, i]
-        feature_predictions.to_csv(out_dir / "test_feature_predictions.csv", index=False)
+    with torch.no_grad():
+        test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+        _, pred_features = fusion(test_pp, test_pp, return_features=True)
+    pred_features = pred_features.cpu().numpy()
+    true_features = feature_targets[eval_idx]
+    per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
+    feature_mae = float(per_feature_mae.mean())
+    metrics["feature_MAE"] = feature_mae
+    metrics["composite_loss"] = (alpha * metrics["MAE"] + (1-alpha) * feature_mae
+                                 if alpha is not None else None)
+    pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
+        out_dir / f"{eval_partition}_feature_metrics.csv", index=False)
+    feature_predictions = pd.DataFrame({"ID_Part": ids_test})
+    for i, name in enumerate(m2_f_cols):
+        feature_predictions[f"{name}_true"] = true_features[:, i]
+        feature_predictions[f"{name}_pred"] = pred_features[:, i]
+    feature_predictions.to_csv(out_dir / f"{eval_partition}_feature_predictions.csv", index=False)
 
-        # Save test predictions + metrics
-        pd.DataFrame({
-            "ID_Part": ids_test,
-            "y_true":  y_test,
-            "y_pred":  preds,
-        }).to_csv(out_dir / "test_predictions.csv", index=False)
-        (out_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2))
+    # Diagnose the restored winner's M2 on the same held-out parts as its weight head.
+    reconstruction = save_fusion_reconstruction(
+        true_features, pred_features, m2_f_cols, ids_test,
+        m1_groups[eval_idx] if m1_groups is not None else None, out_dir, MAT,
+        partition=eval_partition, target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(),
+        plots=cfg.get("evaluation", {}).get("plots", True))
+    metrics.update(feature_NMAE=reconstruction["mean_NMAE"],
+                   feature_RMSE=reconstruction["mean_RMSE"], feature_R2=reconstruction["mean_R2"])
 
-        # Prediction plots
-        _save_scatter(y_test, preds, metrics,
-                      out_dir / "scatter_test.png", MAT)
-        _save_residuals_scatter(y_test, preds,
-                                out_dir / "residuals_scatter_test.png", MAT)
-        _save_residuals_hist(y_test, preds,
-                             out_dir / "residuals_hist_test.png", MAT)
-        save_batch_test_diagnostics(
-            y_test, preds,
-            m1_groups[eval_idx] if m1_groups is not None else None,
-            ids_test, out_dir,
-            target_names=[target_col],
-            title=f"[{MAT} | Fusion] {eval_partition.title()} evaluation",
-        )
-        print("  Test plots saved.")
+    # Save test predictions + metrics
+    pd.DataFrame({
+        "ID_Part": ids_test,
+        "y_true":  y_test,
+        "y_pred":  preds,
+    }).to_csv(out_dir / f"{eval_partition}_predictions.csv", index=False)
+    (out_dir / f"{eval_partition}_metrics.json").write_text(json.dumps(metrics, indent=2))
 
-        if cfg.get("xai", {}).get("enabled", True):
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 7 — XAI setup
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 7: XAI setup ───────────────────────────────────────")
-            # Flattened inputs: [pp_indirect | pp_direct] = [X_pp | X_pp]
-            X_test_flat = np.concatenate([X_test, X_test], axis=1).astype(np.float32)
-            X_dev_flat  = np.concatenate([X_dev,  X_dev],  axis=1).astype(np.float32)
-            flat_cols   = _flat_col_names(pp_cols)
+    # Prediction plots
+    _save_scatter(y_test, preds, metrics,
+                  out_dir / f"scatter_{eval_partition}.png", MAT)
+    _save_residuals_scatter(y_test, preds,
+                            out_dir / f"residuals_scatter_{eval_partition}.png", MAT)
+    _save_residuals_hist(y_test, preds,
+                         out_dir / f"residuals_hist_{eval_partition}.png", MAT)
+    save_batch_test_diagnostics(
+        y_test, preds,
+        m1_groups[eval_idx] if m1_groups is not None else None,
+        ids_test, out_dir,
+        target_names=[target_col],
+        title=f"[{MAT} | Fusion] {eval_partition.title()} evaluation",
+        partition=eval_partition,
+    )
+    print(f"  {eval_partition.title()} plots saved → {out_dir}")
 
-            # IG/IH baseline = mean of dev data (more physically meaningful than zeros)
-            baseline_flat = X_dev_flat.mean(axis=0).astype(np.float32)
-            print(f"  Test flat shape : {X_test_flat.shape}")
-            print(f"  Dev  flat shape : {X_dev_flat.shape}")
-            print(f"  Single-PP shape : {X_test.shape} (same PP tensor used by both paths)")
-            print(f"  IG/IH baseline  : mean of dev set")
+    from src.Utility.dataset_layout import internal_test_name, label_test_1
+    from src.Utility.external_evaluation import external_dataset, save_weight_evaluation
+    from src.Utility.hybrid_models import FrozenTeacher
+    external = external_dataset({**cfg, "data": json.loads((m1_dir / "configuration.json").read_text())["data"]}) if test_enabled else None
+    if external is not None:
+        if [doe1_column_name(c) for c in external.pp_names] != [doe1_column_name(c) for c in pp_cols]:
+            raise ValueError("test_2 PP feature order differs from selected Fusion")
+        with torch.inference_mode():
+            xp = torch.as_tensor(external.pp, dtype=torch.float32, device=device)
+            external_weights, external_features = fusion(xp, xp, return_features=True)
+        report_2 = save_weight_evaluation(out_dir, "test_2", external, external_weights.cpu().numpy(),
+                                          "Selected original Fusion", cfg.get("evaluation", {}).get("plots", True))
+        # Product IDs restart in Test: generate its targets from its own curves.
+        external_truth = FrozenTeacher.load(m1_dir).sensor_features(external.curves)[:, f_positions]
+        reconstruction_2 = save_fusion_reconstruction(external_truth, external_features.cpu().numpy(),
+            m2_f_cols, external.ids, external.groups, out_dir, MAT, partition="test_2",
+            target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(), plots=cfg.get("evaluation", {}).get("plots", True))
+        report_2.update(feature_MAE=reconstruction_2["mean_MAE"], feature_NMAE=reconstruction_2["mean_NMAE"])
+        (out_dir / "test_2_metrics.json").write_text(json.dumps(report_2, indent=2))
+        (out_dir / "test_2_dataset.json").write_text(json.dumps({"namespace": "test_2",
+            "data": external.config["data"], "data_fingerprint": external.digest,
+            "part_ids": external.ids.tolist(), "n_samples": len(external.ids), "used_in_training": False}, indent=2))
 
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 8 — SHAP
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 8: SHAP ────────────────────────────────────────────")
-            shap_vals = run_shap(flat_fusion, X_dev_flat, X_test_flat,
-                                 args.shap_bg, device)
-            shap_single_pp_vals = run_shap(single_pp_fusion, X_dev, X_test,
-                                           args.shap_bg, device)
+    if cfg.get("xai", {}).get("enabled", True):
+        from src.Utility.fusion_xai_sampling import scoped_fusion_xai
+        groups = m1_groups if m1_groups is not None else np.zeros(len(X_pp_m1), dtype=int)
+        domains = [("train", X_pp_m1, part_ids_m1, groups)]
+        internal_name = internal_test_name(cfg["data"])
+        if test_enabled:
+            domains.append((internal_name, X_test, ids_test, groups[eval_idx]))
+            if external is not None:
+                domains.append(("test_2", external.pp, external.ids, external.groups))
+        def explain(background, values, ids, destination, partition):
+            run_fusion_xai(fusion, background, values, ids, pp_cols, n_f,
+                f_positions, args, device, destination, f"{MAT} | {partition}", shap_only=partition != internal_name)
+        scoped_fusion_xai(explain, X_pp_m1[train_idx], groups[train_idx], domains,
+            out_dir / "xai", {**cfg.get("xai", {}), "shap_bg": args.shap_bg}, SEED)
 
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 9 — Expected Gradients
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 9: Expected Gradients ──────────────────────────────")
-            ig_vals = run_ig(flat_fusion, X_dev_flat, X_test_flat,
-                             args.n_ig_steps, args.eg_bg, device)
-            eg_single_pp_vals = run_ig(single_pp_fusion, X_dev, X_test,
-                                       args.n_ig_steps, args.eg_bg, device)
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 14 — Copy model files; save fusion info
+    # ══════════════════════════════════════════════════════════════════════
+    print("\n── Step 14: Saving model copies & fusion info ──────────────")
+    for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
+        for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2_pretrained")]:
+            src = src_dir / fname
+            if src.exists():
+                shutil.copy2(src, out_dir / f"{prefix}_{fname}")
 
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 10 — Integrated Hessians
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 10: Integrated Hessians ────────────────────────────")
-            ih_matrix = run_integrated_hessians(
-                flat_fusion, X_test_flat, baseline_flat,
-                args.n_ig_steps, args.ih_samples, device)
-
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 11 — Jacobian pathway analysis
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 11: Jacobian pathway analysis ──────────────────────")
-            jac_vals = run_jacobian(flat_fusion, X_test_flat, device)
-
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 12 — Save XAI results
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 12: Saving XAI results ─────────────────────────────")
-
-            # per-sample CSVs
-            if shap_vals is not None:
-                build_per_sample_df(shap_vals, ids_test, flat_cols).to_csv(
-                    out_dir / "shap_values.csv", index=False)
-            if ig_vals is not None:
-                build_per_sample_df(ig_vals, ids_test, flat_cols).to_csv(
-                    out_dir / "eg_values.csv", index=False)
-            if shap_single_pp_vals is not None:
-                build_per_sample_df(shap_single_pp_vals, ids_test, pp_cols).to_csv(
-                    out_dir / "shap_single_pp_values.csv", index=False)
-            if eg_single_pp_vals is not None:
-                build_per_sample_df(eg_single_pp_vals, ids_test, pp_cols).to_csv(
-                    out_dir / "eg_single_pp_values.csv", index=False)
-            build_per_sample_df(jac_vals, ids_test, flat_cols).to_csv(
-                out_dir / "jacobian_values.csv", index=False)
-
-            # IH matrix
-            ih_df = pd.DataFrame(ih_matrix, index=flat_cols, columns=flat_cols)
-            ih_df.to_csv(out_dir / "ih_matrix.csv")
-
-            # summary (mean |attr| per feature)
-            summary = build_summary(pp_cols, shap_vals, ig_vals, jac_vals, n_pp)
-            summary.to_csv(out_dir / "feature_attributions.csv")
-            print(f"  feature_attributions.csv saved")
-            print(summary.to_string())
-            single_pp_summary = build_single_pp_summary(
-                pp_cols, shap_single_pp_vals, eg_single_pp_vals)
-            single_pp_summary.to_csv(out_dir / "feature_attributions_single_pp.csv")
-            split_labeled_summary = summary.rename(columns={
-                col: f"{col.split('_', 1)[0]}_split_{col.split('_', 1)[1]}"
-                for col in summary.columns
-            })
-            split_labeled_summary.join(single_pp_summary, how="left").to_csv(
-                out_dir / "feature_attributions_comparison.csv")
-            print("  Single-PP and comparison attribution summaries saved")
-
-            # ══════════════════════════════════════════════════════════════════════
-            # Step 13 — XAI plots
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── Step 13: XAI plots ──────────────────────────────────────")
-            save_xai_bars(summary, pp_cols, out_dir, MAT)
-            save_net_effect_bars(summary, pp_cols, out_dir, MAT)
-            save_pathway_agreement_scatter(summary, pp_cols, out_dir, MAT)
-            save_cancellation_bars(summary, pp_cols, out_dir, MAT)
-            if shap_vals is not None:
-                save_shap_beeswarm(shap_vals, X_test, pp_cols, out_dir, MAT, n_pp)
-            if shap_single_pp_vals is not None:
-                save_single_pp_shap_beeswarm(
-                    shap_single_pp_vals, X_test, pp_cols, out_dir, MAT)
-            save_total_effect_plot(summary, pp_cols, out_dir, MAT)
-            save_single_pp_importance_plot(single_pp_summary, pp_cols, out_dir, MAT)
-            save_ih_heatmap(ih_matrix, flat_cols, out_dir / "ih_heatmap.png", MAT)
-
-            # ══════════════════════════════════════════════════════════════════════
-            # M1-merge XAI — f features (M2 output) + pp_direct → W
-            # Shows how much each encoder f_i feature and each raw pp feature
-            # individually contributes to the weight prediction via the merge head.
-            # ══════════════════════════════════════════════════════════════════════
-            print("\n── M1-merge XAI: f features + pp_direct → W ────────────────")
-            m1_wrap = M1MergeWrapper(fusion, n_f, n_pp).to(device)
-            m1_wrap.eval()
-
-            # Compute f_full from M2 predictions for dev and test sets
-            f_full_dev   = _compute_f_full(fusion, X_dev,  device)   # (N_dev,  n_f)
-            f_full_test  = _compute_f_full(fusion, X_test, device)   # (N_test, n_f)
-
-            # Build [f_full | pp_raw] inputs for M1MergeWrapper
-            X_dev_m1merge    = np.concatenate([f_full_dev,  X_dev],  axis=1).astype(np.float32)
-            X_test_m1merge   = np.concatenate([f_full_test, X_test], axis=1).astype(np.float32)
-            f_col_names      = [f"f_{i}" for i in range(n_f)]
-            m1merge_cols     = f_col_names + pp_cols
-            baseline_m1merge = X_dev_m1merge.mean(axis=0).astype(np.float32)
-
-            print(f"  M1-merge input shape : {X_test_m1merge.shape}  "
-                  f"[n_f={n_f} f-features + n_pp={n_pp} pp_direct]")
-            print(f"  Active f positions   : {f_positions}  (others zero by construction)")
-
-            shap_m1merge = run_shap_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
-                                            args.shap_bg, device)
-            ig_m1merge   = run_ig_m1merge(m1_wrap, X_dev_m1merge, X_test_m1merge,
-                                           args.n_ig_steps, args.eg_bg, device)
-
-            if shap_m1merge is not None:
-                build_per_sample_df(shap_m1merge, ids_test, m1merge_cols).to_csv(
-                    out_dir / "shap_m1merge_values.csv", index=False)
-            if ig_m1merge is not None:
-                build_per_sample_df(ig_m1merge, ids_test, m1merge_cols).to_csv(
-                    out_dir / "eg_m1merge_values.csv", index=False)
-            save_xai_m1merge_bars(shap_m1merge, ig_m1merge, m1merge_cols, n_f, out_dir, MAT)
-            print("  M1-merge XAI done.")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # Step 14 — Copy model files; save fusion info
-        # ══════════════════════════════════════════════════════════════════════
-        print("\n── Step 14: Saving model copies & fusion info ──────────────")
-        for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
-            for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2_pretrained")]:
-                src = src_dir / fname
-                if src.exists():
-                    shutil.copy2(src, out_dir / f"{prefix}_{fname}")
-
-        # The fine-tuned M2 checkpoint is saved by finetune_m2; retain its architecture.
-        tuned_meta = {**m2_meta, "source": "fusion_finetuning", "finetuning": tuning_info,
-                      "pretrained_metrics": {k: v for k, v in m2_meta.items()
-                                             if k.startswith("mean_") or k == "per_target"}}
-        for key in ("mean_MAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target"):
+    # Retain the selected M2 architecture and identify whether it was fine-tuned.
+    tuned_meta = {**m2_meta, "source": "fusion_finetuning" if selection["fine_tuned"] else "fusion_pretrained",
+                  "finetuning": tuning_info,
+                  "pretrained_metrics": {k: v for k, v in m2_meta.items()
+                                         if k.startswith("mean_") or k == "per_target"}}
+    if selection["fine_tuned"]:
+        for key in ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target"):
             tuned_meta.pop(key, None)
-        (out_dir / "m2_best_metrics.json").write_text(json.dumps(tuned_meta, indent=2))
+    tuned_meta.update({key: reconstruction[key] for key in
+        ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target")})
+    tuned_meta["reconstruction_evaluation"] = reconstruction
+    (out_dir / "m2_best_metrics.json").write_text(json.dumps(tuned_meta, indent=2))
 
-        # Also save the consumed M1 sensor-feature table for reference.
-        src_feat = _m1_features_path(m1_dir)
-        shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
+    # Also save the consumed M1 sensor-feature table for reference.
+    src_feat = _m1_features_path(m1_dir)
+    shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
 
-        # Save test data
-        df_test_data = df_m1.iloc[eval_idx].copy()
-        df_test_data["y_pred"] = preds
-        df_test_data.to_csv(out_dir / "test_data_with_pred.csv")
+    # Save test data
+    df_test_data = df_m1.iloc[eval_idx].copy()
+    df_test_data["y_pred"] = preds
+    df_test_data.to_csv(out_dir / f"{eval_partition}_data_with_pred.csv")
 
-        # Fusion model info JSON
-        info = {
-            "alpha": alpha,
-            "finetuning": tuning_info,
-            "material":     MAT,
-            "run_ts":       RUN_TS,
-            "m1_run_ts":    m1_run_ts,
-            "edge_group_split": effective_edge_policy,
-            "device":       str(device),
-            "m1_dir":       str(m1_dir),
-            "m2_dir":       str(m2_dir),
-            "n_pp":         n_pp,
-            "n_f":          n_f,
-            "f_positions":  f_positions,
-            "m2_f_cols":    m2_f_cols,
-            "pp_cols":      pp_cols,
-            f"{eval_partition}_metrics": metrics,
-            "evaluation_partition": eval_partition,
-            "n_test":       int(len(test_idx_m1)),
-            "n_dev":        int(len(dev_idx_m1)),
-            "seed":         SEED,
-            "val_fraction": VAL_FR,
-            "val_fraction_achieved": split_info["val_fraction_achieved"],
-            "split_source": split_source,
-            "n_ig_steps":   args.n_ig_steps,
-            "ih_samples":   args.ih_samples,
-            "shap_bg":      args.shap_bg,
-            "eg_bg":        args.eg_bg,
-            "m1_model_cfg": m1_cfg,
-            "m2_model_cfg": m2_cfg,
-            "m1_metrics":   {k: v for k, v in m1_meta.items()
-                             if k not in ("model_cfg",)},
-            "m2_metrics":   {k: v for k, v in m2_meta.items()
-                             if k not in ("model_cfg",)},
-            "scaler_info": {
-                "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
-                "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
-                "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
-                "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
-                "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
-                "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
-            },
-        }
-        (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
+    # Fusion model info JSON
+    info = {
+        "alpha": alpha,
+        "finetuning": tuning_info,
+        "alpha_selection": selection,
+        "material":     MAT,
+        "run_ts":       RUN_TS,
+        "m1_run_ts":    m1_run_ts,
+        "edge_group_split": effective_edge_policy,
+        "device":       str(device),
+        "m1_dir":       str(m1_dir),
+        "m2_dir":       str(m2_dir),
+        "n_pp":         n_pp,
+        "n_f":          n_f,
+        "f_positions":  f_positions,
+        "m2_f_cols":    m2_f_cols,
+        "pp_cols":      pp_cols,
+        f"{eval_partition}_metrics": metrics,
+        "evaluation_partition": eval_partition,
+        "n_test":       int(len(test_idx_m1)),
+        "n_dev":        int(len(dev_idx_m1)),
+        "seed":         SEED,
+        "val_fraction": VAL_FR,
+        "val_fraction_achieved": split_info["val_fraction_achieved"],
+        "split_source": split_source,
+        "n_ig_steps":   args.n_ig_steps,
+        "ih_samples":   args.ih_samples,
+        "shap_bg":      args.shap_bg,
+        "eg_bg":        args.eg_bg,
+        "m1_model_cfg": m1_cfg,
+        "m2_model_cfg": m2_cfg,
+        "m1_metrics":   {k: v for k, v in m1_meta.items()
+                         if k not in ("model_cfg",)},
+        "m2_metrics":   {k: v for k, v in m2_meta.items()
+                         if k not in ("model_cfg",)},
+        "m2_reconstruction_metrics": reconstruction,
+        "scaler_info": {
+            "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
+            "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
+            "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
+            "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
+            "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
+            "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
+        },
+    }
+    if external is not None:
+        info["test_2_metrics"] = report_2
+        info["m2_reconstruction_test_2_metrics"] = reconstruction_2
+    if test_enabled and internal_test_name(cfg["data"]) == "test_1":
+        info["test_1_metrics"] = info.pop("test_metrics")
+        info["evaluation_partition"] = "test_1"
+    (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
+    if test_enabled:
+        label_test_1(out_dir, cfg["data"])
 
-        print(f"\n{'═'*60}")
-        print(f"  All outputs saved → {out_dir}")
-        print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
-        print(f"  Fusion R²   = {metrics['R2']:.4f}")
-        print(f"{'═'*60}\n")
+    print(f"\n{'═'*60}")
+    print(f"  All outputs saved → {out_dir}")
+    print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
+    print(f"  Fusion R²   = {metrics['R2']:.4f}")
+    print(f"{'═'*60}\n")
 
-        sweep_results.append({"alpha": alpha, "folder": out_dir.name,
-                              "best_epoch": tuning_info["best_epoch"],
-                              "best_val_loss": tuning_info["best_val_loss"], **metrics})
-        pd.DataFrame(sweep_results).to_csv(run_dir / "alpha_comparison.csv", index=False)
-    comparison = pd.DataFrame(sweep_results)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(comparison["alpha"], comparison["MAE"], "o-", label="Fine-tuned Fusion")
-    ax.axhline(baseline_metrics["MAE"], color=_PLT_C["ideal_line"], linestyle="--",
-               label="Pretrained Fusion")
-    ax.set(xlabel="Alpha", ylabel=f"{eval_partition.title()} weight MAE (g)", title=f"{MAT}: alpha comparison")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(run_dir / "alpha_comparison.png")
-    plt.close(fig)
-    finalize_evaluation(run_dir, test_enabled)
-    print(f"\nAlpha sweep complete → {run_dir}\n{comparison.to_string(index=False)}")
+    print(f"\nAlpha sweep complete; selected Fusion outputs → {out_dir}\n")
 
 
 if __name__ == "__main__":

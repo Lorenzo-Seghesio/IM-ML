@@ -146,6 +146,10 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from pathlib import Path
 
+if __package__ in (None, ""):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 warnings.filterwarnings("ignore")
 
 try:
@@ -1351,6 +1355,9 @@ def main():
                 shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
 
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "M2", run_best_dir,
+                          overall_best_dir if overall_updated else None, model=final_model)
     finalize_evaluation(run_best_dir, test_enabled)
     if overall_updated:
         finalize_evaluation(overall_best_dir, test_enabled)

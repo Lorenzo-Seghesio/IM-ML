@@ -191,6 +191,32 @@ class FusionFinetuningTests(unittest.TestCase):
         self.assertGreater(sum(p.grad.abs().sum().item() for p in model.m2.parameters()), 0)
         self.assertTrue(all(p.grad is None for p in model.merge.parameters()))
 
+    def test_selected_xai_helper_writes_explanations_to_best_fusion(self):
+        from contextlib import ExitStack, redirect_stdout
+        import io
+        from src import Fusion_M1M2_WPred as fusion_module
+
+        model = self.make_model()
+        X = np.random.default_rng(5).uniform(size=(5, 2)).astype(np.float32)
+        args = SimpleNamespace(shap_bg=2, n_ig_steps=2, eg_bg=2, ih_samples=1)
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            output = Path(directory) / "best_fusion"
+            output.mkdir()
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            for name in ('run_shap', 'run_ig', 'run_shap_m1merge', 'run_ig_m1merge'):
+                stack.enter_context(patch.object(fusion_module, name,
+                    side_effect=lambda model, background, samples, *args: np.zeros_like(samples)))
+            stack.enter_context(patch.object(fusion_module, 'run_jacobian',
+                side_effect=lambda model, samples, device: np.zeros_like(samples)))
+            stack.enter_context(patch.object(fusion_module, 'run_integrated_hessians',
+                return_value=np.zeros((4, 4))))
+            fusion_module.run_fusion_xai(model, X[:3], X[3:], np.array([40, 41]),
+                ['pp_a', 'pp_b'], 3, [2, 0], args, torch.device('cpu'), output, 'synthetic')
+            import pandas as pd
+            self.assertEqual(pd.read_csv(output / 'shap_values.csv')['ID_Part'].tolist(), [40, 41])
+            self.assertTrue((output / 'feature_attributions_single_pp.csv').is_file())
+            self.assertTrue((output / 'xai_m1merge_shap_beeswarm.png').is_file())
+
     def test_selection_uses_a_finetuned_epoch_even_when_baseline_has_zero_loss(self):
         model = self.make_model()
         X = np.random.default_rng(2).uniform(size=(12, 2)).astype(np.float32)

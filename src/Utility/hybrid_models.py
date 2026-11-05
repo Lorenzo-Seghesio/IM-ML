@@ -26,6 +26,9 @@ from .hybrid_data import (
 from .m1_test_point_training import test_point_metrics
 from .optuna_seeding import resolve_optuna_seed
 from .pipeline_runtime import stage_directory
+from .hybrid_diagnostics import save_partition_plots, save_cv_plots
+from .dataset_layout import internal_test_name
+from .doe1_columns import doe1_column_name
 
 FAMILIES = ("gbdt_pppt", "gbdt_ppdirect_pt", "gbdt_engineered")
 
@@ -90,10 +93,9 @@ def save_evaluation(directory, split, dataset, indices, prediction, label, evalu
                       directory / f"{split}_predictions.csv", index=False)
     pd.DataFrame(result["test_points"]).to_csv(directory / f"{split}_test_points.csv", index=False)
     if (evaluation_cfg if evaluation_cfg is not None else dataset.config.get("evaluation", {})).get("plots", True):
-        from .batch_test_diagnostics import save_batch_test_diagnostics
-        save_batch_test_diagnostics(dataset.y[indices], prediction, dataset.groups[indices],
-            dataset.ids[indices], directory / split, target_names=[dataset.config["data"]["target_col"]],
-            title=f"{label} — {split}")
+        save_partition_plots(directory, split, dataset.y[indices], prediction,
+            [doe1_column_name(dataset.config["data"]["target_col"])], label,
+            dataset.groups[indices], dataset.ids[indices])
     return result
 
 
@@ -186,16 +188,45 @@ def train_teacher(cfg, dataset, splits, contract, directory, seed):
     write_json(directory / "configuration.json", {**cfg, "model": model_cfg, "training": final_cfg})
     # Optional fold-specific encoders keep outer held-out TPs out of encoder fitting.
     cv = cfg.get("cv", {})
-    if cv.get("save_fold_checkpoints", False):
+    records, summaries = [], []
+    if cv.get("enabled", cv.get("save_fold_checkpoints", False)):
         for number, (tv, holdout) in enumerate(cv_splits(dataset, dev, cv["n_folds"], seed)):
             tr, va = inner_split(dataset, tv, train_cfg, seed + number)
             fold_model, fold_prep, fold_score = _train_teacher_once(
                 dataset, tr, va, model_cfg, train_cfg, seed + number, device)
             fold_contract = {**contract, "train_part_ids": dataset.ids[tr].tolist(),
                 "val_part_ids": dataset.ids[va].tolist(), "test_part_ids": dataset.ids[holdout].tolist()}
-            _save_teacher(fold_model, fold_prep, model_cfg, dataset, (tr, va, holdout),
-                           fold_contract, directory / "folds" / f"fold_{number}", fold_score)
-    return FrozenTeacher(model, prep, dataset.pp_names, dataset.sources, model_cfg)
+            if cv.get("save_fold_checkpoints", False):
+                _save_teacher(fold_model, fold_prep, model_cfg, dataset, (tr, va, holdout),
+                               fold_contract, directory / "folds" / f"fold_{number}", fold_score)
+            fold_teacher = FrozenTeacher(fold_model, fold_prep, dataset.pp_names, dataset.sources, model_cfg)
+            pred = fold_teacher.predict_weight(dataset.pp[holdout], [x[holdout] for x in dataset.curves])
+            records.append({"fold": number, "y_true": dataset.y[holdout], "y_pred": pred})
+            report = save_evaluation(directory / "cv" / f"fold_{number + 1:02d}", "heldout", dataset,
+                                     holdout, pred, "M1 neural", evaluation_cfg={"plots": False})
+            summaries.append({"fold": number, **{k: v for k, v in report.items() if k != "test_points"}})
+        pd.DataFrame(summaries).to_csv(directory / "cv_fold_metrics.csv", index=False)
+        save_cv_plots(directory, records, [dataset.config["data"]["target_col"]], "M1 neural CV", cv)
+    teacher = FrozenTeacher(model, prep, dataset.pp_names, dataset.sources, model_cfg)
+    return teacher
+
+
+def evaluate_teacher(teacher, cfg, dataset, splits, directory):
+    if not cfg.get("evaluation", {}).get("test_2_dir"):
+        from .external_evaluation import clear_test_2_artifacts
+        clear_test_2_artifacts(directory)
+    for name, indices in [("validation", splits[1])] + (
+            [(internal_test_name(cfg["data"]), splits[2])] if cfg.get("evaluation", {}).get("enabled", False) else []):
+        pred = teacher.predict_weight(dataset.pp[indices], [x[indices] for x in dataset.curves])
+        save_evaluation(directory, name, dataset, indices, pred, "M1 neural",
+                        evaluation_cfg=cfg.get("evaluation", {}))
+    if cfg.get("evaluation", {}).get("enabled", False):
+        from .external_evaluation import external_dataset
+        external = external_dataset(cfg)
+        if external is not None:
+            pred = teacher.predict_weight(external.pp, external.curves)
+            save_evaluation(directory, "test_2", external, np.arange(len(external.ids)), pred,
+                            "M1 neural", evaluation_cfg=cfg.get("evaluation", {}))
 
 
 class FrozenTeacher:
@@ -361,10 +392,12 @@ def train_xgb(cfg, dataset, splits, contract, features, names, directory, seed,
         parameters.update(xgb_suggest(optuna.trial.FixedTrial(study.best_params), hpo["search_space"]))
     if cv.get("enabled", True):
         records = []
+        predictions = []
         for number, (tr, va, ho, imp, matrix) in enumerate(prepare(cv.get("n_folds", 3), training)):
             model = fit_xgb(impute(imp, matrix[tr]), dataset.y[tr],
                 impute(imp, matrix[va]), dataset.y[va], parameters, training, seed + number)
             prediction = model.predict(impute(imp, matrix[ho]))
+            predictions.append({"fold": number, "y_true": dataset.y[ho], "y_pred": prediction})
             report = metrics(dataset.y[ho], prediction, dataset.groups[ho])
             records.append({"fold": number, **{key: value for key, value in report.items() if key != "test_points"}})
             pd.DataFrame({"part_id": dataset.ids[ho], "y_true": dataset.y[ho],
@@ -373,6 +406,7 @@ def train_xgb(cfg, dataset, splits, contract, features, names, directory, seed,
                 "train_part_ids": dataset.ids[tr].tolist(), "val_part_ids": dataset.ids[va].tolist(),
                 "heldout_part_ids": dataset.ids[ho].tolist()})
         pd.DataFrame(records).to_csv(directory / "cv_fold_metrics.csv", index=False)
+        save_cv_plots(directory, predictions, [dataset.config["data"]["target_col"]], "GBDT CV", cv)
     imp = fit_imputer(features[train])
     model = fit_xgb(impute(imp, features[train]), dataset.y[train],
         impute(imp, features[val]), dataset.y[val], parameters, training, seed)
@@ -386,13 +420,73 @@ def train_xgb(cfg, dataset, splits, contract, features, names, directory, seed,
         "description": "Head-only CV is conditional on pretrained representations. Even fold-specific "
                        "checkpoints do not undo architecture selection on development data."})
     result = save_evaluation(directory, "validation", dataset, val,
-                            model.predict(impute(imp, features[val])), "M1 teacher (measured signals)")
+                            model.predict(impute(imp, features[val])), "GBDT teacher (measured signals)",
+                            evaluation_cfg={"plots": False})
     if cfg.get("evaluation", {}).get("enabled", False):
-        save_evaluation(directory, "test", dataset, test,
-                        model.predict(impute(imp, features[test])), "M1 teacher (measured signals)")
+        save_evaluation(directory, internal_test_name(cfg["data"]), dataset, test,
+                        model.predict(impute(imp, features[test])), "GBDT teacher (measured signals)",
+                        evaluation_cfg={"plots": False})
     write_json(directory / "best_metrics.json", {"source": "validation", "validation_MAE": result["MAE"],
         **result, "best_iteration": int(model.best_iteration) if hasattr(model, "best_iteration") else None})
     return model, imp
+
+
+def fit_m2_partition(cfg, dataset, targets, tr, va, seed):
+    """Fit reconstruction with preprocessing learned exclusively from this fold."""
+    xi, yi = fit_imputer(dataset.pp[tr]), fit_imputer(targets[tr])
+    x, y = impute(xi, dataset.pp), impute(yi, targets)
+    normalization = cfg.get("normalization", {"pp": "minmax", "targets": "minmax"})
+    xs = feature_scaler(x[tr], normalization.get("pp", "minmax"))
+    ys = feature_scaler(y[tr], normalization.get("targets", "minmax"))
+    torch.manual_seed(seed)
+    mc, device = cfg["model"], device_for(cfg)
+    model = m2.M2Model(x.shape[1], y.shape[1], mc["hidden_dims"], mc["dropout"]).to(device)
+    model, _ = m2.train_fold(model, xs.transform(x[tr]), ys.transform(y[tr]),
+        xs.transform(x[va]), ys.transform(y[va]), cfg["training"], device)
+    return model.cpu().eval(), {"pp_imputer": xi, "target_imputer": yi,
+                              "x_scaler": xs, "y_scaler": ys}
+
+
+def fusion_cv(cfg, head_cfg, m2_cfg, dataset, splits, features, sensor_names,
+              directory, seed, fold_features=None):
+    """Refit the head and M2 per development fold; never use independent test IDs.
+
+    Neural representations and selected hyperparameters remain conditional on
+    development data, as in the original indicative CV reports.
+    """
+    cv = cfg.get("cv", {})
+    if not cv.get("enabled", False):
+        return
+    records, summaries, notes = [], [], []
+    dev = np.concatenate(splits[:2])
+    n_direct = features.shape[1] - len(sensor_names)
+    directory = Path(directory)
+    for number, (tv, ho) in enumerate(cv_splits(dataset, dev, cv.get("n_folds", 3), seed)):
+        tr, va = inner_split(dataset, tv, head_cfg["training"], seed + number)
+        matrix, note = fold_features(number, tr, va, ho) if fold_features else (features, None)
+        if note:
+            notes.append(note)
+        imp = fit_imputer(matrix[tr])
+        head = fit_xgb(impute(imp, matrix[tr]), dataset.y[tr], impute(imp, matrix[va]),
+                       dataset.y[va], head_cfg["xgboost"], head_cfg["training"], seed + number)
+        reconstruction, prep = fit_m2_partition(m2_cfg, dataset, matrix[:, n_direct:], tr, va, seed + number)
+        x = prep["x_scaler"].transform(impute(prep["pp_imputer"], dataset.pp[ho])).astype(np.float32)
+        with torch.inference_mode():
+            reconstructed = prep["y_scaler"].inverse_transform(reconstruction(torch.from_numpy(x)).numpy())
+        pred = head.predict(impute(imp, np.concatenate([matrix[ho, :n_direct], reconstructed], axis=1)))
+        records.append({"fold": number, "y_true": dataset.y[ho], "y_pred": pred})
+        report = save_evaluation(directory / "cv" / f"fold_{number + 1:02d}", "heldout",
+            dataset, ho, pred, "Fusion (PP only)", evaluation_cfg={"plots": False})
+        summaries.append({"fold": number, **{k: v for k, v in report.items() if k != "test_points"}})
+        write_json(directory / f"cv_fold_{number}_split.json", {
+            "train_part_ids": dataset.ids[tr].tolist(), "val_part_ids": dataset.ids[va].tolist(),
+            "heldout_part_ids": dataset.ids[ho].tolist()})
+    pd.DataFrame(summaries).to_csv(directory / "cv_fold_metrics.csv", index=False)
+    write_json(directory / "cv_interpretation.json", {"notes": sorted(set(notes)),
+        "independent_test_used_in_cv": False,
+        "description": "Indicative CV: head and M2 are refitted per fold. Representations and "
+                       "hyperparameter selection remain conditional on development data."})
+    save_cv_plots(directory, records, [dataset.config["data"]["target_col"]], "PP-only Fusion CV", cv)
 
 
 def train_m2(cfg, dataset, splits, contract, sensor_features, sensor_names, directory, seed):
@@ -441,15 +535,18 @@ def train_m2(cfg, dataset, splits, contract, sensor_features, sensor_names, dire
     cv = cfg.get("cv", {})
     if cv.get("enabled", False):
         records = []
+        predictions = []
         for number, (tv, ho) in enumerate(cv_splits(dataset, dev, cv.get("n_folds", training["k_folds"]), seed)):
             tr, va = inner_split(dataset, tv, training, seed + number)
             report = fit_fold(model_cfg, training, tr, va, ho, seed + number)
+            predictions.append({"fold": number, "y_true": sensor_features[ho], "y_pred": report["pred"]})
             records.append({"fold": number, **{key: value for key, value in report.items() if key not in ("pred", "per_target")}})
             write_json(directory / f"cv_fold_{number}_metrics.json", {key: value for key, value in report.items() if key != "pred"})
             output = pd.DataFrame(report["pred"], columns=sensor_names)
             output.insert(0, "part_id", dataset.ids[ho])
             output.to_csv(directory / f"cv_fold_{number}_predictions.csv", index=False)
         pd.DataFrame(records).to_csv(directory / "cv_fold_metrics.csv", index=False)
+        save_cv_plots(directory, predictions, sensor_names, "M2 reconstruction CV", cv)
     xs = feature_scaler(x[train], normalization.get("pp", "minmax"))
     ys = feature_scaler(y[train], normalization.get("targets", "minmax"))
     torch.manual_seed(seed)
@@ -467,12 +564,35 @@ def train_m2(cfg, dataset, splits, contract, sensor_features, sensor_names, dire
     write_json(directory / "configuration.json", {**cfg, "model": model_cfg, "training": training})
     write_json(directory / "feature_schema.json", {"pp_columns": dataset.pp_names, "sensor_columns": sensor_names})
     write_json(directory / "data_processing.json", contract)
+    reports = evaluate_m2(model, preprocessing, cfg, dataset, splits, sensor_features, sensor_names, directory)
+    write_json(directory / "best_metrics.json", {"source": "validation", "model_cfg": model_cfg,
+        "n_in": x.shape[1], "n_out": y.shape[1], "validation_MAE": reports["validation"]["mean_NMAE"],
+        "selection_metric": "validation_mean_NMAE", **reports["validation"]})
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model, preprocessing
+
+
+def evaluate_m2(model, preprocessing, cfg, dataset, splits, sensor_features, sensor_names, directory,
+                external=None, external_sensor=None, only_external=False):
+    _, val, test = splits
+    directory = Path(directory)
+    xs, ys = preprocessing["x_scaler"], preprocessing["y_scaler"]
     reports = {}
-    for name, indices in [("validation", val)] + ([("test", test)] if cfg.get("evaluation", {}).get("enabled", False) else []):
+    enabled = cfg.get("evaluation", {}).get("enabled", False)
+    evaluations = [] if only_external else [("validation", dataset, sensor_features, val)]
+    if enabled:
+        if not only_external:
+            evaluations.append((internal_test_name(cfg["data"]), dataset, sensor_features, test))
+        if external is not None:
+            evaluations.append(("test_2", external, external_sensor, np.arange(len(external.ids))))
+    for name, current, features, indices in evaluations:
+        x = impute(preprocessing["pp_imputer"], current.pp)
+        y = impute(preprocessing["target_imputer"], features)
         report = m2.evaluate_model(model, xs.transform(x[indices]), y[indices], ys, sensor_names, torch.device("cpu"))
         pred = report.pop("pred")
         # Missing actual descriptors are not scored as if training-median fills were observations.
-        actual = sensor_features[indices]
+        actual = features[indices]
         observed = np.isfinite(actual)
         errors = np.where(observed, np.abs(pred - actual), np.nan)
         counts = observed.sum(axis=0)
@@ -481,19 +601,17 @@ def train_m2(cfg, dataset, splits, contract, sensor_features, sensor_names, dire
         report["observed_feature_MAE"] = float(np.nanmean(feature_mae)) if np.any(counts) else None
         pd.DataFrame({"feature": sensor_names, "MAE": feature_mae, "n_observed": counts}).to_csv(
             directory / f"{name}_feature_metrics.csv", index=False)
-        output = pd.DataFrame({"part_id": dataset.ids[indices]})
+        output = pd.DataFrame({"part_id": current.ids[indices]})
         for i, column in enumerate(sensor_names):
             output[f"{column}__true"] = actual[:, i]
             output[f"{column}__pred"] = pred[:, i]
         output.to_csv(directory / f"{name}_feature_predictions.csv", index=False)
-        write_json(directory / f"{name}_metrics.json", report)
+        write_json(directory / f"{name}_metrics.json", {**report, "partition": name})
+        if cfg.get("evaluation", {}).get("plots", True):
+            save_partition_plots(directory, name, actual, pred, sensor_names,
+                "M2 reconstruction", current.groups[indices], current.ids[indices])
         reports[name] = report
-    write_json(directory / "best_metrics.json", {"source": "validation", "model_cfg": model_cfg,
-        "n_in": x.shape[1], "n_out": y.shape[1], "validation_MAE": reports["validation"]["mean_NMAE"],
-        "selection_metric": "validation_mean_NMAE", **reports["validation"]})
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    return model, preprocessing
+    return reports
 
 
 class HybridPredictor:

@@ -157,6 +157,10 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from pathlib import Path
 
+if __package__ in (None, ""):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 # Keep insufficient-variability and undersized-test-point warnings visible.
 warnings.simplefilter("always", InsufficientVariabilityWarning)
 
@@ -1783,6 +1787,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[Encoder] All artefacts copied → {ob_dir}")
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "Encoder", rb_dir, ob_dir if updated else None,
+                          model=final_model, transform=scale)
     finalize_evaluation(rb_dir, test_enabled)
     if updated:
         finalize_evaluation(ob_dir, test_enabled)
@@ -1901,6 +1908,9 @@ def run_mlp(X_pp, y, cfg, mat, mat_dir, seed, device, strat_labels,
         save_cv_plots(metrics_df, K, mat, ob_dir, "MLP")
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[MLP] All artefacts copied → {ob_dir}")
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "MLP", rb_dir, ob_dir if updated else None,
+                          model=final_model, transform=lambda values: sc.transform(values).astype(np.float32))
     finalize_evaluation(rb_dir, test_enabled)
     if updated:
         finalize_evaluation(ob_dir, test_enabled)
@@ -2011,6 +2021,9 @@ def run_lgbm(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
         print(f"[LightGBM] All artefacts copied → {ob_dir}")
 
 
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "LightGBM", rb_dir, ob_dir if updated else None,
+                          model=final_model, transform=None)
     finalize_evaluation(rb_dir, test_enabled)
     if updated:
         finalize_evaluation(ob_dir, test_enabled)
@@ -2120,6 +2133,9 @@ def run_xgboost(X_pp, y, cfg, mat, mat_dir, seed, strat_labels,
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "XGBoost", rb_dir, ob_dir if updated else None,
+                          model=final_model, transform=None)
     finalize_evaluation(rb_dir, test_enabled)
     if updated:
         finalize_evaluation(ob_dir, test_enabled)
@@ -2315,6 +2331,8 @@ def run_custom_gbdt(X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, tes
         for artifact in run_dir.iterdir():
             if artifact.is_file():
                 shutil.copy2(artifact, overall_dir / artifact.name)
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "CustomGBDT", run_dir, overall_dir if updated else None, model=model)
     finalize_evaluation(run_dir, test_enabled)
     if updated:
         finalize_evaluation(overall_dir, test_enabled)

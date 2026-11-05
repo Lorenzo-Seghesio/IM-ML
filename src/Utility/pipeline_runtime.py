@@ -7,6 +7,7 @@ import copy
 import json
 import os
 from pathlib import Path
+from .dataset_layout import resolve_data_config
 
 
 def stage_directory(run_dir, stage, material):
@@ -23,9 +24,14 @@ def model_config(default_path, stage, material):
 
 def configure(cfg, stage, material):
     cfg = copy.deepcopy(cfg)
+    if cfg.get("data"):
+        cfg["data"] = resolve_data_config(cfg["data"])
     seed = os.environ.get("IM_ML_RUN_SEED")
     if seed is not None:
         cfg.setdefault("preprocessing", {})["random_seed"] = int(seed)
+    split_seed = os.environ.get("IM_ML_SPLIT_SEED")
+    if stage == "M1" and split_seed is not None:
+        cfg.setdefault("preprocessing", {}).setdefault("split_seed", int(split_seed))
     run_dir = os.environ.get("IM_ML_RUN_DIR")
     if run_dir:
         root = Path(run_dir)

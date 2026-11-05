@@ -112,6 +112,10 @@ from sklearn.model_selection import KFold, StratifiedKFold, StratifiedShuffleSpl
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from pathlib import Path
+
+if __package__ in (None, ""):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 try:
     from Utility.group_splitting import (
         grouped_kfold, grouped_train_test_split,
@@ -1552,6 +1556,9 @@ def main():
 
 
 def run_experiment(cfg, mat, cfg_path):
+    from src.Utility.dataset_layout import resolve_data_config
+    cfg = copy.deepcopy(cfg)
+    cfg["data"] = resolve_data_config(cfg["data"])
     data_cfg  = cfg["data"]
     prep_cfg  = cfg["preprocessing"]
     model_cfg = cfg["model"]
@@ -1833,6 +1840,10 @@ def run_experiment(cfg, mat, cfg_path):
             "removed_ids":   y_removed_ids,
         },
     }
+    from src.Utility.dataset_layout import divided_dataset, training_data_identity
+    if divided_dataset(data_cfg):
+        dp["training_data_identity"] = training_data_identity(data_cfg)
+        dp["id_namespace"] = "Train"
     (run_best_dir / "data_processing.json").write_text(json.dumps(dp, indent=2))
     print(f"Data processing saved → {run_best_dir / 'data_processing.json'}")
 
@@ -1884,6 +1895,9 @@ def run_experiment(cfg, mat, cfg_path):
                 shutil.copy2(artifact, overall_best_dir / artifact.name)
         print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
 
+    from src.Utility.external_evaluation import finish_original_stage
+    finish_original_stage(cfg, "M1", run_best_dir,
+                          overall_best_dir if overall_updated else None)
     finalize_evaluation(run_best_dir, test_enabled)
     if overall_updated:
         finalize_evaluation(overall_best_dir, test_enabled)

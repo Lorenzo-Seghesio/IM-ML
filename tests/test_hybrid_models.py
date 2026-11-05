@@ -18,6 +18,7 @@ from src.Utility import hybrid_models as hm
 from src.Utility import hybrid_pipeline as hp
 from src.Utility.hybrid_data import read_json, write_json, load_data, split_data
 from src.Utility.family_launcher import validate_pipeline_config, run_families
+from src.Utility.dataset_layout import resolve_data_config, internal_test_name
 
 
 def tiny_training():
@@ -51,7 +52,7 @@ def fixture(root):
                        "objective": "reg:absoluteerror", "tree_method": "hist", "n_jobs": 1},
            "optuna": {"enabled": True, "n_trials": 1, "n_startup_trials": 1, "sampler_seed": 17,
                       "n_folds": 2, "search_space": {"max_depth": [1, 2]}},
-           "cv": {"enabled": True, "n_folds": 2}, "evaluation": {"enabled": False, "plots": False},
+           "cv": {"enabled": True, "n_folds": 2, "plots": False}, "evaluation": {"enabled": False, "plots": False},
            "checkpoint": {"reuse": True}, "output": {"output_dir": str(root / "output")}}
     model_cfg = {"curve_encoders": [{"conv_channels": [1, 2], "conv_kernels": [3],
                                     "n_f_features": 2} for _ in sources],
@@ -65,6 +66,33 @@ def write_time_grid(root, times, labels=None):
     pd.DataFrame({"column": labels if labels is not None else [f"t{i}" for i in range(len(times))],
                   "time_seconds": times}).to_csv(path, index=False)
     return path
+
+
+def divided_fixture(root):
+    train, test = root/'Train', root/'Test'
+    train.mkdir(); test.mkdir()
+    cfg, model = fixture(train)
+    for old, suffix in [('scalar.csv', 'Scalars.csv'), ('p1.csv', 'Pressure_1.csv'), ('T1.csv', 'Temperature.csv')]:
+        new = train / ('Training_'+suffix)
+        (train/old).rename(new)
+        frame = pd.read_csv(new).iloc[:6].copy()
+        if suffix == 'Scalars.csv':
+            frame['weight'] += 100
+        else:
+            frame.loc[:, frame.columns != 'ID'] += .25
+        frame.to_csv(test/('External_'+suffix), index=False)
+        if suffix == 'Scalars.csv':
+            cfg['data']['scalar_csv'] = str(new)
+        else:
+            for source in cfg['data']['timeseries_csvs']:
+                if Path(source['path']).name == old:
+                    source['path'] = str(new)
+    cfg['data']['dataset_dir'] = str(root)
+    cfg['evaluation']['test_2_dir'] = str(test)
+    cfg['data'] = resolve_data_config(cfg['data'])
+    write_time_grid(train, np.arange(8)*.1)
+    write_time_grid(test, np.arange(8)*.1)
+    return cfg, model
 
 
 class EngineeredTests(unittest.TestCase):
@@ -183,12 +211,18 @@ class HybridIntegrationTests(unittest.TestCase):
             np.testing.assert_array_equal(before, after.predict(imputer.transform(features[val])))
             self.assertFalse((root / "first" / "test_metrics.json").exists())
 
-    def test_all_families_train_reload_and_reuse_without_test_evaluation(self):
+    def test_all_families_train_reload_reuse_and_enable_final_testing(self):
+        self._check_hybrid_families(False)
+
+    def test_all_families_keep_external_test_separate_and_reuse_training_checkpoints(self):
+        self._check_hybrid_families(True)
+
+    def _check_hybrid_families(self, divided):
         torch.set_num_threads(1)
         for family in hp.FAMILIES:
             with self.subTest(family=family), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
                 root = Path(directory)
-                cfg, mc = fixture(root)
+                cfg, mc = divided_fixture(root) if divided else fixture(root)
                 cfg["family"] = family
                 dataset = load_data(cfg)
                 splits, contract = split_data(dataset, cfg)
@@ -196,15 +230,21 @@ class HybridIntegrationTests(unittest.TestCase):
                 # Held-out extremes must never affect fitted scalers/imputers or gradients.
                 self.assertFalse(set(dataset.groups[tr]) & set(dataset.groups[te]))
                 write_json(root / "split" / "data_processing.json", contract)
+                write_json(root / "split" / "reference_run.json", {
+                    "run_dir": "/original/runs/2026-11-05_12-00-00/run_001",
+                    "run_timestamp": "2026-11-05_12-00-00", "fusion_test_MAE": .123})
                 cfg["split"] = {"source_dir": str(root / "split")}
                 if family == "gbdt_engineered":
-                    write_time_grid(root, np.arange(8) * .1)
+                    write_time_grid(root/'Train' if divided else root, np.arange(8) * .1)
                     cfg["feature_extraction"] = {"auto_discover_time_grid": True,
                                                  "cache_dir": str(root / "cache")}
                 else:
                     teacher_cfg = {"data": cfg["data"], "model": mc, "training": tiny_training(),
                                    "mode": "manual", "checkpoint": {"reuse": True},
-                                   "cv": {"save_fold_checkpoints": family == "gbdt_ppdirect_pt", "n_folds": 2}}
+                                   "evaluation": {"enabled": False, "plots": False,
+                                                  "test_2_dir": cfg['evaluation'].get('test_2_dir')},
+                                   "cv": {"enabled": True, "plots": False,
+                                          "save_fold_checkpoints": family == "gbdt_ppdirect_pt", "n_folds": 2}}
                     if family == "gbdt_ppdirect_pt":
                         teacher_cfg["model"]["pp_branch"] = "direct"
                         cfg["teacher"] = {"train": True, "config": str(root / "m1.json")}
@@ -217,16 +257,19 @@ class HybridIntegrationTests(unittest.TestCase):
                         cfg["teacher"] = {"train": False, "checkpoint_dir": str(root / "pretrained")}
                 reconstruction = {"data": cfg["data"], "preprocessing": {"random_seed": 42},
                     "model": {"hidden_dims": [4], "dropout": 0.}, "training": tiny_training(),
-                    "mode": "manual", "evaluation": {"enabled": False}, "checkpoint": {"reuse": True}}
+                    "mode": "manual", "evaluation": {"enabled": False, "plots": False,
+                        "test_2_dir": cfg['evaluation'].get('test_2_dir')}, "checkpoint": {"reuse": True}}
                 if family == "gbdt_ppdirect_pt":
                     reconstruction.update(mode="optuna", normalization={"pp": "standard", "targets": "standard"},
-                        cv={"enabled": True, "n_folds": 2}, optuna={"enabled": True, "n_trials": 1,
+                        cv={"enabled": True, "n_folds": 2, "plots": False}, optuna={"enabled": True, "n_trials": 1,
                             "n_startup_trials": 1, "sampler_seed": 4, "n_folds": 2, "epochs": 1,
                             "patience": 1, "search_space": {"lr": [.001, .002]}})
                 fusion = {"evaluation": {"enabled": False, "plots": False},
+                          "cv": {"enabled": True, "n_folds": 2, "plots": False},
                           "xai": {"enabled": family == "gbdt_engineered", "partition": "validation",
                                   "background_samples": 2, "explain_samples": 2, "nsamples": 16,
                                   "pathway_analysis": True}}
+                fusion['evaluation']['test_2_dir'] = cfg['evaluation'].get('test_2_dir')
                 write_json(root / "m2.json", reconstruction)
                 write_json(root / "fusion.json", fusion)
                 cfg["configs"] = {"m2": str(root / "m2.json"), "fusion": str(root / "fusion.json")}
@@ -240,11 +283,19 @@ class HybridIntegrationTests(unittest.TestCase):
                 np.testing.assert_allclose(prediction, pd.read_csv(fusion_dir / "validation_predictions.csv")["y_pred"])
                 self.assertFalse(any(run.rglob("test_metrics.json")))
                 self.assertTrue((run / "comparison.csv").exists())
+                self.assertEqual(read_json(run / "reference_run.json")["reference_run"]["run_timestamp"],
+                                 "2026-11-05_12-00-00")
+                for path in fusion_dir.glob("cv_fold_*_split.json"):
+                    fold = read_json(path)
+                    self.assertFalse(set(fold["heldout_part_ids"]) & set(dataset.ids[te]))
+                    self.assertFalse(set(fold["heldout_part_ids"]) & set(fold["train_part_ids"]))
+                    self.assertFalse(set(fold["heldout_part_ids"]) & set(fold["val_part_ids"]))
+                self.assertEqual(len(list(fusion_dir.glob("cv_fold_*_split.json"))), 2)
                 self.assertTrue(all(not p.requires_grad for p in predictor.reconstructor.parameters()))
                 if family == "gbdt_engineered":
-                    self.assertTrue((fusion_dir / "xai" / "xai_shap_single_pp_beeswarm.png").exists())
-                    self.assertTrue((fusion_dir / "xai" / "xai_bar_shap_pathway_split.png").exists())
-                    self.assertTrue((fusion_dir / "xai" / "tree_head_shap_values.csv").exists())
+                    self.assertTrue((fusion_dir / "xai/train" / "xai_shap_single_pp_beeswarm.png").exists())
+                    self.assertTrue((fusion_dir / "xai/train" / "xai_bar_shap_pathway_split.png").exists())
+                    self.assertTrue((fusion_dir / "xai/train" / "tree_head_shap_values.csv").exists())
                     fusion["xai"]["enabled"] = False
                     write_json(root / "fusion.json", fusion)
                 else:
@@ -255,6 +306,62 @@ class HybridIntegrationTests(unittest.TestCase):
                         patch.object(hp, "train_xgb", side_effect=AssertionError("head retrained")), \
                         patch.object(hp, "train_m2", side_effect=AssertionError("M2 retrained")):
                     hp.run_hybrid(family, root / "head.json", run_dir=run)
+                    # Enabling final testing must also evaluate reused checkpoints.
+                    cfg["evaluation"]["enabled"] = True
+                    reconstruction["evaluation"]["enabled"] = True
+                    fusion["evaluation"]["enabled"] = True
+                    write_json(root / "head.json", cfg)
+                    write_json(root / "m2.json", reconstruction)
+                    write_json(root / "fusion.json", fusion)
+                    if family == "gbdt_ppdirect_pt":
+                        teacher_cfg["evaluation"]["enabled"] = True
+                        write_json(root / "m1.json", teacher_cfg)
+                    hp.run_hybrid(family, root / "head.json", run_dir=run)
+                    internal = internal_test_name(cfg['data'])
+                    for stage in ("XGBoost", "Fusion") + (("M1",) if family != "gbdt_engineered" else ()):
+                        stage_dir = run / stage / "run_best" / "model"
+                        self.assertEqual(set(pd.read_csv(stage_dir / f"{internal}_predictions.csv")["part_id"]),
+                                         set(dataset.ids[te]))
+                    m2_predictions = run / "M2" / "run_best" / "model" / f"{internal}_feature_predictions.csv"
+                    self.assertEqual(set(pd.read_csv(m2_predictions)["part_id"]), set(dataset.ids[te]))
+                    if divided:
+                        for stage in ('XGBoost', 'M2', 'Fusion') + (('M1',) if family != 'gbdt_engineered' else ()):
+                            stage_dir = run/stage/'run_best/model'
+                            report = read_json(stage_dir/'test_2_metrics.json')
+                            name = 'test_2_feature_predictions.csv' if stage == 'M2' else 'test_2_predictions.csv'
+                            self.assertEqual(pd.read_csv(stage_dir/name)['part_id'].tolist(), list(range(6)))
+                        before = pd.read_csv(fusion_dir/'test_2_predictions.csv')['y_pred'].to_numpy()
+                        ext_path = root/'Test/External_Scalars.csv'
+                        ext_frame = pd.read_csv(ext_path); ext_frame['weight'] += 1000
+                        ext_frame.to_csv(ext_path, index=False)
+                        hp.run_hybrid(family, root/'head.json', run_dir=run)
+                        np.testing.assert_array_equal(before, pd.read_csv(fusion_dir/'test_2_predictions.csv')['y_pred'])
+                        # Independent stage controls: only Fusion uses a different external folder.
+                        alternate = root/'AlternateTest'
+                        alternate.mkdir()
+                        for path in (root/'Test').glob('*.csv'):
+                            pd.read_csv(path).iloc[:3].to_csv(alternate/path.name, index=False)
+                        write_time_grid(alternate, np.arange(8)*.1)
+                        cfg['evaluation']['test_2_dir'] = None
+                        reconstruction['evaluation']['test_2_dir'] = None
+                        fusion['evaluation']['test_2_dir'] = str(alternate)
+                        write_json(root/'head.json', cfg)
+                        write_json(root/'m2.json', reconstruction)
+                        write_json(root/'fusion.json', fusion)
+                        if family == 'gbdt_ppdirect_pt':
+                            teacher_cfg['evaluation']['test_2_dir'] = None
+                            write_json(root/'m1.json', teacher_cfg)
+                        hp.run_hybrid(family, root/'head.json', run_dir=run)
+                        for stage in ('XGBoost', 'M2', 'M1'):
+                            self.assertFalse((run/stage/'run_best/model/test_2_metrics.json').exists())
+                            self.assertFalse((run/stage/'best_overall/test_2_metrics.json').exists())
+                        self.assertEqual(pd.read_csv(fusion_dir/'test_2_predictions.csv')['part_id'].tolist(), [0,1,2])
+                        fusion['evaluation']['test_2_dir'] = None
+                        write_json(root/'fusion.json', fusion)
+                        hp.run_hybrid(family, root/'head.json', run_dir=run)
+                        self.assertFalse((fusion_dir/'test_2_metrics.json').exists())
+                        self.assertFalse((run/'Fusion/best_overall/test_2_metrics.json').exists())
+                        self.assertNotIn('test_2', pd.read_csv(run/'comparison.csv')['partition'].tolist())
                     if family == "gbdt_engineered":
                         cfg["checkpoint"]["source_dir"] = str(run / "XGBoost" / "best_overall")
                         reconstruction["checkpoint"]["source_dir"] = str(run / "M2" / "best_overall")
@@ -262,7 +369,7 @@ class HybridIntegrationTests(unittest.TestCase):
                         write_json(root / "m2.json", reconstruction)
                         hp.run_hybrid(family, root / "head.json", run_dir=root / "resumed_elsewhere")
                         self.assertTrue((root / "resumed_elsewhere" / "comparison.csv").exists())
-                        write_time_grid(root, np.arange(8) * .2)
+                        write_time_grid(root/'Train' if divided else root, np.arange(8) * .2)
                         with self.assertRaisesRegex(ValueError, "checkpoint source.*incompatible"):
                             hp.run_hybrid(family, root / "head.json", run_dir=run)
                 if family != "gbdt_engineered":
@@ -271,11 +378,27 @@ class HybridIntegrationTests(unittest.TestCase):
                                     else any("not an unbiased" in n for n in notes))
 
     def test_original_m1_m2_training_supports_validation_only_evaluation(self):
+        self._check_original_evaluation(False)
+
+    def test_original_m1_m2_fusion_final_evaluation_uses_test_ids(self):
+        self._check_original_evaluation(True)
+
+    def test_original_sweep_selects_validation_winner_before_single_test_and_xai(self):
+        self._check_original_evaluation(True, alpha_sweep=True)
+
+    def test_original_sweep_can_select_pretrained_fusion_for_single_test_and_xai(self):
+        self._check_original_evaluation(True, alpha_sweep=True, baseline_wins=True)
+
+    def test_original_train_pipeline_and_independent_external_test_with_overlapping_ids(self):
+        self._check_original_evaluation(True, alpha_sweep=True, divided=True)
+
+    def _check_original_evaluation(self, test_enabled, alpha_sweep=False, baseline_wins=False, divided=False):
         from src import M2_PP_to_F as m2
         from src import Fusion_M1M2_WPred as original_fusion
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             root = Path(directory)
-            cfg, mc = fixture(root)
+            cfg, mc = divided_fixture(root) if divided else fixture(root)
+            cfg["evaluation"]["enabled"] = test_enabled
             cfg.update(model=mc, training=tiny_training(), mode="manual")
             cfg["preprocessing"].update(iqr_multiplier=1.5, remove_target_outliers=False)
             output = root / "M1"
@@ -289,12 +412,13 @@ class HybridIntegrationTests(unittest.TestCase):
             stack.enter_context(redirect_stdout(io.StringIO()))
             m1.run_experiment(cfg, "DOE1", "synthetic")
             metadata = read_json(output / "best_overall" / "best_metrics.json")
-            self.assertEqual(metadata["source"], "validation")
+            self.assertEqual(metadata["source"], ("final_test_1" if divided else "final_test") if test_enabled else "validation")
             self.assertIn("validation_MAE", metadata)
             second = {"data": {**cfg["data"], "features_csv": str(output / "best_overall" / "sensors_features_f.csv"),
                                "drop_cols": ["weight"]}, "preprocessing": cfg["preprocessing"],
                       "model": {"hidden_dims": [4], "dropout": 0.}, "training": tiny_training(),
-                      "mode": "manual", "evaluation": {"enabled": False},
+                      "mode": "manual", "evaluation": {"enabled": test_enabled,
+                          "test_2_dir": cfg['evaluation'].get('test_2_dir')},
                       "output": {"output_dir": str(root / "M2"), "run_best_dir": str(root / "M2" / "run_best"),
                                  "best_overall_dir": str(root / "M2" / "best_overall")}}
             write_json(root / "m2.json", second)
@@ -302,29 +426,127 @@ class HybridIntegrationTests(unittest.TestCase):
             stack.enter_context(patch('sys.argv', ['m2', '--material', 'DOE1']))
             m2.main()
             metadata = read_json(root / "M2" / "best_overall" / "best_metrics.json")
-            self.assertEqual(metadata["source"], "validation")
+            self.assertEqual(metadata["source"], ("final_test_1" if divided else "final_test") if test_enabled else "validation")
             self.assertIn("validation_NMAE", metadata)
             fusion_cfg = {"data": cfg["data"], "preprocessing": {"random_seed": 42},
                 "models": {"m1_best_dir": str(output / "best_overall"),
                            "m2_best_dir": str(root / "M2" / "best_overall")},
                 "output": {"output_base_dir": str(root / "Fusion")},
-                "evaluation": {"enabled": False}, "xai": {"enabled": False},
-                "finetuning": {"alpha": [0], "epochs": 1, "lr": .001,
+                "evaluation": {"enabled": test_enabled, "plots": False,
+                    "test_2_dir": cfg['evaluation'].get('test_2_dir')}, "xai": {"enabled": alpha_sweep},
+                "finetuning": {"alpha": [0, .5, 1] if alpha_sweep else [0], "epochs": 1, "lr": .001,
                                "batch_size": 8, "patience": 1, "val_fraction": None}}
             write_json(root / "config" / "ProBayes" / "Fusion_PP_config.json", fusion_cfg)
             stack.enter_context(patch.object(original_fusion, 'BASE_DIR', root))
             for name in ('_save_scatter', '_save_residuals_scatter', '_save_residuals_hist',
                          'save_batch_test_diagnostics'):
                 stack.enter_context(patch.object(original_fusion, name))
+            if alpha_sweep:
+                events = []
+                actual_train, actual_evaluate = original_fusion.finetune_m2, original_fusion.evaluate_fusion
+                active = {"alpha": None}
+                def train_alpha(*args, **kwargs):
+                    alpha = args[6]
+                    active["alpha"] = alpha
+                    events.append(("train", alpha))
+                    info = actual_train(*args, **kwargs)
+                    # Composite loss favors alpha=0; weight MAE must choose .5.
+                    info["best_val_loss"] = .1 if alpha == 0 else .9
+                    return info
+                def evaluate_alpha(model, X, y, device, partition="test"):
+                    events.append((partition, active["alpha"]))
+                    report = actual_evaluate(model, X, y, device, partition=partition)
+                    if partition == "validation":
+                        report["MAE"] = ({0.: .3, .5: .1, 1.: .2}[active["alpha"]]
+                                         if active["alpha"] is not None else .05 if baseline_wins else .4)
+                    return report
+                stack.enter_context(patch.object(original_fusion, 'finetune_m2', side_effect=train_alpha))
+                stack.enter_context(patch.object(original_fusion, 'evaluate_fusion', side_effect=evaluate_alpha))
+                xai = stack.enter_context(patch.object(original_fusion, 'run_fusion_xai'))
             with patch('sys.argv', ['fusion', '--material', 'PP']):
                 original_fusion.main()
-            reports = list((root / "Fusion").rglob("validation_predictions.csv"))
+            partition = internal_test_name(cfg['data']) if test_enabled else "validation"
+            reports = list((root / "Fusion").rglob(f"best_fusion/{partition}_predictions.csv"))
             self.assertEqual(len(reports), 1)
             predicted_ids = set(pd.read_csv(reports[0])["ID_Part"])
             contract = read_json(output / "best_overall" / "data_processing.json")
-            self.assertEqual(predicted_ids, set(contract["val_part_ids"]))
-            self.assertFalse(predicted_ids & set(contract["test_part_ids"]))
-            self.assertFalse(any(root.rglob("test_metrics.json")))
+            self.assertEqual(predicted_ids, set(contract["test_part_ids" if test_enabled else "val_part_ids"]))
+            self.assertFalse(predicted_ids & set(contract["val_part_ids" if test_enabled else "test_part_ids"]))
+            reconstruction_dir = reports[0].parent / 'm2_reconstruction'
+            reconstruction = read_json(reconstruction_dir / f'{partition}_metrics.json')
+            feature_predictions = pd.read_csv(reconstruction_dir / f'{partition}_feature_predictions.csv')
+            self.assertEqual(set(feature_predictions['ID_Part']), predicted_ids)
+            selected_m2 = read_json(reports[0].parent / 'm2_best_metrics.json')
+            self.assertAlmostEqual(selected_m2['mean_MAE'], reconstruction['mean_MAE'])
+            self.assertAlmostEqual(selected_m2['mean_NMAE'], reconstruction['mean_NMAE'])
+            fusion_metrics = read_json(reports[0].parent / f'{partition}_metrics.json')
+            self.assertAlmostEqual(fusion_metrics['feature_MAE'], reconstruction['mean_MAE'], places=5)
+            if not test_enabled:
+                self.assertFalse(any(root.rglob("test_metrics.json")))
+            if alpha_sweep:
+                best = reports[0].parent
+                selection = read_json(best / "selection.json")
+                self.assertEqual(selection["alpha"], None if baseline_wins else .5)
+                self.assertEqual(selection["candidate"], 'no_finetuning' if baseline_wins else 'alpha_0.5')
+                self.assertEqual(selection["fine_tuned"], not baseline_wins)
+                self.assertEqual(selection["n_alphas"], 3)
+                self.assertEqual(selection["n_candidates"], 4)
+                self.assertEqual(selection["selection_metric"], "validation_MAE")
+                self.assertFalse(selection["test_used_for_selection"])
+                self.assertEqual([event for event in events if event[0] == "train"],
+                                 [("train", 0.), ("train", .5), ("train", 1.)])
+                self.assertEqual(len([event for event in events if event[0] == "test"]), 1)
+                self.assertGreater(events.index(("test", 1.)), events.index(("train", 1.)))
+                self.assertEqual(len(list((root / "Fusion").rglob(f"{partition}_metrics.json"))), 2)
+                self.assertFalse(any(best.parent.glob("alpha_*/test*")))
+                self.assertFalse(any((best.parent / 'no_finetuning').glob('test*')))
+                baseline_predictions = pd.read_csv(best.parent / 'no_finetuning' / 'validation_predictions.csv')
+                self.assertEqual(set(baseline_predictions['ID_Part']), set(contract['val_part_ids']))
+                baseline_info = read_json(best.parent / 'no_finetuning' / 'finetuning_info.json')
+                self.assertFalse(baseline_info['enabled'])
+                self.assertEqual(baseline_info['epochs_run'], 0)
+                self.assertEqual(xai.call_count, 3 if divided else 2)
+                internal_call = xai.call_args_list[1]
+                self.assertEqual(internal_call.args[9], best/'xai'/partition)
+                self.assertEqual(set(internal_call.args[3]), set(contract["test_part_ids"]))
+                if divided:
+                    self.assertEqual(set(xai.call_args_list[2].args[3]), set(range(6)))
+                    self.assertEqual(pd.read_csv(best/'test_2_predictions.csv')['part_id'].tolist(), list(range(6)))
+                    self.assertEqual(pd.read_csv(output/'best_overall/test_2_predictions.csv')['part_id'].tolist(), list(range(6)))
+                    self.assertEqual(read_json(root/'M2/best_overall/test_2_metrics.json')['n_samples'], 6)
+                selected_state = torch.load(best / "fusion_model.pt", weights_only=True)
+                evaluated_state = xai.call_args.args[0].state_dict()
+                for key, value in selected_state.items():
+                    torch.testing.assert_close(value, evaluated_state[key])
+                with torch.inference_mode():
+                    selected_model = xai.call_args.args[0]
+                    selected_pp = torch.tensor(internal_call.args[2], dtype=torch.float32)
+                    _, selected_features = selected_model(selected_pp, selected_pp, return_features=True)
+                feature_columns = [name for name in feature_predictions.columns if name.endswith('_pred')]
+                sampled_predictions = pd.DataFrame(selected_features.numpy(), index=internal_call.args[3]).loc[feature_predictions['ID_Part']].to_numpy()
+                np.testing.assert_allclose(feature_predictions[feature_columns].to_numpy(), sampled_predictions,
+                                           rtol=1e-6, atol=1e-6)
+                comparison = pd.read_csv(best.parent / "alpha_comparison.csv")
+                self.assertEqual(comparison.loc[comparison["selected"], "candidate"].tolist(),
+                                 ['no_finetuning' if baseline_wins else 'alpha_0.5'])
+                self.assertEqual(set(comparison["source"]), {"validation"})
+                if baseline_wins:
+                    original_m2 = torch.load(root / 'M2' / 'best_overall' / 'best_model.pt', weights_only=True)
+                    restored_m2 = torch.load(best / 'm2_best_model.pt', weights_only=True)
+                    for key, value in original_m2.items():
+                        torch.testing.assert_close(value, restored_m2[key], rtol=0, atol=0)
+                    self.assertIsNone(read_json(best / f'{partition}_metrics.json')['composite_loss'])
+                    self.assertEqual(read_json(best / 'm2_best_metrics.json')['source'], 'fusion_pretrained')
+                from src.Utility.family_launcher import _original_comparison
+                _original_comparison(root, 'DOE1', 42)
+                combined = pd.read_csv(root / 'comparison.csv')
+                fusion_rows = combined.loc[combined['role'] == 'Fusion (PP only)']
+                self.assertEqual(len(fusion_rows), 6 if divided else 5)
+                self.assertEqual((fusion_rows['partition'] == partition).sum(), 1)
+                selected_validation = fusion_rows.loc[
+                    (fusion_rows['partition'] == 'validation') & (fusion_rows['selected'] == True)]
+                self.assertEqual(selected_validation['candidate'].tolist(),
+                                 ['no_finetuning' if baseline_wins else 'alpha_0.5'])
 
     def test_direct_pp_model_has_no_pp_parameters_and_ignores_pp_hpo(self):
         with tempfile.TemporaryDirectory() as directory:

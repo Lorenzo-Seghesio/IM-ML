@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
+from .dataset_layout import resolve_data_config, divided_dataset, training_data_identity
 
 from .group_splitting import (
     grouped_train_test_split, grouped_train_val_split, validate_group_disjoint,
@@ -32,6 +33,22 @@ def write_json(path, value):
 
 def resolve(path):
     return ROOT / path
+
+
+def split_provenance(cfg):
+    """Persist the identity of a mutable best-reference folder in each consumer."""
+    source = cfg.get("split", {}).get("source_dir")
+    if not source:
+        return None
+    source = resolve(source).resolve()
+    result = {"split_source_dir": str(source),
+              "split_sha256": file_hash(source / "data_processing.json")}
+    for parent in (source, *source.parents):
+        manifest = parent / "reference_run.json"
+        if manifest.is_file():
+            result.update(reference_run=read_json(manifest), reference_directory=str(parent))
+            break
+    return result
 
 
 def file_hash(path):
@@ -74,6 +91,7 @@ class HybridData:
 
 
 def load_data(cfg):
+    cfg = {**cfg, "data": resolve_data_config(cfg["data"])}
     data = cfg["data"]
     id_col = data["id_col"]
     scalar_path = resolve(data["scalar_csv"])
@@ -89,6 +107,8 @@ def load_data(cfg):
     ids = scalar.index
     for frame in frames:
         ids = ids[ids.isin(frame.index)]
+    if data.get("_dataset_partition") == "test_2" and len(ids) != len(scalar):
+        raise ValueError("Every external Test part must have all configured signal curves; refusing to drop test_2 rows")
     scalar = scalar.loc[ids]
     group_col = data.get("group_col")
     if not group_col or group_col not in scalar or not data.get("group_split", {}).get("enabled"):
@@ -115,7 +135,15 @@ def split_data(dataset, cfg, source_dir=None):
     group_cfg, edge_cfg = data["group_split"], data.get("edge_group_split", {})
     source = source_dir or cfg.get("split", {}).get("source_dir")
     if source:
-        contract = read_json(resolve(source) / "data_processing.json")
+        split_path = resolve(source) / "data_processing.json"
+        if not split_path.is_file():
+            raise FileNotFoundError(f"Authoritative split missing: {split_path}. Run the original family "
+                                    "with final Fusion testing enabled to create best_reference_run, "
+                                    "or configure split.source_dir with an existing compatible checkpoint.")
+        contract = read_json(split_path)
+        if divided_dataset(data) and contract.get("training_data_identity") != training_data_identity(data):
+            raise ValueError("Reference split/checkpoint belongs to a different training dataset. "
+                             "Run original on the current Train folder to create a compatible best_reference_run.")
         positions = {value: i for i, value in enumerate(dataset.ids.tolist())}
         result = []
         for key in ("train_part_ids", "val_part_ids", "test_part_ids"):
@@ -159,6 +187,9 @@ def split_data(dataset, cfg, source_dir=None):
                                                                 edge_cfg, group_cfg),
                 **{key: dataset.ids[index].tolist() for key, index in zip(
                     ("train_part_ids", "val_part_ids", "test_part_ids"), (train, val, test))}}
+    if divided_dataset(data):
+        contract["training_data_identity"] = training_data_identity(data)
+        contract["id_namespace"] = "Train"
     return (train, val, test), contract
 
 

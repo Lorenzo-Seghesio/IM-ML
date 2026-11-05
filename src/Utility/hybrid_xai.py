@@ -13,12 +13,12 @@ def run_xai(predictor, training_pp, explain_pp, part_ids, directory, cfg, materi
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    background_count = min(int(cfg.get("background_samples", 30)), len(training_pp))
-    count = min(int(cfg.get("explain_samples", 40)), len(explain_pp))
+    background_count = len(training_pp) if cfg.get("preselected") else min(int(cfg.get("background_samples", 30)), len(training_pp))
+    count = len(explain_pp) if cfg.get("preselected") else min(int(cfg.get("explain_samples", 40)), len(explain_pp))
     if min(background_count, count) <= 0:
         raise ValueError("XAI sample counts must be positive")
-    bg = training_pp[rng.choice(len(training_pp), background_count, replace=False)]
-    selected = rng.choice(len(explain_pp), count, replace=False)
+    bg = training_pp if cfg.get("preselected") else training_pp[rng.choice(len(training_pp), background_count, replace=False)]
+    selected = np.arange(count) if cfg.get("preselected") else rng.choice(len(explain_pp), count, replace=False)
     x, ids = explain_pp[selected], np.asarray(part_ids)[selected]
     # SHAP maskers need finite background data. Imputation statistics are training-only.
     pp_imp = predictor.m2_preprocessing["pp_imputer"]
@@ -42,6 +42,7 @@ def run_xai(predictor, training_pp, explain_pp, part_ids, directory, cfg, materi
                             nsamples=nsamples, l1_reg=cfg.get("l1_reg", 0)))
         split_summary = plots.build_summary(predictor.pp_names, values, None, None, n)
         split_summary.to_csv(directory / "feature_attributions.csv")
+        split_summary.join(summary).to_csv(directory / "feature_attributions_comparison.csv")
         columns = [f"indirect__{name}" for name in predictor.pp_names] + [f"direct__{name}" for name in predictor.pp_names]
         pd.DataFrame(values, index=ids, columns=columns).to_csv(directory / "shap_values.csv", index_label="part_id")
         plots._bar_direct_indirect(np.abs(values[:, :n]).mean(axis=0), np.abs(values[:, n:]).mean(axis=0),
