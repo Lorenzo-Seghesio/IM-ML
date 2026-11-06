@@ -14,8 +14,12 @@ The default config selects original, gbdt_pppt, gbdt_ppdirect_pt and
 gbdt_engineered with models.<family>.enabled/n_runs. Each count is one complete
 sequential repetition. Architecture/HPO/training/testing remain in each model's
 own configuration. See docs/xgboost_hybrid_pipeline.md. --dry-run previews work.
-models.original.n_m1_run_per_pipeline_run controls how many M1 launches finish
-before the single M2/Fusion stages in each original repetition (default: 1).
+models.original.n_m1_run_per_pipeline_run, n_m2_run_per_pipeline_run and
+n_fusion_run_per_pipeline_run control stage launches (default: 1). Zero skips
+training and copies required parents from best_reference_run. M2-only results
+stay separate; only requested Fusion runs can update the reference snapshot.
+data_split.seed and data_split.seed_step choose fixed or changing final splits
+across repetitions. Reused models retain their saved split contracts.
 
 Legacy pipeline configurations also support:
   - n_runs_m1          : how many times M1 is launched per material

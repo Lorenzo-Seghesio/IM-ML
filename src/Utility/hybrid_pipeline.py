@@ -186,7 +186,7 @@ def _write_comparison(rows, run_dir, family, material, seed, provenance):
 
 
 def run_hybrid(family, config_path, material="DOE1", run_dir=None, seed=None,
-               optuna_seed=None, stages=("m1", "xgboost", "m2", "fusion")):
+               optuna_seed=None, stages=("m1", "xgboost", "m2", "fusion"), split_seed=None):
     if family not in FAMILIES:
         raise ValueError(f"Unknown hybrid family: {family}")
     cfg = read_json(config_path)
@@ -195,6 +195,8 @@ def run_hybrid(family, config_path, material="DOE1", run_dir=None, seed=None,
         raise ValueError("Model configuration family differs from the requested entry point")
     seed = int(seed if seed is not None else cfg["preprocessing"]["random_seed"])
     cfg["preprocessing"]["random_seed"] = seed
+    if split_seed is not None:
+        cfg["preprocessing"]["split_seed"] = split_seed
     if optuna_seed is not None:
         cfg.setdefault("optuna", {})["sampler_seed"] = optuna_seed
     run_dir = Path(run_dir) if run_dir else resolve(cfg["output"]["output_dir"]) / "runs" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")
@@ -225,6 +227,8 @@ def run_hybrid(family, config_path, material="DOE1", run_dir=None, seed=None,
     if family != "gbdt_engineered":
         if teacher_settings.get("train", False):
             teacher_cfg = _load_model_config(teacher_settings["config"], seed, optuna_seed)
+            if split_seed is not None:
+                teacher_cfg["preprocessing"]["split_seed"] = split_seed
             if teacher_cfg["data"] != cfg["data"]:
                 raise ValueError("Teacher and hybrid data configurations must match")
             expected_direct = family == "gbdt_ppdirect_pt"

@@ -18,9 +18,9 @@ same pretrained checkpoint and seed. M1's saved train/validation split is
 reused unless finetuning.val_fraction requests a new split of development data;
 early stopping selects the fine-tuned epoch with the lowest validation
 composite loss. After all alphas finish, the lowest validation weight MAE
-selects between unchanged pretrained Fusion and the fine-tuned alphas. Only
-that checkpoint is evaluated on test data and passed through XAI, under
-best_fusion/. The pretrained candidate is saved under no_finetuning/.
+selects between unchanged pretrained Fusion and the fine-tuned alphas. Every
+candidate then receives test evaluation and XAI in its own folder, including
+no_finetuning/. best_fusion/ copies the complete validation winner.
 
 Configure a scalar or list in finetuning.alpha in the Fusion JSON config,
 or pass --alpha 0 0.1 0.25 0.5 0.75 0.9 1. Fine-tuning settings are
@@ -95,7 +95,7 @@ predictions and plots, and finetuning_info.json with enabled=false and alpha=nul
 It is eligible for selection alongside every alpha. Ties favor no fine-tuning.
 
 best_fusion/ contains a copy of the winner and its validation artifacts,
-selection.json, and is the only folder with final test and XAI outputs:
+selection.json. Each candidate folder also contains final test and XAI outputs:
   m2_pretrained_best_model.pt    Original M2 checkpoint for reference
   test_feature_metrics.csv       Held-out MAE per M1 extracted feature
   test_feature_predictions.csv   Held-out feature targets and predictions
@@ -2213,6 +2213,10 @@ def parse_args():
     p.add_argument("--m2-dir", default=None,
                    help="Path to M2 best_overall dir "
                         "(default: outputs/[dataset]/ProBayes/M2/{material}/best_overall)")
+    p.add_argument("--evaluate-run", type=Path, default=None,
+                   help="Recompute tests and XAI for every checkpoint in an existing sweep; no training")
+    p.add_argument("--pretrained-only", action="store_true",
+                   help="Evaluate unchanged M1+M2 without fine-tuning")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--val-fraction", type=float, default=None,
                    help="Fine-tuning validation fraction of M1 dev data; overrides "
@@ -2261,13 +2265,21 @@ def main():
         if "--" + option.replace("_", "-") not in sys.argv and option in cfg.get("xai", {}):
             setattr(args, option, cfg["xai"][option])
     alphas, finetuning_settings = resolve_finetuning(cfg, args)
+    saved_sweep = None
+    if args.evaluate_run:
+        saved_sweep = json.loads((args.evaluate_run / "sweep_config.json").read_text())
+        SEED = saved_sweep["seed"]
+        alphas = saved_sweep["alpha"]
+        finetuning_settings = saved_sweep["finetuning"]
+    if args.pretrained_only:
+        alphas = []
     VAL_FR = finetuning_settings["val_fraction"]
 
     # ── Resolve model directories ──────────────────────────────────────────
     m1_dir = Path(args.m1_dir) if args.m1_dir else \
-             BASE_DIR / cfg.get("models", {}).get("m1_best_dir", f"outputs/ProBayes/M1/{MAT}/best_overall")
+             Path(saved_sweep["m1_dir"]) if saved_sweep else BASE_DIR / cfg.get("models", {}).get("m1_best_dir", f"outputs/ProBayes/M1/{MAT}/best_overall")
     m2_dir = Path(args.m2_dir) if args.m2_dir else \
-             BASE_DIR / cfg.get("models", {}).get("m2_best_dir", f"outputs/ProBayes/M2/{MAT}/best_overall")
+             Path(saved_sweep["m2_dir"]) if saved_sweep else BASE_DIR / cfg.get("models", {}).get("m2_best_dir", f"outputs/ProBayes/M2/{MAT}/best_overall")
 
     for label, d in [("M1 dir", m1_dir), ("M2 dir", m2_dir)]:
         if not d.is_dir():
@@ -2279,10 +2291,22 @@ def main():
     # ── M1 ↔ M2 coherence check (before any output is created) ───────────
     _check_m1_m2_coherence(m1_dir, m2_dir)
 
+    if saved_sweep:
+        # Saved checkpoints must be restored against their original parents.
+        for label, directory in (("m1", m1_dir), ("m2", m2_dir)):
+            original = Path(saved_sweep[f"{label}_dir"])
+            if original.exists():
+                for filename in ("best_model.pt", "best_metrics.json"):
+                    if (original / filename).read_bytes() != (directory / filename).read_bytes():
+                        raise ValueError(f"{label.upper()} differs from the parent of the saved sweep")
+
     # ── Output directory ───────────────────────────────────────────────────
     out_base = cfg.get("output", {}).get("output_base_dir", "outputs/ProBayes/Fusion")
-    run_dir = BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir = args.evaluate_run.resolve() if args.evaluate_run else BASE_DIR / out_base / f"{RUN_TS}_{MAT}"
+    if args.evaluate_run:
+        RUN_TS = run_dir.name.removesuffix(f"_{MAT}")
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
     print(f"  Output : {run_dir}\n")
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2511,25 +2535,30 @@ def main():
                   "train_part_ids": part_ids_m1[train_idx].tolist(),
                   "val_part_ids": part_ids_m1[val_idx].tolist(),
                   "test_part_ids": part_ids_m1[test_idx_m1].tolist()}
-    (run_dir / "finetuning_split.json").write_text(json.dumps(split_info, indent=2))
-    print(f"  Fine-tuning split ({split_source}): train={len(train_idx)}  "
-          f"val={len(val_idx)} ({len(val_idx) / len(dev_idx_m1):.1%} of dev)  "
-          f"test={len(test_idx_m1)}")
-    (run_dir / "sweep_config.json").write_text(json.dumps({
-        "alpha": alphas, "finetuning": finetuning_settings, "seed": SEED,
-        "m1_dir": str(m1_dir), "m2_dir": str(m2_dir),
-        "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx_m1),
-    }, indent=2))
-    selection, tuning_info = train_alpha_sweep(
-        fusion, X_pp_m1, y_m1, feature_targets, train_idx, val_idx, alphas,
-        finetuning_settings, SEED, device, run_dir, part_ids_m1, m1_groups,
-        material=MAT, plots=cfg.get("evaluation", {}).get("plots", True))
-    alpha = selection["alpha"]
-    out_dir = run_dir / "best_fusion"
+    if args.evaluate_run:
+        saved_split = json.loads((run_dir / "finetuning_split.json").read_text())
+        for key in ("train_part_ids", "val_part_ids", "test_part_ids"):
+            if saved_split[key] != split_info[key]:
+                raise ValueError(f"Saved Fusion {key} differs from the current split")
+        selection = json.loads((run_dir / "best_alpha_selection.json").read_text())
+    else:
+        (run_dir / "finetuning_split.json").write_text(json.dumps(split_info, indent=2))
+        print(f"  Fine-tuning split ({split_source}): train={len(train_idx)}  "
+              f"val={len(val_idx)} ({len(val_idx) / len(dev_idx_m1):.1%} of dev)  "
+              f"test={len(test_idx_m1)}")
+        (run_dir / "sweep_config.json").write_text(json.dumps({
+            "alpha": alphas, "finetuning": finetuning_settings, "seed": SEED,
+            "m1_dir": str(m1_dir), "m2_dir": str(m2_dir),
+            "n_train": len(train_idx), "n_val": len(val_idx), "n_test": len(test_idx_m1),
+        }, indent=2))
+        selection, tuning_info = train_alpha_sweep(
+            fusion, X_pp_m1, y_m1, feature_targets, train_idx, val_idx, alphas,
+            finetuning_settings, SEED, device, run_dir, part_ids_m1, m1_groups,
+            material=MAT, plots=cfg.get("evaluation", {}).get("plots", True))
     test_enabled = cfg.get("evaluation", {}).get("enabled", True)
     eval_idx = test_idx_m1 if test_enabled else val_idx
     eval_partition = "test" if test_enabled else "validation"
-    # Run final evaluation and XAI only after all alphas have been ranked.
+    # All candidates are evaluated only after validation selection is fixed.
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -2538,207 +2567,241 @@ def main():
     print(f"  MergeHead input = n_f + pp_latent_dim = "
           f"{n_f} + {m1_model.pp_latent_dim} = {n_f + m1_model.pp_latent_dim}")
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 6 — Evaluate on test set
-    # ══════════════════════════════════════════════════════════════════════
-    print(f"\n── Step 6: Selected Fusion {eval_partition} evaluation ──────────")
-    X_test   = X_pp_m1[eval_idx]
-    y_test   = y_m1[eval_idx]
-    ids_test = part_ids_m1[eval_idx]
+    def evaluate_candidate(out_dir, selection, tuning_info):
+        alpha = selection["alpha"]
+        from src.Utility.external_evaluation import clear_test_2_artifacts
+        clear_test_2_artifacts(out_dir)
+        for path in list(out_dir.glob("test*")) + list(out_dir.glob("*test_1.png")):
+            if path.is_file():
+                path.unlink()
+        for name in ("xai", "m2_reconstruction"):
+            if (out_dir / name).exists():
+                shutil.rmtree(out_dir / name)
+        torch.manual_seed(SEED)
+        np.random.seed(SEED)
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 6 — Evaluate on test set
+        # ══════════════════════════════════════════════════════════════════════
+        print(f"\n── Step 6: Fusion candidate {eval_partition} evaluation ──────────")
+        X_test   = X_pp_m1[eval_idx]
+        y_test   = y_m1[eval_idx]
+        ids_test = part_ids_m1[eval_idx]
 
-    X_dev    = X_pp_m1[dev_idx_m1]
+        X_dev    = X_pp_m1[dev_idx_m1]
 
-    metrics = evaluate_fusion(fusion, X_test, y_test, device, partition=eval_partition)
-    preds   = metrics.pop("pred")
-    metrics["source"] = "final_test" if test_enabled else "validation"
-    metrics.update(alpha=alpha, validation_MAE=selection["validation_MAE"],
-                   candidate=selection["candidate"], fine_tuned=selection["fine_tuned"],
-                   alpha_selection_metric="validation_MAE")
-    if m1_groups is not None:
-        metrics.update(test_point_metrics(y_test, preds, m1_groups[eval_idx]))
+        metrics = evaluate_fusion(fusion, X_test, y_test, device, partition=eval_partition)
+        preds   = metrics.pop("pred")
+        metrics["source"] = "final_test" if test_enabled else "validation"
+        metrics.update(alpha=alpha, validation_MAE=selection["validation_MAE"],
+                       candidate=selection["candidate"], fine_tuned=selection["fine_tuned"],
+                       alpha_selection_metric="validation_MAE")
+        if m1_groups is not None:
+            metrics.update(test_point_metrics(y_test, preds, m1_groups[eval_idx]))
 
-    with torch.no_grad():
-        test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
-        _, pred_features = fusion(test_pp, test_pp, return_features=True)
-    pred_features = pred_features.cpu().numpy()
-    true_features = feature_targets[eval_idx]
-    per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
-    feature_mae = float(per_feature_mae.mean())
-    metrics["feature_MAE"] = feature_mae
-    metrics["composite_loss"] = (alpha * metrics["MAE"] + (1-alpha) * feature_mae
-                                 if alpha is not None else None)
-    pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
-        out_dir / f"{eval_partition}_feature_metrics.csv", index=False)
-    feature_predictions = pd.DataFrame({"ID_Part": ids_test})
-    for i, name in enumerate(m2_f_cols):
-        feature_predictions[f"{name}_true"] = true_features[:, i]
-        feature_predictions[f"{name}_pred"] = pred_features[:, i]
-    feature_predictions.to_csv(out_dir / f"{eval_partition}_feature_predictions.csv", index=False)
+        with torch.no_grad():
+            test_pp = torch.as_tensor(X_test, dtype=torch.float32, device=device)
+            _, pred_features = fusion(test_pp, test_pp, return_features=True)
+        pred_features = pred_features.cpu().numpy()
+        true_features = feature_targets[eval_idx]
+        per_feature_mae = np.abs(pred_features - true_features).mean(axis=0)
+        feature_mae = float(per_feature_mae.mean())
+        metrics["feature_MAE"] = feature_mae
+        metrics["composite_loss"] = (alpha * metrics["MAE"] + (1-alpha) * feature_mae
+                                     if alpha is not None else None)
+        pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
+            out_dir / f"{eval_partition}_feature_metrics.csv", index=False)
+        feature_predictions = pd.DataFrame({"ID_Part": ids_test})
+        for i, name in enumerate(m2_f_cols):
+            feature_predictions[f"{name}_true"] = true_features[:, i]
+            feature_predictions[f"{name}_pred"] = pred_features[:, i]
+        feature_predictions.to_csv(out_dir / f"{eval_partition}_feature_predictions.csv", index=False)
 
-    # Diagnose the restored winner's M2 on the same held-out parts as its weight head.
-    reconstruction = save_fusion_reconstruction(
-        true_features, pred_features, m2_f_cols, ids_test,
-        m1_groups[eval_idx] if m1_groups is not None else None, out_dir, MAT,
-        partition=eval_partition, target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(),
-        plots=cfg.get("evaluation", {}).get("plots", True))
-    metrics.update(feature_NMAE=reconstruction["mean_NMAE"],
-                   feature_RMSE=reconstruction["mean_RMSE"], feature_R2=reconstruction["mean_R2"])
+        # Diagnose the restored winner's M2 on the same held-out parts as its weight head.
+        reconstruction = save_fusion_reconstruction(
+            true_features, pred_features, m2_f_cols, ids_test,
+            m1_groups[eval_idx] if m1_groups is not None else None, out_dir, MAT,
+            partition=eval_partition, target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(),
+            plots=cfg.get("evaluation", {}).get("plots", True))
+        metrics.update(feature_NMAE=reconstruction["mean_NMAE"],
+                       feature_RMSE=reconstruction["mean_RMSE"], feature_R2=reconstruction["mean_R2"])
 
-    # Save test predictions + metrics
-    pd.DataFrame({
-        "ID_Part": ids_test,
-        "y_true":  y_test,
-        "y_pred":  preds,
-    }).to_csv(out_dir / f"{eval_partition}_predictions.csv", index=False)
-    (out_dir / f"{eval_partition}_metrics.json").write_text(json.dumps(metrics, indent=2))
+        # Save test predictions + metrics
+        pd.DataFrame({
+            "ID_Part": ids_test,
+            "y_true":  y_test,
+            "y_pred":  preds,
+        }).to_csv(out_dir / f"{eval_partition}_predictions.csv", index=False)
+        (out_dir / f"{eval_partition}_metrics.json").write_text(json.dumps(metrics, indent=2))
 
-    # Prediction plots
-    _save_scatter(y_test, preds, metrics,
-                  out_dir / f"scatter_{eval_partition}.png", MAT)
-    _save_residuals_scatter(y_test, preds,
-                            out_dir / f"residuals_scatter_{eval_partition}.png", MAT)
-    _save_residuals_hist(y_test, preds,
-                         out_dir / f"residuals_hist_{eval_partition}.png", MAT)
-    save_batch_test_diagnostics(
-        y_test, preds,
-        m1_groups[eval_idx] if m1_groups is not None else None,
-        ids_test, out_dir,
-        target_names=[target_col],
-        title=f"[{MAT} | Fusion] {eval_partition.title()} evaluation",
-        partition=eval_partition,
-    )
-    print(f"  {eval_partition.title()} plots saved → {out_dir}")
+        # Prediction plots
+        _save_scatter(y_test, preds, metrics,
+                      out_dir / f"scatter_{eval_partition}.png", MAT)
+        _save_residuals_scatter(y_test, preds,
+                                out_dir / f"residuals_scatter_{eval_partition}.png", MAT)
+        _save_residuals_hist(y_test, preds,
+                             out_dir / f"residuals_hist_{eval_partition}.png", MAT)
+        save_batch_test_diagnostics(
+            y_test, preds,
+            m1_groups[eval_idx] if m1_groups is not None else None,
+            ids_test, out_dir,
+            target_names=[target_col],
+            title=f"[{MAT} | Fusion] {eval_partition.title()} evaluation",
+            partition=eval_partition,
+        )
+        print(f"  {eval_partition.title()} plots saved → {out_dir}")
 
-    from src.Utility.dataset_layout import internal_test_name, label_test_1
-    from src.Utility.external_evaluation import external_dataset, save_weight_evaluation
-    from src.Utility.hybrid_models import FrozenTeacher
-    external = external_dataset({**cfg, "data": json.loads((m1_dir / "configuration.json").read_text())["data"]}) if test_enabled else None
-    if external is not None:
-        if [doe1_column_name(c) for c in external.pp_names] != [doe1_column_name(c) for c in pp_cols]:
-            raise ValueError("test_2 PP feature order differs from selected Fusion")
-        with torch.inference_mode():
-            xp = torch.as_tensor(external.pp, dtype=torch.float32, device=device)
-            external_weights, external_features = fusion(xp, xp, return_features=True)
-        report_2 = save_weight_evaluation(out_dir, "test_2", external, external_weights.cpu().numpy(),
-                                          "Selected original Fusion", cfg.get("evaluation", {}).get("plots", True))
-        # Product IDs restart in Test: generate its targets from its own curves.
-        external_truth = FrozenTeacher.load(m1_dir).sensor_features(external.curves)[:, f_positions]
-        reconstruction_2 = save_fusion_reconstruction(external_truth, external_features.cpu().numpy(),
-            m2_f_cols, external.ids, external.groups, out_dir, MAT, partition="test_2",
-            target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(), plots=cfg.get("evaluation", {}).get("plots", True))
-        report_2.update(feature_MAE=reconstruction_2["mean_MAE"], feature_NMAE=reconstruction_2["mean_NMAE"])
-        (out_dir / "test_2_metrics.json").write_text(json.dumps(report_2, indent=2))
-        (out_dir / "test_2_dataset.json").write_text(json.dumps({"namespace": "test_2",
-            "data": external.config["data"], "data_fingerprint": external.digest,
-            "part_ids": external.ids.tolist(), "n_samples": len(external.ids), "used_in_training": False}, indent=2))
+        from src.Utility.dataset_layout import internal_test_name, label_test_1
+        from src.Utility.external_evaluation import external_dataset, save_weight_evaluation
+        from src.Utility.hybrid_models import FrozenTeacher
+        external = external_dataset({**cfg, "data": json.loads((m1_dir / "configuration.json").read_text())["data"]}) if test_enabled else None
+        if external is not None:
+            if [doe1_column_name(c) for c in external.pp_names] != [doe1_column_name(c) for c in pp_cols]:
+                raise ValueError("test_2 PP feature order differs from selected Fusion")
+            with torch.inference_mode():
+                xp = torch.as_tensor(external.pp, dtype=torch.float32, device=device)
+                external_weights, external_features = fusion(xp, xp, return_features=True)
+            report_2 = save_weight_evaluation(out_dir, "test_2", external, external_weights.cpu().numpy(),
+                                              "Original Fusion candidate", cfg.get("evaluation", {}).get("plots", True))
+            # Product IDs restart in Test: generate its targets from its own curves.
+            external_truth = FrozenTeacher.load(m1_dir).sensor_features(external.curves)[:, f_positions]
+            reconstruction_2 = save_fusion_reconstruction(external_truth, external_features.cpu().numpy(),
+                m2_f_cols, external.ids, external.groups, out_dir, MAT, partition="test_2",
+                target_scale=fusion.m2_y_sc.scale_.detach().cpu().numpy(), plots=cfg.get("evaluation", {}).get("plots", True))
+            report_2.update(feature_MAE=reconstruction_2["mean_MAE"], feature_NMAE=reconstruction_2["mean_NMAE"])
+            (out_dir / "test_2_metrics.json").write_text(json.dumps(report_2, indent=2))
+            (out_dir / "test_2_dataset.json").write_text(json.dumps({"namespace": "test_2",
+                "data": external.config["data"], "data_fingerprint": external.digest,
+                "part_ids": external.ids.tolist(), "n_samples": len(external.ids), "used_in_training": False}, indent=2))
 
-    if cfg.get("xai", {}).get("enabled", True):
-        from src.Utility.fusion_xai_sampling import scoped_fusion_xai
-        groups = m1_groups if m1_groups is not None else np.zeros(len(X_pp_m1), dtype=int)
-        domains = [("train", X_pp_m1, part_ids_m1, groups)]
-        internal_name = internal_test_name(cfg["data"])
+        if cfg.get("xai", {}).get("enabled", True):
+            from src.Utility.fusion_xai_sampling import scoped_fusion_xai
+            groups = m1_groups if m1_groups is not None else np.zeros(len(X_pp_m1), dtype=int)
+            domains = [("train", X_pp_m1, part_ids_m1, groups)]
+            internal_name = internal_test_name(cfg["data"])
+            if test_enabled:
+                domains.append((internal_name, X_test, ids_test, groups[eval_idx]))
+                if external is not None:
+                    domains.append(("test_2", external.pp, external.ids, external.groups))
+            def explain(background, values, ids, destination, partition):
+                run_fusion_xai(fusion, background, values, ids, pp_cols, n_f,
+                    f_positions, args, device, destination, f"{MAT} | {partition}", shap_only=partition != internal_name)
+            scoped_fusion_xai(explain, X_pp_m1[train_idx], groups[train_idx], domains,
+                out_dir / "xai", {**cfg.get("xai", {}), "shap_bg": args.shap_bg}, SEED)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Step 14 — Copy model files; save fusion info
+        # ══════════════════════════════════════════════════════════════════════
+        print("\n── Step 14: Saving model copies & fusion info ──────────────")
+        for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
+            for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2_pretrained")]:
+                src = src_dir / fname
+                if src.exists():
+                    shutil.copy2(src, out_dir / f"{prefix}_{fname}")
+
+        # Retain the selected M2 architecture and identify whether it was fine-tuned.
+        tuned_meta = {**m2_meta, "source": "fusion_finetuning" if selection["fine_tuned"] else "fusion_pretrained",
+                      "finetuning": tuning_info,
+                      "pretrained_metrics": {k: v for k, v in m2_meta.items()
+                                             if k.startswith("mean_") or k == "per_target"}}
+        if selection["fine_tuned"]:
+            for key in ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target"):
+                tuned_meta.pop(key, None)
+        tuned_meta.update({key: reconstruction[key] for key in
+            ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target")})
+        tuned_meta["reconstruction_evaluation"] = reconstruction
+        (out_dir / "m2_best_metrics.json").write_text(json.dumps(tuned_meta, indent=2))
+
+        # Also save the consumed M1 sensor-feature table for reference.
+        src_feat = _m1_features_path(m1_dir)
+        shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
+
+        # Save test data
+        df_test_data = df_m1.iloc[eval_idx].copy()
+        df_test_data["y_pred"] = preds
+        df_test_data.to_csv(out_dir / f"{eval_partition}_data_with_pred.csv")
+
+        # Fusion model info JSON
+        info = {
+            "alpha": alpha,
+            "finetuning": tuning_info,
+            "alpha_selection": selection,
+            "material":     MAT,
+            "run_ts":       RUN_TS,
+            "m1_run_ts":    m1_run_ts,
+            "edge_group_split": effective_edge_policy,
+            "device":       str(device),
+            "m1_dir":       str(m1_dir),
+            "m2_dir":       str(m2_dir),
+            "n_pp":         n_pp,
+            "n_f":          n_f,
+            "f_positions":  f_positions,
+            "m2_f_cols":    m2_f_cols,
+            "pp_cols":      pp_cols,
+            f"{eval_partition}_metrics": metrics,
+            "evaluation_partition": eval_partition,
+            "n_test":       int(len(test_idx_m1)),
+            "n_dev":        int(len(dev_idx_m1)),
+            "seed":         SEED,
+            "val_fraction": VAL_FR,
+            "val_fraction_achieved": split_info["val_fraction_achieved"],
+            "split_source": split_source,
+            "n_ig_steps":   args.n_ig_steps,
+            "ih_samples":   args.ih_samples,
+            "shap_bg":      args.shap_bg,
+            "eg_bg":        args.eg_bg,
+            "m1_model_cfg": m1_cfg,
+            "m2_model_cfg": m2_cfg,
+            "m1_metrics":   {k: v for k, v in m1_meta.items()
+                             if k not in ("model_cfg",)},
+            "m2_metrics":   {k: v for k, v in m2_meta.items()
+                             if k not in ("model_cfg",)},
+            "m2_reconstruction_metrics": reconstruction,
+            "scaler_info": {
+                "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
+                "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
+                "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
+                "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
+                "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
+                "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
+            },
+        }
+        if external is not None:
+            info["test_2_metrics"] = report_2
+            info["m2_reconstruction_test_2_metrics"] = reconstruction_2
+        if test_enabled and internal_test_name(cfg["data"]) == "test_1":
+            info["test_1_metrics"] = info.pop("test_metrics")
+            info["evaluation_partition"] = "test_1"
+        (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
         if test_enabled:
-            domains.append((internal_name, X_test, ids_test, groups[eval_idx]))
-            if external is not None:
-                domains.append(("test_2", external.pp, external.ids, external.groups))
-        def explain(background, values, ids, destination, partition):
-            run_fusion_xai(fusion, background, values, ids, pp_cols, n_f,
-                f_positions, args, device, destination, f"{MAT} | {partition}", shap_only=partition != internal_name)
-        scoped_fusion_xai(explain, X_pp_m1[train_idx], groups[train_idx], domains,
-            out_dir / "xai", {**cfg.get("xai", {}), "shap_bg": args.shap_bg}, SEED)
+            label_test_1(out_dir, cfg["data"])
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 14 — Copy model files; save fusion info
-    # ══════════════════════════════════════════════════════════════════════
-    print("\n── Step 14: Saving model copies & fusion info ──────────────")
-    for fname in ["best_model.pt", "best_metrics.json", "hpo_best_config.json"]:
-        for src_dir, prefix in [(m1_dir, "m1"), (m2_dir, "m2_pretrained")]:
-            src = src_dir / fname
-            if src.exists():
-                shutil.copy2(src, out_dir / f"{prefix}_{fname}")
+        print(f"\n{'═'*60}")
+        print(f"  All outputs saved → {out_dir}")
+        print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
+        print(f"  Fusion R²   = {metrics['R2']:.4f}")
+        print(f"{'═'*60}\n")
 
-    # Retain the selected M2 architecture and identify whether it was fine-tuned.
-    tuned_meta = {**m2_meta, "source": "fusion_finetuning" if selection["fine_tuned"] else "fusion_pretrained",
-                  "finetuning": tuning_info,
-                  "pretrained_metrics": {k: v for k, v in m2_meta.items()
-                                         if k.startswith("mean_") or k == "per_target"}}
-    if selection["fine_tuned"]:
-        for key in ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target"):
-            tuned_meta.pop(key, None)
-    tuned_meta.update({key: reconstruction[key] for key in
-        ("mean_MAE", "mean_NMAE", "mean_RMSE", "mean_R2", "mean_MSE", "per_target")})
-    tuned_meta["reconstruction_evaluation"] = reconstruction
-    (out_dir / "m2_best_metrics.json").write_text(json.dumps(tuned_meta, indent=2))
-
-    # Also save the consumed M1 sensor-feature table for reference.
-    src_feat = _m1_features_path(m1_dir)
-    shutil.copy2(src_feat, out_dir / "sensors_features_f.csv")
-
-    # Save test data
-    df_test_data = df_m1.iloc[eval_idx].copy()
-    df_test_data["y_pred"] = preds
-    df_test_data.to_csv(out_dir / f"{eval_partition}_data_with_pred.csv")
-
-    # Fusion model info JSON
-    info = {
-        "alpha": alpha,
-        "finetuning": tuning_info,
-        "alpha_selection": selection,
-        "material":     MAT,
-        "run_ts":       RUN_TS,
-        "m1_run_ts":    m1_run_ts,
-        "edge_group_split": effective_edge_policy,
-        "device":       str(device),
-        "m1_dir":       str(m1_dir),
-        "m2_dir":       str(m2_dir),
-        "n_pp":         n_pp,
-        "n_f":          n_f,
-        "f_positions":  f_positions,
-        "m2_f_cols":    m2_f_cols,
-        "pp_cols":      pp_cols,
-        f"{eval_partition}_metrics": metrics,
-        "evaluation_partition": eval_partition,
-        "n_test":       int(len(test_idx_m1)),
-        "n_dev":        int(len(dev_idx_m1)),
-        "seed":         SEED,
-        "val_fraction": VAL_FR,
-        "val_fraction_achieved": split_info["val_fraction_achieved"],
-        "split_source": split_source,
-        "n_ig_steps":   args.n_ig_steps,
-        "ih_samples":   args.ih_samples,
-        "shap_bg":      args.shap_bg,
-        "eg_bg":        args.eg_bg,
-        "m1_model_cfg": m1_cfg,
-        "m2_model_cfg": m2_cfg,
-        "m1_metrics":   {k: v for k, v in m1_meta.items()
-                         if k not in ("model_cfg",)},
-        "m2_metrics":   {k: v for k, v in m2_meta.items()
-                         if k not in ("model_cfg",)},
-        "m2_reconstruction_metrics": reconstruction,
-        "scaler_info": {
-            "m1_pp_sc_data_min":   m1_pp_sc.data_min_.tolist(),
-            "m1_pp_sc_data_max":   m1_pp_sc.data_max_.tolist(),
-            "m2_x_sc_data_min":    m2_x_sc.data_min_.tolist(),
-            "m2_x_sc_data_max":    m2_x_sc.data_max_.tolist(),
-            "m2_y_sc_data_min":    m2_y_sc.data_min_.tolist(),
-            "m2_y_sc_data_max":    m2_y_sc.data_max_.tolist(),
-        },
-    }
-    if external is not None:
-        info["test_2_metrics"] = report_2
-        info["m2_reconstruction_test_2_metrics"] = reconstruction_2
-    if test_enabled and internal_test_name(cfg["data"]) == "test_1":
-        info["test_1_metrics"] = info.pop("test_metrics")
-        info["evaluation_partition"] = "test_1"
-    (out_dir / "fusion_model_info.json").write_text(json.dumps(info, indent=2))
-    if test_enabled:
-        label_test_1(out_dir, cfg["data"])
-
-    print(f"\n{'═'*60}")
-    print(f"  All outputs saved → {out_dir}")
-    print(f"  Fusion MAE  = {metrics['MAE']:.4f} g")
-    print(f"  Fusion R²   = {metrics['R2']:.4f}")
-    print(f"{'═'*60}\n")
+    winner = selection.copy()
+    candidates = [run_dir / "no_finetuning", *[run_dir / f"alpha_{alpha}" for alpha in alphas]]
+    for candidate_dir in candidates:
+        print(f"\nEvaluating Fusion candidate: {candidate_dir.name}", flush=True)
+        fusion.load_state_dict(torch.load(candidate_dir / "fusion_model.pt", map_location=device, weights_only=True))
+        fusion.eval()
+        for parameter in fusion.parameters():
+            parameter.requires_grad_(False)
+        report = json.loads((candidate_dir / "validation_metrics.json").read_text())
+        tuning_info = json.loads((candidate_dir / "finetuning_info.json").read_text())
+        candidate_selection = {**winner, "alpha": report["alpha"], "candidate": candidate_dir.name,
+            "source_folder": candidate_dir.name, "fine_tuned": report["fine_tuned"],
+            "validation_MAE": report["MAE"], "best_epoch": tuning_info["best_epoch"],
+            "selected": candidate_dir.name == winner["source_folder"]}
+        evaluate_candidate(candidate_dir, candidate_selection, tuning_info)
+    # Publish a complete copy of the validation winner, including its diagnostics.
+    from src.M1_PPPT_to_W import _promote_complete_run
+    out_dir = run_dir / "best_fusion"
+    _promote_complete_run(run_dir / winner["source_folder"], out_dir)
+    (out_dir / "selection.json").write_text(json.dumps(winner, indent=2))
+    fusion.load_state_dict(torch.load(out_dir / "fusion_model.pt", map_location=device, weights_only=True))
 
     print(f"\nAlpha sweep complete; selected Fusion outputs → {out_dir}\n")
 

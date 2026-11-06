@@ -1,4 +1,4 @@
-"""Four-family sequential launcher. Pipeline files contain selection/counts only."""
+"""Four-family sequential launcher. Pipeline files contain execution and split-seed settings."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -20,25 +20,43 @@ FAMILIES = ("original", "gbdt_pppt", "gbdt_ppdirect_pt", "gbdt_engineered")
 
 
 def validate_pipeline_config(cfg):
-    extra = set(cfg) - {"models", "_comment"}
+    extra = set(cfg) - {"models", "data_split", "_comment"}
     if extra:
-        raise ValueError(f"Family pipeline config only accepts models; move settings {sorted(extra)} to individual model configs")
+        raise ValueError(f"Family pipeline config only accepts models/data_split; move settings {sorted(extra)} to individual model configs")
+    split = cfg.get("data_split", {})
+    if not isinstance(split, dict) or set(split) - {"seed", "seed_step", "_comment"}:
+        raise ValueError("data_split accepts only seed and seed_step")
+    for key, value in split.items():
+        if key == "_comment":
+            continue
+        if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value < 2**32:
+            raise ValueError(f"data_split.{key} must be an integer between 0 and 4294967295")
+    for model in cfg["models"].values():
+        count = model.get("n_runs", 1)
+        if isinstance(count, int) and count > 0 and "seed" in split:
+            if split["seed"] + (count - 1) * split.get("seed_step", 0) >= 2**32:
+                raise ValueError("data_split seed exceeds 4294967295 for the requested repetitions")
     unknown = set(cfg["models"]) - set(FAMILIES)
     if unknown:
         raise ValueError(f"Unknown pipeline families: {sorted(unknown)}")
     for name, model in cfg["models"].items():
         allowed = {"enabled", "n_runs", "_comment", "reference"}
         if name == "original":
-            allowed.add("n_m1_run_per_pipeline_run")
+            allowed.update({"n_m1_run_per_pipeline_run", "n_m2_run_per_pipeline_run", "n_fusion_run_per_pipeline_run"})
         if set(model) - allowed:
             raise ValueError(f"{name}: only execution flags/counts belong in the pipeline; allowed: {sorted(allowed)}")
         count = model.get("n_runs", 1)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError(f"{name}.n_runs must be a nonnegative integer counting full repetitions")
         if name == "original":
-            m1_count = model.get("n_m1_run_per_pipeline_run", 1)
-            if not isinstance(m1_count, int) or isinstance(m1_count, bool) or m1_count < 1:
-                raise ValueError("original.n_m1_run_per_pipeline_run must be a positive integer")
+            for stage in ("m1", "m2", "fusion"):
+                count = model.get(f"n_{stage}_run_per_pipeline_run", 1)
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    raise ValueError(f"original.n_{stage}_run_per_pipeline_run must be a nonnegative integer")
+            if (model.get("n_m1_run_per_pipeline_run", 1) > 0
+                    and model.get("n_m2_run_per_pipeline_run", 1) == 0
+                    and model.get("n_fusion_run_per_pipeline_run", 1) > 0):
+                raise ValueError("Training M1 before Fusion also requires M2 training for the new teacher")
         reference = model.get("reference", {})
         if reference and (name != "original" or set(reference) - {"enabled", "n_runs"}):
             raise ValueError("reference execution flags/counts are supported only under original")
@@ -59,12 +77,44 @@ def original_configs(material):
     return paths
 
 
-def _run_original(material, run_dir, seed, optuna_seed, spec):
+def _run_original(material, run_dir, seed, optuna_seed, spec, split_seed=None):
     configs = original_configs(material)
     scripts = {"M1": "M1_PPPT_to_W.py", "M2": "M2_PP_to_F.py", "Fusion": "Fusion_M1M2_WPred.py",
                "RefModels": "Reference_Models_W_Pred.py"}
-    stages = [(stage, spec.get("n_m1_run_per_pipeline_run", 1) if stage == "M1" else 1)
-              for stage in ("M1", "M2", "Fusion") if stage in configs]
+    counts = {stage: spec.get(f"n_{stage.lower()}_run_per_pipeline_run", 1)
+              for stage in ("M1", "M2", "Fusion")}
+    reused = []
+    if counts["M1"] == 0 and (counts["M2"] or counts["Fusion"]):
+        reused.append("M1")
+    if counts["M2"] == 0 and counts["Fusion"]:
+        reused.append("M2")
+    if reused:
+        m1_cfg = read_json(configs["M1"])
+        reference_root = ROOT / m1_cfg["output"].get("pipeline_root", f"outputs/{material}/original") / "best_reference_run"
+        # Check all dependencies before creating the new run.
+        for stage in reused:
+            source = stage_directory(reference_root, stage, material) / "best_overall"
+            required = ["best_model.pt", "data_processing.json", "sensors_features_f.csv", "configuration.json"] if stage == "M1" else ["best_model.pt", "scalers.json"]
+            missing = [name for name in required if not (source / name).is_file()]
+            if missing:
+                raise ValueError(f"Cannot reuse reference {stage} from {source}; missing {missing}")
+        if "M2" in reused:
+            split = read_json(stage_directory(reference_root, "M1", material) / "best_overall/data_processing.json")
+            scalers = read_json(stage_directory(reference_root, "M2", material) / "best_overall/scalers.json")
+            if scalers.get("m1_run_ts") != split.get("run_ts"):
+                raise ValueError("Reference M1/M2 originate from different runs")
+        provenance = {"reference_dir": str(reference_root.resolve()), "stages": {},
+                      "reference_run": read_json(reference_root / "reference_run.json") if (reference_root / "reference_run.json").exists() else {}}
+        for stage in reused:
+            source = stage_directory(reference_root, stage, material)
+            target = stage_directory(run_dir, stage, material)
+            shutil.copytree(source, target)
+            # The old execution manifest describes the reference launch, not this one.
+            (target / "best_overall/manifest.json").unlink(missing_ok=True)
+            provenance["stages"][stage] = {"source": str(source.resolve()),
+                "model_sha256": file_hash(source / "best_overall/best_model.pt")}
+        write_json(run_dir / "reused_stages.json", provenance)
+    stages = [(stage, counts[stage]) for stage in ("M1", "M2", "Fusion") if stage in configs and counts[stage]]
     reference = spec.get("reference", {})
     if reference.get("enabled", True):
         stages.append(("RefModels", int(reference.get("n_runs", 1))))
@@ -72,15 +122,15 @@ def _run_original(material, run_dir, seed, optuna_seed, spec):
         config_path = configs[stage]
         cfg = read_json(config_path)
         for repetition in range(count):
-            stage_seed = seed + repetition if stage == "M1" else seed
+            stage_seed = seed + repetition
             sampler_seed = optuna_seed + repetition if optuna_seed is not None else None
             env = {**os.environ, "IM_ML_RUN_DIR": str(run_dir), "IM_ML_RUN_SEED": str(stage_seed),
                    "IM_ML_MODEL_CONFIG": str(config_path), "PYTHONDONTWRITEBYTECODE": "1"}
             if stage == "M1":
-                env["IM_ML_SPLIT_SEED"] = str(cfg.get("preprocessing", {}).get("split_seed", seed))
+                env["IM_ML_SPLIT_SEED"] = str(split_seed if split_seed is not None else cfg.get("preprocessing", {}).get("split_seed", seed))
             cmd = [sys.executable, str(ROOT / "src" / scripts[stage]), "--material", material]
             if stage == "Fusion":
-                cmd.extend(["--seed", str(seed)])
+                cmd.extend(["--seed", str(stage_seed)])
             elif sampler_seed is not None:
                 cmd.extend(["--optuna-seed", str(sampler_seed)])
             # Reuse only a manifest made with this exact requested configuration and seed.
@@ -90,7 +140,7 @@ def _run_original(material, run_dir, seed, optuna_seed, spec):
             if cfg.get("data", {}).get("pressure_csv"):
                 data_paths.append(cfg["data"]["pressure_csv"])
             data_hashes = [(path, file_hash(ROOT / path)) for path in data_paths if path]
-            signature = fingerprint(training_config(cfg), cfg.get("evaluation", {}), stage_seed, sampler_seed, data_hashes)
+            signature = fingerprint(training_config(cfg), cfg.get("evaluation", {}), stage_seed, sampler_seed, data_hashes, env.get("IM_ML_SPLIT_SEED"))
             if stage == "M2":
                 teacher_path = stage_directory(run_dir, "M1", material) / "best_overall" / "best_model.pt"
                 signature = fingerprint(signature, file_hash(teacher_path))
@@ -104,7 +154,10 @@ def _run_original(material, run_dir, seed, optuna_seed, spec):
             if stage in ("M1", "M2"):
                 save_manifest(target, signature, files)
     _original_comparison(run_dir, material, seed)
-    _publish_best_reference_run(material, run_dir, configs)
+    if counts["Fusion"] > 0 and "Fusion" in configs:
+        _publish_best_reference_run(material, run_dir, configs)
+    else:
+        print("  [original] Results saved separately; best_reference_run is updated only after a requested Fusion run.", flush=True)
 
 
 def _publish_best_reference_run(material, run_dir, configs):
@@ -230,7 +283,8 @@ def _original_comparison(run_dir, material, seed):
         rows.append({"family": "original", "material": material, "seed": seed,
             "run_dir": str(run_dir), "role": "Fusion (PP only)", "alpha": report.get("alpha", path.parent.name),
             "candidate": report.get("candidate", path.parent.name),
-            "selected": path.parent.name == "best_fusion" or path.parent.name == selection.get("source_folder"),
+            "selected": path.parent.name == "best_fusion" or (path.name == "validation_metrics.json"
+                and path.parent.name == selection.get("source_folder")),
             "partition": path.name.removesuffix("_metrics.json"),
             **{key: value for key, value in report.items() if isinstance(value, (int, float))}})
     if rows:
@@ -276,18 +330,34 @@ def run_families(cfg, materials, optuna_seed=None, dry_run=False):
             for repetition in range(spec.get("n_runs", 1)):
                 seed = int(model_cfg["preprocessing"]["random_seed"]) + repetition * 1009
                 sampler_seed = optuna_seed + repetition * 1009 if optuna_seed is not None else None
+                split_options = cfg.get("data_split", {})
+                base_split_seed = split_options.get("seed", model_cfg["preprocessing"].get(
+                    "split_seed", seed))
+                split_seed = int(base_split_seed) + repetition * split_options.get("seed_step", 0)
+                if not 0 <= split_seed < 2**32:
+                    raise ValueError("Resolved data split seed must be between 0 and 4294967295")
                 run_dir = output / "runs" / timestamp / f"run_{repetition+1:03d}"
                 print(f"[{material}/{family}] complete repetition {repetition+1}/{spec.get('n_runs', 1)}; "
-                      f"seed={seed}; outputs={run_dir}", flush=True)
+                      f"seed={seed}; split_seed={split_seed}; outputs={run_dir}", flush=True)
                 if family == "original":
-                    print(f"  M1 launches per pipeline run: {spec.get('n_m1_run_per_pipeline_run', 1)}", flush=True)
+                    for stage in ("M1", "M2", "Fusion"):
+                        count = spec.get(f"n_{stage.lower()}_run_per_pipeline_run", 1)
+                        print(f"  {stage} launches per pipeline run: {count}", flush=True)
+                    if spec.get("n_m1_run_per_pipeline_run", 1) == 0:
+                        print("  Reuse M1 and its saved split from best_reference_run; split_seed does not resplit it", flush=True)
+                    if spec.get("n_m2_run_per_pipeline_run", 1) == 0 and spec.get("n_fusion_run_per_pipeline_run", 1) > 0:
+                        print("  Reuse M2 from best_reference_run", flush=True)
+                    if spec.get("n_m2_run_per_pipeline_run", 1) > 0 and spec.get("n_fusion_run_per_pipeline_run", 1) == 0:
+                        print("  M2-only results stay separate; best_reference_run is unchanged", flush=True)
+                if family != "original" and model_cfg.get("split", {}).get("source_dir"):
+                    print("  Reuse the configured source split; split_seed applies only when generating a new split", flush=True)
                 if dry_run:
                     continue
                 try:
                     if family == "original":
-                        _run_original(material, run_dir, seed, sampler_seed, spec)
+                        _run_original(material, run_dir, seed, sampler_seed, spec, split_seed=split_seed)
                     else:
-                        run_hybrid(family, path, material, run_dir, seed, sampler_seed)
+                        run_hybrid(family, path, material, run_dir, seed, sampler_seed, split_seed=split_seed)
                     comparison_path = run_dir / "comparison.csv"
                     if comparison_path.exists():
                         all_rows.append(pd.read_csv(comparison_path))

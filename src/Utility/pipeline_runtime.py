@@ -31,7 +31,7 @@ def configure(cfg, stage, material):
         cfg.setdefault("preprocessing", {})["random_seed"] = int(seed)
     split_seed = os.environ.get("IM_ML_SPLIT_SEED")
     if stage == "M1" and split_seed is not None:
-        cfg.setdefault("preprocessing", {}).setdefault("split_seed", int(split_seed))
+        cfg.setdefault("preprocessing", {})["split_seed"] = int(split_seed)
     run_dir = os.environ.get("IM_ML_RUN_DIR")
     if run_dir:
         root = Path(run_dir)

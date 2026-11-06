@@ -46,7 +46,7 @@ Outputs
 
 import argparse
 from datetime import datetime
-import copy, json, math, shutil, warnings
+import copy, json, math, shutil, tempfile, warnings
 import optuna
 import numpy as np
 import pandas as pd
@@ -959,6 +959,22 @@ def save_models(final_model: M1Model, final_metrics: dict,
         return False
 
 
+def _promote_complete_run(source: Path, destination: Path) -> None:
+    """Replace all artifacts together after evaluation filenames are finalized."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".m1-promotion-", dir=destination.parent) as temporary:
+        snapshot, previous = Path(temporary) / "snapshot", Path(temporary) / "previous"
+        shutil.copytree(source, snapshot)
+        if destination.exists():
+            destination.rename(previous)
+        try:
+            snapshot.rename(destination)
+        except Exception:
+            if previous.exists():
+                previous.rename(destination)
+            raise
+
+
 def _feature_signal_name(curve_name: str) -> str:
     """Convert configured curve names to stable feature-name tokens."""
     if curve_name.lower() in {"temp", "temperature", "t"}:
@@ -1859,48 +1875,15 @@ def run_experiment(cfg, mat, cfg_path):
     (run_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
     print(f"Run info saved → {run_best_dir / 'run_info.json'}")
 
-    if overall_updated:
-        save_final_test_plots(y[eval_idx], final_metrics["pred"], final_metrics,
-                              overall_best_dir, mat)
-        save_batch_test_diagnostics(
-            y[eval_idx], final_metrics["pred"],
-            group_ids[eval_idx] if group_ids is not None else None,
-            part_ids[eval_idx], overall_best_dir,
-            target_names=[data_cfg["target_col"]],
-            title=f"[{mat} | M1] {'Test' if test_enabled else 'Validation'} evaluation",
-        )
-        save_cv_plots(metrics_df, K, mat, overall_best_dir)
-        for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
-            shutil.copy2(cv_plot, overall_best_dir / cv_plot.name)
-        metrics_df.to_csv(overall_best_dir / "cv_fold_metrics.csv")
-        shutil.copy2(run_best_dir / "train_test_split.json",
-                     overall_best_dir / "train_test_split.json")
-        shutil.copy2(run_best_dir / "data_processing.json",
-                     overall_best_dir / "data_processing.json")
-        (overall_best_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
-        df_f.index.name = data_cfg["id_col"]
-        df_f.to_csv(overall_best_dir / "sensors_features_f.csv")
-        (overall_best_dir / "feature_summary.json").write_text(
-            json.dumps(feature_summary, indent=2))
-        if mode == "optuna" and best_hpo is not None:
-            (overall_best_dir / "hpo_best_config.json").write_text(
-                json.dumps(best_hpo, indent=2))
-            src_trials = run_best_dir / "hpo_trials.csv"
-            if src_trials.exists():
-                shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
-        for pattern in ("training_history.json", "normalization_factors.json",
-                        "configuration.json", "validation_metrics.json",
-                        "*_test_points.csv", "cv_fold_*_training.json"):
-            for artifact in run_best_dir.glob(pattern):
-                shutil.copy2(artifact, overall_best_dir / artifact.name)
-        print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
-
     from src.Utility.external_evaluation import finish_original_stage
-    finish_original_stage(cfg, "M1", run_best_dir,
-                          overall_best_dir if overall_updated else None)
+    finish_original_stage(cfg, "M1", run_best_dir)
     finalize_evaluation(run_best_dir, test_enabled)
     if overall_updated:
-        finalize_evaluation(overall_best_dir, test_enabled)
+        # Copy the completed run, including nested test_2 output. Reusing the
+        # previous directory lets old test_1 names shadow newly written test
+        # artifacts during label_test_1, leaving reports from an earlier run.
+        _promote_complete_run(run_best_dir, overall_best_dir)
+        print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
     return {"validation_mae_g": final_model.m1_training_info["best_validation_mae_g"],
             "run_dir": str(run_best_dir), "within_test_point_beta":
             train_cfg.get("within_test_point_beta", 0.0)}
@@ -1977,11 +1960,7 @@ def run_beta_experiments(cfg, mat, cfg_path, beta_override=None):
     if (winner["validation_mae_g"] < previous.get("validation_MAE", float("inf"))
             or previous_policy.get("policy_hash") != current_policy.get("policy_hash")
             or split_ids_changed(previous_split, current_split)):
-        destination.mkdir(parents=True, exist_ok=True)
-        # Preserve the existing downstream M1 checkpoint/feature/split contract.
-        for artifact in source.iterdir():
-            if artifact.is_file():
-                shutil.copy2(artifact, destination / artifact.name)
+        _promote_complete_run(source, destination)
         (destination / "beta_selection.json").write_text(json.dumps(selection, indent=2))
         for artifact in comparison_paths:
             shutil.copy2(artifact, destination / artifact.name)

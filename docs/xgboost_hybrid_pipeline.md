@@ -155,18 +155,21 @@ python Run_WPred_Pipeline.py --material DOE1 --dry-run
 python Run_WPred_Pipeline.py --material DOE1
 ```
 
-`config/WPred_Pipeline_config.json` contains only family selection and execution
-counts. `models.<family>.n_runs` counts **complete independent repetitions**,
+`config/WPred_Pipeline_config.json` contains family selection, execution counts,
+and optional split-seed controls. `models.<family>.n_runs` counts **complete independent repetitions**,
 not trials or epochs. Every enabled family/repetition executes sequentially.
 An original repetition runs all M1 launches → M2 → Fusion → optional Reference.
-`models.original.n_m1_run_per_pipeline_run` is a positive integer (default `1`)
-controlling the M1 launches within each full original repetition. For example:
+`models.original.n_m1_run_per_pipeline_run`, `n_m2_run_per_pipeline_run` and
+`n_fusion_run_per_pipeline_run` accept nonnegative integers (default `1`).
+Zero skips training that stage. For example:
 
 ```json
 "original": {
     "enabled": true,
     "n_runs": 2,
     "n_m1_run_per_pipeline_run": 3,
+    "n_m2_run_per_pipeline_run": 1,
+    "n_fusion_run_per_pipeline_run": 1,
     "reference": {"enabled": true, "n_runs": 1}
 }
 ```
@@ -180,14 +183,61 @@ existing validation-MAE selection retains the best checkpoint in that repetition
 `M1/best_overall`; M2 and Fusion use that checkpoint. All M1 launch artifacts stay
 in the same repetition's M1 folders, with their existing timestamped run directories.
 `original.reference.enabled` and `n_runs` control that optional baseline stage.
+
+To run downstream stages without M1 training, set the original counts as follows
+and disable other families and `original.reference.enabled` for an isolated run:
+
+| Requested training | M1 count | M2 count | Fusion count |
+| --- | ---: | ---: | ---: |
+| M2 only, three launches | 0 | 3 | 0 |
+| Fusion only, three launches | 0 | 0 | 3 |
+| M2 twice, then Fusion three times | 0 | 2 | 3 |
+
+Required skipped stages are copied from `best_reference_run` into the new run,
+including their fitted scalers, features and split contracts. `reused_stages.json`
+records their source and checkpoint hashes. Missing or incompatible reference
+models fail before training. M2 launches select their best model by validation
+NMAE; each Fusion launch selects its alpha by validation weight MAE. Training
+and explicit sampler seeds increment for repeated stages.
+
+M2-only runs save their training, evaluation and comparison results separately in
+`runs/`. They do not launch Fusion or update `best_reference_run`. Only an
+explicitly requested Fusion run can update the reference. Such runs use the
+same reference-ranking rule as a full run: a lower Fusion Test 1 MAE on the same
+data/test membership replaces the entire reference snapshot. Inferior runs
+remain in `runs/`. Training a new M1 before Fusion requires training M2 for that
+new teacher as well.
 Legacy pipeline files using `n_runs_m1`, `n_runs_m2`, etc. still follow their
 previous stage-loop procedure. `--material`, `--config`, and `--optuna-seed`
 remain supported.
 
 Training seeds come from the model configurations; repetition `r` adds
 `1009 * (r - 1)`. The same offset applies to an explicit CLI Optuna seed.
-`preprocessing.split_seed` keeps baseline partitions fixed while training seeds
-vary. Hybrid split contracts use the exact configured source checkpoint IDs.
+Choose final train/validation/Test 1 split seeds in the pipeline file:
+
+```json
+"data_split": {
+    "seed": 42,
+    "seed_step": 0
+}
+```
+
+`seed_step: 0` keeps the same seed for every `models.<family>.n_runs` repetition.
+`seed_step: 1` uses 42, 43, 44, and so on; larger steps are also supported.
+All M1 launches within one repetition share its split seed while their training
+seeds vary. The pipeline seed overrides M1's `preprocessing.split_seed`.
+Each new invocation restarts the sequence; change `seed` to choose a different
+split when launching one repetition at a time. Dry runs print both training and
+split seeds. Different seeds can still produce the same split on small datasets.
+If `data_split` is omitted, the model's existing split-seed behavior is retained.
+
+M2/Fusion-only runs inherit the saved M1 partition IDs; they cannot resplit a
+pretrained model. Hybrids with `split.source_dir` likewise use that exact source
+contract. Hybrids generating new partitions use the pipeline split seed.
+The external Test 2 folder and protected/edge-group rules remain unchanged.
+HPO and CV keep their existing training-seed settings. A changed Test 1 membership
+starts a new reference comparison under the existing task-signature policy;
+scores on different test memberships are not ranked against each other.
 DoE1 model-specific configurations are supplied; other datasets need their own
 individual hybrid configurations and valid TP IDs/grouped splitting.
 
@@ -377,12 +427,25 @@ uses weight MAE. Ties prefer no fine-tuning, then the first configured alpha.
 `best_alpha_selection.json` records the decision. `best_fusion/` contains a copy
 of the selected checkpoint and validation artifacts, `selection.json`, final
 test metrics/predictions/plots, model metadata and XAI outputs. The pretrained
-baseline also receives final testing and XAI if it wins; all other candidates
-retain validation results only. With `evaluation.enabled: false`,
-the selected model produces validation outputs and XAI without testing.
+baseline and every alpha receive final testing, feature reconstruction diagnostics
+and XAI in their own folders after validation selection is fixed. Internal Test 1
+and configured external Test 2 both use each candidate's saved checkpoint.
+`best_fusion/` copies the complete validation winner. With `evaluation.enabled:
+false`, every candidate produces validation outputs and XAI without testing.
 
-The restored winner also evaluates its M2 reconstruction on the same final
-partition. `best_fusion/m2_reconstruction/` contains `test_metrics.json`,
+Recompute tests and XAI from existing checkpoints without retraining:
+
+```bash
+python src/Fusion_M1M2_WPred.py --material DOE1 --evaluate-run outputs/DOE1/original/runs/<launch>/run_001/Fusion/<sweep>_DOE1
+```
+
+The command uses the saved parent checkpoint paths and verifies the original
+split. `--m1-dir` and `--m2-dir` can point to identical relocated copies. The saved
+alpha selection and trained weights remain unchanged. All candidates use the
+same sampled explanation IDs and background seed for comparable XAI.
+
+Every restored candidate also evaluates its M2 reconstruction on the same final
+partition. Each `m2_reconstruction/` directory (also copied under `best_fusion/`) contains `test_metrics.json`,
 `test_feature_metrics.csv`, part-level feature targets/predictions, measured vs
 predicted scatter, residual scatter and histograms, plus batch-colored plots
 and per-batch reports. Errors compare M2 predictions with the frozen M1 sensor

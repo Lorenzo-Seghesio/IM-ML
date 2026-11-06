@@ -211,6 +211,31 @@ class HybridIntegrationTests(unittest.TestCase):
             np.testing.assert_array_equal(before, after.predict(imputer.transform(features[val])))
             self.assertFalse((root / "first" / "test_metrics.json").exists())
 
+    def test_hybrid_split_seed_changes_new_splits_and_preserves_imported_contracts(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            cfg, _ = fixture(root)
+            cfg.update(family='gbdt_engineered', feature_extraction={
+                'sampling_interval_s': .1, 'cache_dir': str(root / 'cache')})
+            cfg['preprocessing']['split_seed'] = 17
+            path = root / 'config.json'
+            write_json(path, cfg)
+            contracts = []
+            for split_seed in (42, 43):
+                run = root / f'new_{split_seed}'
+                hp.run_hybrid('gbdt_engineered', path, run_dir=run, seed=99,
+                              stages=('m1',), split_seed=split_seed)
+                self.assertEqual(read_json(run / 'configuration.json')['preprocessing']['split_seed'], split_seed)
+                contracts.append(read_json(run / 'data_processing.json'))
+            self.assertNotEqual(contracts[0]['test_part_ids'], contracts[1]['test_part_ids'])
+            cfg['split'] = {'source_dir': str(root / 'new_42')}
+            write_json(path, cfg)
+            hp.run_hybrid('gbdt_engineered', path, run_dir=root / 'imported', seed=101,
+                          stages=('m1',), split_seed=123)
+            imported = read_json(root / 'imported/data_processing.json')
+            for key in ('train_part_ids', 'val_part_ids', 'test_part_ids'):
+                self.assertEqual(imported[key], contracts[0][key])
+
     def test_all_families_train_reload_reuse_and_enable_final_testing(self):
         self._check_hybrid_families(False)
 
@@ -383,16 +408,20 @@ class HybridIntegrationTests(unittest.TestCase):
     def test_original_m1_m2_fusion_final_evaluation_uses_test_ids(self):
         self._check_original_evaluation(True)
 
-    def test_original_sweep_selects_validation_winner_before_single_test_and_xai(self):
+    def test_original_sweep_selects_validation_winner_before_all_candidate_tests_and_xai(self):
         self._check_original_evaluation(True, alpha_sweep=True)
 
-    def test_original_sweep_can_select_pretrained_fusion_for_single_test_and_xai(self):
+    def test_original_sweep_can_select_pretrained_fusion_with_all_candidate_tests_and_xai(self):
         self._check_original_evaluation(True, alpha_sweep=True, baseline_wins=True)
 
     def test_original_train_pipeline_and_independent_external_test_with_overlapping_ids(self):
         self._check_original_evaluation(True, alpha_sweep=True, divided=True)
 
-    def _check_original_evaluation(self, test_enabled, alpha_sweep=False, baseline_wins=False, divided=False):
+    def test_original_explicit_pretrained_fusion_evaluates_without_finetuning(self):
+        self._check_original_evaluation(True, pretrained_only=True)
+
+    def _check_original_evaluation(self, test_enabled, alpha_sweep=False, baseline_wins=False, divided=False,
+                                   pretrained_only=False):
         from src import M2_PP_to_F as m2
         from src import Fusion_M1M2_WPred as original_fusion
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -463,7 +492,11 @@ class HybridIntegrationTests(unittest.TestCase):
                 stack.enter_context(patch.object(original_fusion, 'finetune_m2', side_effect=train_alpha))
                 stack.enter_context(patch.object(original_fusion, 'evaluate_fusion', side_effect=evaluate_alpha))
                 xai = stack.enter_context(patch.object(original_fusion, 'run_fusion_xai'))
-            with patch('sys.argv', ['fusion', '--material', 'PP']):
+            if pretrained_only:
+                stack.enter_context(patch.object(original_fusion, 'finetune_m2',
+                    side_effect=AssertionError('Pretrained-only Fusion must not fine-tune')))
+            cli = ['fusion', '--material', 'PP'] + (['--pretrained-only'] if pretrained_only else [])
+            with patch('sys.argv', cli):
                 original_fusion.main()
             partition = internal_test_name(cfg['data']) if test_enabled else "validation"
             reports = list((root / "Fusion").rglob(f"best_fusion/{partition}_predictions.csv"))
@@ -483,6 +516,17 @@ class HybridIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(fusion_metrics['feature_MAE'], reconstruction['mean_MAE'], places=5)
             if not test_enabled:
                 self.assertFalse(any(root.rglob("test_metrics.json")))
+            if pretrained_only:
+                best = reports[0].parent
+                selection = read_json(best / 'selection.json')
+                self.assertEqual(selection['source_folder'], 'no_finetuning')
+                self.assertEqual(selection['n_alphas'], 0)
+                self.assertFalse(selection['fine_tuned'])
+                self.assertFalse(any(path.is_dir() for path in best.parent.glob('alpha_*')))
+                original_m2 = torch.load(root / 'M2/best_overall/best_model.pt', weights_only=True)
+                evaluated_m2 = torch.load(best / 'm2_best_model.pt', weights_only=True)
+                for key in original_m2:
+                    torch.testing.assert_close(original_m2[key], evaluated_m2[key], rtol=0, atol=0)
             if alpha_sweep:
                 best = reports[0].parent
                 selection = read_json(best / "selection.json")
@@ -495,22 +539,31 @@ class HybridIntegrationTests(unittest.TestCase):
                 self.assertFalse(selection["test_used_for_selection"])
                 self.assertEqual([event for event in events if event[0] == "train"],
                                  [("train", 0.), ("train", .5), ("train", 1.)])
-                self.assertEqual(len([event for event in events if event[0] == "test"]), 1)
-                self.assertGreater(events.index(("test", 1.)), events.index(("train", 1.)))
-                self.assertEqual(len(list((root / "Fusion").rglob(f"{partition}_metrics.json"))), 2)
-                self.assertFalse(any(best.parent.glob("alpha_*/test*")))
-                self.assertFalse(any((best.parent / 'no_finetuning').glob('test*')))
+                self.assertEqual(len([event for event in events if event[0] == "test"]), 4)
+                self.assertGreater(next(i for i, event in enumerate(events) if event[0] == "test"),
+                                   max(i for i, event in enumerate(events) if event[0] == "train"))
+                self.assertEqual(len(list((root / "Fusion").rglob(f"{partition}_metrics.json"))), 10)
+                for folder in ('no_finetuning', 'alpha_0.0', 'alpha_0.5', 'alpha_1.0'):
+                    candidate_dir = best.parent / folder
+                    self.assertTrue((candidate_dir / f'{partition}_predictions.csv').exists())
+                    actual = read_json(candidate_dir / f'{partition}_metrics.json')
+                    self.assertEqual(actual['candidate'], folder)
+                    self.assertTrue((candidate_dir / 'xai' / partition / 'explained_samples.csv').exists())
+                    if divided:
+                        self.assertTrue((candidate_dir / 'test_2_metrics.json').exists())
                 baseline_predictions = pd.read_csv(best.parent / 'no_finetuning' / 'validation_predictions.csv')
                 self.assertEqual(set(baseline_predictions['ID_Part']), set(contract['val_part_ids']))
                 baseline_info = read_json(best.parent / 'no_finetuning' / 'finetuning_info.json')
                 self.assertFalse(baseline_info['enabled'])
                 self.assertEqual(baseline_info['epochs_run'], 0)
-                self.assertEqual(xai.call_count, 3 if divided else 2)
-                internal_call = xai.call_args_list[1]
-                self.assertEqual(internal_call.args[9], best/'xai'/partition)
+                self.assertEqual(xai.call_count, 12 if divided else 8)
+                winner_index = ['no_finetuning', 'alpha_0.0', 'alpha_0.5', 'alpha_1.0'].index(selection['source_folder'])
+                calls_per_candidate = 3 if divided else 2
+                internal_call = xai.call_args_list[winner_index * calls_per_candidate + 1]
+                self.assertEqual(internal_call.args[9], best.parent/selection['source_folder']/'xai'/partition)
                 self.assertEqual(set(internal_call.args[3]), set(contract["test_part_ids"]))
                 if divided:
-                    self.assertEqual(set(xai.call_args_list[2].args[3]), set(range(6)))
+                    self.assertEqual(set(xai.call_args_list[winner_index * calls_per_candidate + 2].args[3]), set(range(6)))
                     self.assertEqual(pd.read_csv(best/'test_2_predictions.csv')['part_id'].tolist(), list(range(6)))
                     self.assertEqual(pd.read_csv(output/'best_overall/test_2_predictions.csv')['part_id'].tolist(), list(range(6)))
                     self.assertEqual(read_json(root/'M2/best_overall/test_2_metrics.json')['n_samples'], 6)
@@ -541,12 +594,25 @@ class HybridIntegrationTests(unittest.TestCase):
                 _original_comparison(root, 'DOE1', 42)
                 combined = pd.read_csv(root / 'comparison.csv')
                 fusion_rows = combined.loc[combined['role'] == 'Fusion (PP only)']
-                self.assertEqual(len(fusion_rows), 6 if divided else 5)
-                self.assertEqual((fusion_rows['partition'] == partition).sum(), 1)
+                self.assertEqual(len(fusion_rows), 14 if divided else 9)
+                self.assertEqual((fusion_rows['partition'] == partition).sum(), 5)
+                self.assertEqual(((fusion_rows['partition'] == partition) & fusion_rows['selected']).sum(), 1)
                 selected_validation = fusion_rows.loc[
                     (fusion_rows['partition'] == 'validation') & (fusion_rows['selected'] == True)]
                 self.assertEqual(selected_validation['candidate'].tolist(),
                                  ['no_finetuning' if baseline_wins else 'alpha_0.5'])
+
+                if divided:
+                    checkpoint_bytes = {path: path.read_bytes() for path in best.parent.rglob('fusion_model.pt')}
+                    selection_bytes = (best.parent / 'best_alpha_selection.json').read_bytes()
+                    with patch.object(original_fusion, 'train_alpha_sweep') as retrain, \
+                            patch('sys.argv', ['fusion', '--material', 'PP', '--evaluate-run', str(best.parent)]):
+                        original_fusion.main()
+                    retrain.assert_not_called()
+                    self.assertEqual((best.parent / 'best_alpha_selection.json').read_bytes(), selection_bytes)
+                    for path, contents in checkpoint_bytes.items():
+                        self.assertEqual(path.read_bytes(), contents)
+                    self.assertEqual(xai.call_count, 24)
 
     def test_direct_pp_model_has_no_pp_parameters_and_ignores_pp_hpo(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -559,7 +625,8 @@ class HybridIntegrationTests(unittest.TestCase):
             self.assertFalse(any(key.startswith("pp_") for key in mu))
 
     def test_family_launcher_counts_full_repetitions_sequentially_and_offsets_seeds(self):
-        cfg = {"models": {"gbdt_engineered": {"enabled": True, "n_runs": 2}}}
+        cfg = {"data_split": {"seed": 17, "seed_step": 2},
+               "models": {"gbdt_engineered": {"enabled": True, "n_runs": 2}}}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "cfg.json"
@@ -570,6 +637,7 @@ class HybridIntegrationTests(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             self.assertEqual([c.args[4] for c in run.call_args_list], [42, 1051])
             self.assertEqual([c.args[5] for c in run.call_args_list], [7, 1016])
+            self.assertEqual([c.kwargs["split_seed"] for c in run.call_args_list], [17, 19])
         with self.assertRaises(ValueError):
             validate_pipeline_config({"models": {}, "epochs": 100})
         with self.assertRaises(ValueError):

@@ -1330,37 +1330,13 @@ def main():
         final_model, X, x_sc, y_sc, part_ids, f_cols,
         run_best_dir / "f_predictions.csv", data_cfg["id_col"], device)
 
-    if overall_updated:
-        save_final_test_plots(Y[eval_idx], final_metrics["pred"], final_metrics,
-                              overall_best_dir, mat, f_cols)
-        save_batch_test_diagnostics(
-            Y[eval_idx], final_metrics["pred"],
-            group_ids[eval_idx] if group_ids is not None else None,
-            part_ids[eval_idx], overall_best_dir,
-            target_names=f_cols,
-            title=f"[{mat} | M2] {'Test' if test_enabled else 'Validation'} evaluation",
-        )
-        save_cv_plots(metrics_df, K, mat, overall_best_dir)
-        for cv_plot in run_best_dir.glob("cv_*diagnostics*.png"):
-            shutil.copy2(cv_plot, overall_best_dir / cv_plot.name)
-        metrics_df.to_csv(overall_best_dir / "cv_fold_metrics.csv")
-        df_pred.to_csv(overall_best_dir / "f_predictions.csv")
-        shutil.copy2(run_best_dir / "scalers.json", overall_best_dir / "scalers.json")
-        (overall_best_dir / "run_info.json").write_text(json.dumps(m2_run_info, indent=2))
-        if mode == "optuna" and best_hpo is not None:
-            (overall_best_dir / "hpo_best_config.json").write_text(
-                json.dumps(best_hpo, indent=2))
-            src_trials = run_best_dir / "hpo_trials.csv"
-            if src_trials.exists():
-                shutil.copy2(src_trials, overall_best_dir / "hpo_trials.csv")
-        print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
-
     from src.Utility.external_evaluation import finish_original_stage
-    finish_original_stage(cfg, "M2", run_best_dir,
-                          overall_best_dir if overall_updated else None, model=final_model)
+    finish_original_stage(cfg, "M2", run_best_dir, model=final_model)
     finalize_evaluation(run_best_dir, test_enabled)
     if overall_updated:
-        finalize_evaluation(overall_best_dir, test_enabled)
+        from src.M1_PPPT_to_W import _promote_complete_run
+        _promote_complete_run(run_best_dir, overall_best_dir)
+        print(f"All run-best artefacts also saved to overall best → {overall_best_dir}")
 
 
 if __name__ == "__main__":
