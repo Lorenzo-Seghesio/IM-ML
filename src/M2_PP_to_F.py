@@ -25,7 +25,7 @@ Architecture
 
 Training
 --------
-  • MinMax-scaled MAE loss + explicit L1 weight regularisation
+  • MinMax-scaled MAE loss
   • AdamW optimiser (weight_decay) + ReduceLROnPlateau scheduler
   • HPO and model selection use range-normalized MAE; reported MAE stays in original units
   • K-fold cross-validation; early stopping per fold (monitored on val MAE, scaled space)
@@ -284,7 +284,7 @@ def train_fold(model: M2Model,
                tcfg: dict, device: torch.device):
     """Train for one fold with early stopping.
 
-    Training loss = MAE (in scaled space) + l1_lambda * Σ|params|.
+    Training loss = MAE (in scaled space).
     Early stopping monitored on val MAE (scaled space).
     Returns model with best-val-MAE state + the best val MAE value.
     """
@@ -304,7 +304,6 @@ def train_fold(model: M2Model,
     loader = DataLoader(TensorDataset(t_X_tr, t_Y_tr),
                         batch_size=tcfg["batch_size"], shuffle=True, drop_last=False)
 
-    l1_lambda    = float(tcfg.get("l1_lambda", 0.0))
     best_val_mae = float("inf")
     best_state   = copy.deepcopy(model.state_dict())
     wait         = 0
@@ -318,9 +317,6 @@ def train_fold(model: M2Model,
             optimizer.zero_grad()
             pred = model(b_x)
             loss = criterion(pred, b_y)
-            if l1_lambda > 0.0:
-                l1_reg = sum(p.abs().sum() for p in model.parameters())
-                loss   = loss + l1_lambda * l1_reg
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * len(b_y)
@@ -934,8 +930,6 @@ def suggest_hyperparams(trial, ss: dict, n_in: int):
         t_upd["batch_size"] = _soi(trial, "batch_size", ss["batch_size"])
     if "dropout" in ss:
         m_upd["dropout"] = _sof(trial, "dropout", ss["dropout"])
-    if "l1_lambda" in ss:
-        t_upd["l1_lambda"] = _sof(trial, "l1_lambda", ss["l1_lambda"], log=True)
 
     # ── MLP hidden dims ───────────────────────────────────────────────────────
     if "n_layers" in ss:
@@ -1025,7 +1019,7 @@ def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
             f_cols, seed, device, strat_labels=None, out_dir=None,
             group_values=None, group_cfg=None, sampler_seed=None,
             edge_values=None, edge_cfg=None):
-    """Create and run an Optuna study, using a new name for persisted NMAE studies."""
+    """Create and run an Optuna study, using a separate persisted study for MAE-only training."""
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     sampler = optuna.samplers.TPESampler(
@@ -1038,7 +1032,7 @@ def run_hpo(X, Y, optuna_cfg, base_model_cfg, base_train_cfg,
     storage    = optuna_cfg.get("storage")
     study_name = optuna_cfg.get("study_name", "M2_hpo")
     if storage:
-        study_name = f"{study_name}_nmae"
+        study_name = f"{study_name}_nmae_no_l1"
     study = optuna.create_study(
         direction="minimize",
         sampler=sampler,
@@ -1235,7 +1229,6 @@ def main():
             "train_lr":           train_cfg["lr"],
             "train_weight_decay": train_cfg["weight_decay"],
             "train_batch_size":   train_cfg["batch_size"],
-            "train_l1_lambda":    train_cfg.get("l1_lambda", 0.0),
         }
         (run_best_dir / "hpo_best_config.json").write_text(json.dumps(best_hpo, indent=2))
         print(f"HPO best config saved → {run_best_dir / 'hpo_best_config.json'}")
