@@ -12,11 +12,11 @@ Five reference models that all predict injection-moulded part weight (W):
 All models support Optuna (TPE sampler); CustomGBDT also supports fixed parameters.
 NN and CustomGBDT models use HyperbandPruner; standard GBDTs use MedianPruner.
 After HPO a full K-fold CV is run for each model to produce final metrics.
-With test-point training enabled, Encoder, MLP and CustomGBDT use the shared
-normalized within-test-point loss, multi-test-point mini-batches, and
-validation-selected beta sweeps. Otherwise the original four models use legacy
-training and CustomGBDT is skipped. All models
-report complete-test-point variability metrics when test-point IDs are available.
+CustomGBDT always uses the shared normalized within-test-point loss,
+multi-test-point mini-batches, and validation-selected beta sweeps when selected.
+Encoder/MLP opt into that mode with training.test_point_training.enabled;
+otherwise they use legacy training. LightGBM/XGBoost keep standard fitting.
+All models report complete-test-point variability metrics when IDs are available.
 
 Usage
 -----
@@ -2387,11 +2387,21 @@ def main():
     edge_cfg = cfg["data"].get("edge_group_split", {})
 
     _require_test_point_grouping(cfg["training"], group_ids, group_cfg)
-    if cfg["training"].get("test_point_training", {}).get("enabled", False):
+    neural_tp_enabled = cfg["training"].get("test_point_training", {}).get("enabled", False)
+    custom_on = bool(cfg.get("active_models", {}).get("custom_gbdt", 0))
+    custom_cfg = None
+    if custom_on:
+        # CustomGBDT always uses the TP loss and sampler. Its selection is
+        # independent of the optional TP-training switch for Encoder/MLP.
+        custom_cfg = copy.deepcopy(cfg)
+        custom_cfg["training"].setdefault("test_point_training", {})["enabled"] = True
+        _require_test_point_grouping(custom_cfg["training"], group_ids, group_cfg)
+    if neural_tp_enabled or custom_on:
         if len(np.unique(part_ids)) != len(part_ids):
             raise ValueError("Part IDs must be unique for distinct-part sampling")
     elif args.beta_values is not None:
-        raise ValueError("--beta-values requires test_point_training.enabled=true")
+        raise ValueError("--beta-values requires test_point_training.enabled=true or an active CustomGBDT")
+    neural_beta_override = args.beta_values if neural_tp_enabled else None
 
     # ── One-time initial split (dev / held-out test) ──────────────────────────
     test_frac = prep_cfg.get("test_fraction", 0.2)
@@ -2457,11 +2467,9 @@ def main():
     mlp_on  = bool(active.get("mlp",     1))
     lgbm_on = bool(active.get("lgbm",    1))
     xgb_on  = bool(active.get("xgboost", 1))
-    custom_on = bool(active.get("custom_gbdt", 0))
-    if custom_on and not cfg["training"].get("test_point_training", {}).get("enabled", False):
-        print("\n[custom_gbdt] skipped (test_point_training.enabled=false; "
-              "CustomGBDT requires TP-aware training)")
-        custom_on = False
+    if custom_on and not neural_tp_enabled:
+        print("\n[custom_gbdt] Enabled with its TP loss/sampler; "
+              "Encoder/MLP retain their configured training mode.")
     print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}  custom_gbdt={custom_on}")
 
     if enc_on:
@@ -2471,7 +2479,7 @@ def main():
                 dev_idx, test_idx, group_ids, group_cfg,
                 m1_train_idx, m1_val_idx, edge_values, edge_cfg,
                 part_ids=part_ids, target_name=cfg["data"]["target_col"]),
-            args.beta_values)
+            neural_beta_override)
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
 
@@ -2482,7 +2490,7 @@ def main():
                 dev_idx, test_idx, pp_cols, group_ids, group_cfg,
                 m1_train_idx, m1_val_idx, edge_values, edge_cfg,
                 part_ids=part_ids, target_name=cfg["data"]["target_col"]),
-            args.beta_values)
+            neural_beta_override)
     else:
         print("\n[mlp]      skipped (active_models.mlp = 0)")
 
@@ -2503,7 +2511,7 @@ def main():
         print("\n[xgboost]  skipped (active_models.xgboost = 0)")
 
     if custom_on:
-        run_test_point_beta_experiments("CustomGBDT", cfg, mat_dir, seed,
+        run_test_point_beta_experiments("CustomGBDT", custom_cfg, mat_dir, seed,
             lambda experiment: run_custom_gbdt(
                 X_pp, y, experiment, mat, mat_dir, seed, strat_labels, dev_idx, test_idx,
                 pp_cols, group_ids, group_cfg, m1_train_idx, m1_val_idx, edge_values, edge_cfg,

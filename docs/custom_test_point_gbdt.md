@@ -20,9 +20,13 @@ This launches the configured training/HPO jobs; it is not a lightweight test.
 configuration remains the default when `--models` is omitted. Configurations
 without the new active-model key keep CustomGBDT off for compatibility.
 ProBayes keeps it explicitly disabled until valid TP IDs and grouped splits are
-supplied. When TP training is disabled, the reference-model entry point skips
-CustomGBDT with a message, even if its active-model flag is set. The original
-four reference models continue with their legacy training behavior.
+supplied. Selecting CustomGBDT always runs its required TP-aware training,
+independently of `training.test_point_training.enabled`, which controls the
+optional TP mode for Encoder/MLP. It inherits the configured beta values and
+sampler settings without changing the other models' training mode. Missing TP
+IDs or disabled grouped splitting raise an error before any training starts,
+instead of silently skipping an explicitly selected model. CustomGBDT reuses the
+same authoritative M1 final train/validation/test split as the other references.
 
 ## Exactly the shared loss
 

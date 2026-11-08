@@ -408,7 +408,40 @@ class ReferenceArtifactTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in sweeps.call_args_list], ['Encoder', 'MLP'])
             self.assertTrue(all(tree.call_count == 1 for tree in trees))
 
-    def test_main_legacy_mode_runs_original_models_and_skips_configured_custom(self):
+    def test_custom_selection_keeps_other_models_in_legacy_training_mode(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            cfg = {'data': {'target_col': 'weight', 'group_split': {'enabled': True}},
+                   'preprocessing': {'random_seed': 42}, 'output_base_dir': directory,
+                   'training': {**tiny_config(), 'test_point_training': {'enabled': False}},
+                   'active_models': dict.fromkeys(('encoder', 'mlp', 'lgbm', 'xgboost', 'custom_gbdt'), 1)}
+            path = root / 'config.json'
+            path.write_text(json.dumps(cfg))
+            x = np.arange(24, dtype=np.float32).reshape(-1, 1)
+            stack.enter_context(patch.object(ref, '_CFG_MAP', {'DOE1': str(path)}))
+            stack.enter_context(patch.object(ref, 'BASE_OUT', root))
+            stack.enter_context(patch.object(ref, 'load_data', return_value=(
+                np.arange(24), x, x, x[:, 0], None, ['x'], np.repeat(np.arange(12), 2), None)))
+            stack.enter_context(patch('sys.argv', ['ref', '--material', 'DOE1', '--beta-values', '0', '.25']))
+            runners = [stack.enter_context(patch.object(ref, name)) for name in
+                       ('run_encoder', 'run_mlp', 'run_lgbm', 'run_xgboost')]
+            def sweep(label, experiment, mat_dir, seed, run, override):
+                self.assertEqual(label, 'CustomGBDT')
+                self.assertEqual(override, [0, .25])
+                return run(experiment)
+            stack.enter_context(patch.object(ref, 'run_test_point_beta_experiments', side_effect=sweep))
+            custom = stack.enter_context(patch.object(ref, 'run_custom_gbdt'))
+            output = stack.enter_context(redirect_stdout(io.StringIO()))
+            ref.main()
+            for runner in runners:
+                runner.assert_called_once()
+                self.assertEqual(runner.call_args.args[2], cfg)
+            custom.assert_called_once()
+            self.assertTrue(custom.call_args.args[2]['training']['test_point_training']['enabled'])
+            self.assertEqual(json.loads(path.read_text()), cfg)
+            self.assertIn('5/5 reference model(s) complete', output.getvalue())
+
+    def test_main_legacy_mode_runs_original_models_when_custom_is_disabled(self):
         for tp_cfg in ({'test_point_training': {'enabled': False, 'beta_values': [0, .25]}}, {}):
             for grouped in (False, True):
                 with self.subTest(tp_cfg=tp_cfg, grouped=grouped), \
@@ -422,6 +455,7 @@ class ReferenceArtifactTests(unittest.TestCase):
                                ('encoder', 'mlp', 'lgbm', 'xgboost', 'custom_gbdt'), 1)}
                     if not tp_cfg:
                         cfg['training'].pop('test_point_training')
+                    cfg['active_models']['custom_gbdt'] = 0
                     cfg_path.write_text(json.dumps(cfg))
                     x = np.arange(24, dtype=np.float32).reshape(-1, 1)
                     ids = np.repeat(np.arange(12), 2) if grouped else None
@@ -441,7 +475,7 @@ class ReferenceArtifactTests(unittest.TestCase):
                         self.assertEqual(runner.call_args.args[2], cfg)
                     custom.assert_not_called()
                     comparison.assert_not_called()
-                    self.assertIn('CustomGBDT requires TP-aware training', output.getvalue())
+                    self.assertIn('active_models.custom_gbdt = 0', output.getvalue())
                     self.assertIn('4/5 reference model(s) complete', output.getvalue())
 
 

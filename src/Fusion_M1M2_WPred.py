@@ -7,9 +7,15 @@ Fine-tuning
 -----------
 Only M2 is updated; all M1 parameters and scalers remain frozen. M1's
 PPMLP and merge head stay in evaluation mode, but gradients flow through
-the merge head into M2. The objective uses original (unscaled) units:
+the merge head into M2. The objective normalizes original-unit MAEs:
 
-    L = alpha * MAE_w + (1 - alpha) * mean_i(MAE_f_i)
+    L = alpha * MAE_w / std_w
+        + (1 - alpha) * mean_i(MAE_f_i / max(std_f_i, eps_rel * median(std_f)))
+
+Population standard deviations are computed once on the fine-tuning training
+split and fixed for every alpha, training batch, and validation pass.
+Set finetuning.normalize_loss=false (or --no-normalize-loss) to use the original
+raw-unit objective: L = alpha * MAE_w + (1 - alpha) * mean_i(MAE_f_i).
 
 Feature targets are the saved M1 extracted sensor features, aligned by
 part ID and M2 output column. The average includes the features predicted
@@ -24,7 +30,9 @@ no_finetuning/. best_fusion/ copies the complete validation winner.
 
 Configure a scalar or list in finetuning.alpha in the Fusion JSON config,
 or pass --alpha 0 0.1 0.25 0.5 0.75 0.9 1. Fine-tuning settings are
-finetuning.{epochs,lr,batch_size,patience,val_fraction}, with matching CLI overrides.
+finetuning.{epochs,lr,batch_size,patience,val_fraction,normalize_loss,eps_rel}, with matching CLI overrides.
+Loss normalization defaults to enabled.
+The relative feature denominator floor eps_rel defaults to 0.01.
 The default sweep is [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1].
 
 Architecture
@@ -80,10 +88,11 @@ Outputs (under outputs/[dataset]/Fusion/{timestamp}_{material}/)
   pretrained_validation_metrics.json  Validation metrics before fine-tuning
   best_alpha_selection.json      Winner, fine-tuning flag and validation selection criterion
   finetuning_split.json          Exact train/validation/test part IDs
+  loss_normalization.json        Fixed training-only factors when normalization is enabled
   sweep_config.json              Resolved settings and checkpoint sources
 
 Each alpha_{value}/ subfolder contains training and validation artifacts:
-  training_history.csv           Train/validation loss and both MAE components
+  training_history.csv           Train/validation loss, raw MAEs, and normalized MAEs when enabled
   finetuning_info.json           Settings and selected epoch/validation loss
   fusion_model.pt                Full tuned Fusion state_dict, including scalers
   m2_best_model.pt               Selected fine-tuned M2 state_dict
@@ -982,13 +991,13 @@ def get_m1_n_f_features(m1_cfg: dict, m1_model: M1Model,
 DEFAULT_FINETUNING = {
     "alpha": [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1],
     "epochs": 200, "lr": 1e-4, "batch_size": 64, "patience": 30,
-    "val_fraction": None,
+    "val_fraction": None, "normalize_loss": True, "eps_rel": 0.01,
 }
 
 
 def resolve_finetuning(cfg: dict, args) -> tuple[list[float], dict]:
     settings = {**DEFAULT_FINETUNING, **cfg.get("finetuning", {})}
-    for key in ("alpha", "epochs", "lr", "batch_size", "patience", "val_fraction"):
+    for key in ("alpha", "epochs", "lr", "batch_size", "patience", "val_fraction", "normalize_loss", "eps_rel"):
         override = getattr(args, key, None)
         if override is not None:
             settings[key] = override
@@ -1003,6 +1012,10 @@ def resolve_finetuning(cfg: dict, args) -> tuple[list[float], dict]:
             raise ValueError(f"finetuning {key} must be a positive integer")
     if not math.isfinite(settings["lr"]) or settings["lr"] <= 0:
         raise ValueError("finetuning lr must be positive and finite")
+    if not isinstance(settings["normalize_loss"], bool):
+        raise ValueError("finetuning normalize_loss must be a boolean")
+    if not math.isfinite(settings["eps_rel"]) or settings["eps_rel"] <= 0:
+        raise ValueError("finetuning eps_rel must be positive and finite")
     if settings["val_fraction"] is not None:
         settings["val_fraction"] = split_fraction(
             settings["val_fraction"], "finetuning.val_fraction")
@@ -1053,15 +1066,45 @@ def finetuning_split(m1_dir, part_ids, dev_idx, test_idx, seed, val_fraction=Non
     return train, val, source
 
 
-def fusion_mae_loss(pred_w, target_w, pred_f, target_f, alpha):
-    """Raw-unit MAE_w and the equally weighted mean of per-feature MAEs."""
+def fusion_loss_normalization(y, features, train_idx, eps_rel=0.01):
+    """Fit fixed loss denominators using only training weights and M1 targets."""
+    if not math.isfinite(eps_rel) or eps_rel <= 0:
+        raise ValueError("finetuning eps_rel must be positive and finite")
+    # Slice before converting: validation/test values never enter these statistics.
+    w = torch.as_tensor(y[train_idx], dtype=torch.float32).detach().reshape(-1)
+    f = torch.as_tensor(features[train_idx], dtype=torch.float32).detach()
+    if not torch.isfinite(w).all() or not torch.isfinite(f).all():
+        raise ValueError("Non-finite fine-tuning training targets")
+    std_w = w.std(unbiased=False)
+    std_f = f.std(dim=0, unbiased=False)
+    # quantile uses the midpoint of the central pair for even feature counts.
+    median_std_f = torch.quantile(std_f, 0.5)
+    if not torch.isfinite(std_w) or std_w <= 0:
+        raise ValueError("Fine-tuning training std_w must be positive and finite")
+    if not torch.isfinite(std_f).all() or not torch.isfinite(median_std_f) or median_std_f <= 0:
+        raise ValueError("Fine-tuning training median(std_f) must be positive and finite")
+    feature_scale = std_f.clamp_min(eps_rel * median_std_f)
+    return {"source": "fusion_finetuning_train", "n_train": len(train_idx),
+            "unbiased": False, "eps_rel": eps_rel,
+            "std_w": float(std_w), "std_f": std_f.tolist(),
+            "median_std_f": float(median_std_f), "feature_scale": feature_scale.tolist()}
+
+
+def fusion_mae_loss(pred_w, target_w, pred_f, target_f, alpha, std_w=None, feature_scale=None):
+    """Raw composite loss and MAEs, or normalized loss plus both MAE forms."""
     mae_w = (pred_w.reshape(-1) - target_w.reshape(-1)).abs().mean()
-    mae_f = (pred_f - target_f).abs().mean(dim=0).mean()
-    return alpha * mae_w + (1 - alpha) * mae_f, mae_w, mae_f
+    per_feature_mae = (pred_f - target_f).abs().mean(dim=0)
+    mae_f = per_feature_mae.mean()
+    if std_w is None:
+        return alpha * mae_w + (1 - alpha) * mae_f, mae_w, mae_f
+    normalized_mae_w = mae_w / std_w
+    normalized_mae_f = (per_feature_mae / feature_scale).mean()
+    loss = alpha * normalized_mae_w + (1 - alpha) * normalized_mae_f
+    return loss, mae_w, mae_f, normalized_mae_w, normalized_mae_f
 
 
 def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
-                settings, seed, device, out_dir):
+                settings, seed, device, out_dir, normalization=None):
     """Train only M2, select by validation composite loss, restore best weights."""
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -1076,6 +1119,18 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     if not all(torch.isfinite(t[train_idx]).all() and torch.isfinite(t[val_idx]).all()
                for t in tensors):
         raise ValueError("Non-finite fine-tuning inputs or targets")
+    normalize_loss = settings.get("normalize_loss", True)
+    std_w, feature_scale = None, None
+    if normalize_loss:
+        if normalization is None:
+            normalization = fusion_loss_normalization(
+                y, features, train_idx, settings.get("eps_rel", 0.01))
+        std_w = torch.as_tensor(normalization["std_w"], dtype=torch.float32, device=device)
+        feature_scale = torch.as_tensor(normalization["feature_scale"], dtype=torch.float32, device=device)
+        print(f"  Loss normalization (training only): {json.dumps(normalization)}", flush=True)
+    else:
+        normalization = None
+        print("  Loss normalization disabled: using raw weight and feature MAEs", flush=True)
     optimizer = torch.optim.Adam(fusion.m2.parameters(), lr=settings["lr"])
     generator = torch.Generator().manual_seed(seed)
     loader = torch.utils.data.DataLoader(
@@ -1085,7 +1140,7 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     def losses(indices):
         x, w, f = [t[indices] for t in tensors]
         pred_w, pred_f = fusion(x, x, return_features=True)
-        return fusion_mae_loss(pred_w, w, pred_f, f, alpha)
+        return fusion_mae_loss(pred_w, w, pred_f, f, alpha, std_w, feature_scale)
 
     def score(indices):
         fusion.eval()
@@ -1099,6 +1154,8 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     # Select an actually fine-tuned checkpoint; epoch 0 remains a reference.
     best_loss = math.inf
     names = ("loss", "mae_w", "mae_f")
+    if normalize_loss:
+        names += ("normalized_mae_w", "normalized_mae_f")
     history.append({"epoch": 0, **dict(zip([f"train_{n}" for n in names], initial_train)),
                     **dict(zip([f"val_{n}" for n in names], initial_val))})
     for epoch in range(1, settings["epochs"] + 1):
@@ -1106,7 +1163,7 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
         fusion.m2.train()
         for (indices,) in loader:
             optimizer.zero_grad(set_to_none=True)
-            loss, _, _ = losses(indices.to(device))
+            loss = losses(indices.to(device))[0]
             if not torch.isfinite(loss):
                 raise ValueError(f"Non-finite training loss at epoch {epoch}")
             loss.backward()
@@ -1135,8 +1192,11 @@ def finetune_m2(fusion, X, y, features, train_idx, val_idx, alpha,
     torch.save(fusion.m2.state_dict(), out_dir / "m2_best_model.pt")
     torch.save(fusion.state_dict(), out_dir / "fusion_model.pt")
     info = {"alpha": alpha, **settings, "seed": seed,
-            "loss": "alpha * MAE_w + (1-alpha) * mean_i(MAE_f_i)",
-            "loss_units": "raw weight and original M1 encoder feature units",
+            "normalize_loss": normalize_loss,
+            "loss": ("alpha * MAE_w / std_w + (1-alpha) * mean_i(MAE_f_i / max(std_f_i, eps_rel * median(std_f)))"
+                     if normalize_loss else "alpha * MAE_w + (1-alpha) * mean_i(MAE_f_i)"),
+            "loss_units": ("dimensionless" if normalize_loss else "raw weight and original M1 encoder feature units"),
+            "normalization": normalization,
             "n_feature_targets": int(features.shape[1]), "m1_frozen": True,
             "best_epoch": best_epoch, "epochs_run": epoch,
             "initial_val_loss": initial_val[0], "best_val_loss": best_loss,
@@ -1181,6 +1241,10 @@ def train_alpha_sweep(fusion, X, y, features, train_idx, val_idx, alphas,
     """
     pretrained_m2_state = copy.deepcopy(fusion.m2.state_dict())
     rows, tuning_by_folder = [], {}
+    normalization = (fusion_loss_normalization(y, features, train_idx, settings.get("eps_rel", 0.01))
+                     if alphas and settings.get("normalize_loss", True) else None)
+    if normalization is not None:
+        (run_dir / "loss_normalization.json").write_text(json.dumps(normalization, indent=2))
 
     def save_candidate(out_dir, alpha, tuning_info, report):
         pred = report.pop("pred")
@@ -1190,6 +1254,9 @@ def train_alpha_sweep(fusion, X, y, features, train_idx, val_idx, alphas,
         report.update(source="validation", alpha=alpha, candidate=out_dir.name, fine_tuned=fine_tuned,
                       feature_MAE=tuning_info["val_metrics"]["mae_f"],
                       composite_loss=tuning_info["best_val_loss"])
+        if normalization is not None:
+            report.update(normalized_MAE=tuning_info["val_metrics"]["normalized_mae_w"],
+                          normalized_feature_MAE=tuning_info["val_metrics"]["normalized_mae_f"])
         if groups is not None:
             report.update(test_point_metrics(y[val_idx], pred, groups[val_idx]))
         (out_dir / "validation_metrics.json").write_text(json.dumps(report, indent=2))
@@ -1220,6 +1287,12 @@ def train_alpha_sweep(fusion, X, y, features, train_idx, val_idx, alphas,
     baseline_info = {"enabled": False, "alpha": None, "seed": seed, "best_epoch": 0,
                      "epochs_run": 0, "best_val_loss": None, "m1_frozen": True,
                      "val_metrics": {"mae_w": baseline["MAE"], "mae_f": feature_mae}}
+    if normalization is not None:
+        baseline_info["normalization"] = normalization
+        baseline_info["val_metrics"].update(
+            normalized_mae_w=baseline["MAE"] / normalization["std_w"],
+            normalized_mae_f=float((np.abs(baseline_features.cpu().numpy() - features[val_idx]).mean(axis=0)
+                                    / np.asarray(normalization["feature_scale"])).mean()))
     torch.save(fusion.state_dict(), baseline_dir / "fusion_model.pt")
     torch.save(pretrained_m2_state, baseline_dir / "m2_best_model.pt")
     (baseline_dir / "finetuning_info.json").write_text(json.dumps(baseline_info, indent=2))
@@ -1232,7 +1305,7 @@ def train_alpha_sweep(fusion, X, y, features, train_idx, val_idx, alphas,
         out_dir.mkdir()
         print(f"\n── Fine-tuning M2: alpha={alpha:g} → {out_dir} ──", flush=True)
         tuning_info = finetune_m2(fusion, X, y, features, train_idx, val_idx,
-                                 alpha, settings, seed, device, out_dir)
+                                 alpha, settings, seed, device, out_dir, normalization=normalization)
         tuning_info["enabled"] = True
         (out_dir / "finetuning_info.json").write_text(json.dumps(tuning_info, indent=2))
         report = evaluate_fusion(fusion, X[val_idx], y[val_idx], device, partition="validation")
@@ -2236,6 +2309,11 @@ def parse_args():
                    help="Fine-tuning batch size (default: config or 64)")
     p.add_argument("--patience", type=int, default=None,
                    help="Early stopping patience on validation composite loss (default: 30)")
+    p.add_argument("--eps-rel", type=float, default=None,
+                   help="Relative floor for feature loss denominators (default: config or 0.01)")
+    p.add_argument("--normalize-loss", action=argparse.BooleanOptionalAction, default=None,
+                   help="Normalize weight and feature MAEs; --no-normalize-loss uses raw MAEs "
+                        "(default: config or enabled)")
     return p.parse_args()
 
 
@@ -2608,7 +2686,16 @@ def main():
         metrics["feature_MAE"] = feature_mae
         metrics["composite_loss"] = (alpha * metrics["MAE"] + (1-alpha) * feature_mae
                                      if alpha is not None else None)
-        pd.DataFrame({"feature": m2_f_cols, "MAE": per_feature_mae}).to_csv(
+        feature_metrics = {"feature": m2_f_cols, "MAE": per_feature_mae}
+        normalization = tuning_info.get("normalization")
+        if normalization is not None:
+            normalized_per_feature = per_feature_mae / np.asarray(normalization["feature_scale"])
+            metrics["normalized_MAE"] = metrics["MAE"] / normalization["std_w"]
+            metrics["normalized_feature_MAE"] = float(normalized_per_feature.mean())
+            metrics["composite_loss"] = (alpha * metrics["normalized_MAE"]
+                + (1-alpha) * metrics["normalized_feature_MAE"] if alpha is not None else None)
+            feature_metrics["normalized_MAE"] = normalized_per_feature
+        pd.DataFrame(feature_metrics).to_csv(
             out_dir / f"{eval_partition}_feature_metrics.csv", index=False)
         feature_predictions = pd.DataFrame({"ID_Part": ids_test})
         for i, name in enumerate(m2_f_cols):

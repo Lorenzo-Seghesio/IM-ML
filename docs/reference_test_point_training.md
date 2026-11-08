@@ -28,10 +28,13 @@ These settings belong in `training`. Set `enabled` to `false` (or omit
 `test_point_training`) to run the original four references as before: Encoder
 and MLP use shuffled part mini-batches, MAE plus L1 regularization, and the
 configured HPO batch-size search, with one run each and no beta sweep.
-LightGBM/XGBoost keep their standard fitting methods. CustomGBDT is skipped
-with a message in this mode, even if `active_models.custom_gbdt` is set.
-Existing split settings and M1 split reuse still apply. Omit `--beta-values`
-when TP training is disabled.
+LightGBM/XGBoost keep their standard fitting methods. Selected CustomGBDT always
+uses the TP-aware loss, sampler and beta sweep, even when the neural TP switch
+is false. Its local configuration enables TP training without changing Encoder
+or MLP. It requires valid TP IDs and grouped splitting; missing prerequisites
+raise an error before training. Existing split settings and M1 split reuse still
+apply. With neural TP training disabled, `--beta-values` applies only to an active
+CustomGBDT.
 
 `beta_values` accepts a scalar or list;
 `within_test_point_beta` records the active coefficient in each experiment.

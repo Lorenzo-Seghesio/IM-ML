@@ -411,6 +411,9 @@ class HybridIntegrationTests(unittest.TestCase):
     def test_original_sweep_selects_validation_winner_before_all_candidate_tests_and_xai(self):
         self._check_original_evaluation(True, alpha_sweep=True)
 
+    def test_original_raw_loss_sweep_and_saved_evaluation_use_raw_composite(self):
+        self._check_original_evaluation(True, alpha_sweep=True, divided=True, normalize_loss=False)
+
     def test_original_sweep_can_select_pretrained_fusion_with_all_candidate_tests_and_xai(self):
         self._check_original_evaluation(True, alpha_sweep=True, baseline_wins=True)
 
@@ -421,7 +424,7 @@ class HybridIntegrationTests(unittest.TestCase):
         self._check_original_evaluation(True, pretrained_only=True)
 
     def _check_original_evaluation(self, test_enabled, alpha_sweep=False, baseline_wins=False, divided=False,
-                                   pretrained_only=False):
+                                   pretrained_only=False, normalize_loss=True):
         from src import M2_PP_to_F as m2
         from src import Fusion_M1M2_WPred as original_fusion
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -464,7 +467,8 @@ class HybridIntegrationTests(unittest.TestCase):
                 "evaluation": {"enabled": test_enabled, "plots": False,
                     "test_2_dir": cfg['evaluation'].get('test_2_dir')}, "xai": {"enabled": alpha_sweep},
                 "finetuning": {"alpha": [0, .5, 1] if alpha_sweep else [0], "epochs": 1, "lr": .001,
-                               "batch_size": 8, "patience": 1, "val_fraction": None}}
+                               "batch_size": 8, "patience": 1, "val_fraction": None,
+                               "normalize_loss": normalize_loss}}
             write_json(root / "config" / "ProBayes" / "Fusion_PP_config.json", fusion_cfg)
             stack.enter_context(patch.object(original_fusion, 'BASE_DIR', root))
             for name in ('_save_scatter', '_save_residuals_scatter', '_save_residuals_hist',
@@ -514,6 +518,12 @@ class HybridIntegrationTests(unittest.TestCase):
             self.assertAlmostEqual(selected_m2['mean_NMAE'], reconstruction['mean_NMAE'])
             fusion_metrics = read_json(reports[0].parent / f'{partition}_metrics.json')
             self.assertAlmostEqual(fusion_metrics['feature_MAE'], reconstruction['mean_MAE'], places=5)
+            if not normalize_loss:
+                self.assertNotIn('normalized_MAE', fusion_metrics)
+                self.assertNotIn('normalized_feature_MAE', fusion_metrics)
+                alpha = fusion_metrics['alpha']
+                self.assertAlmostEqual(fusion_metrics['composite_loss'],
+                    alpha * fusion_metrics['MAE'] + (1-alpha) * fusion_metrics['feature_MAE'])
             if not test_enabled:
                 self.assertFalse(any(root.rglob("test_metrics.json")))
             if pretrained_only:
@@ -613,6 +623,10 @@ class HybridIntegrationTests(unittest.TestCase):
                     for path, contents in checkpoint_bytes.items():
                         self.assertEqual(path.read_bytes(), contents)
                     self.assertEqual(xai.call_count, 24)
+                    if not normalize_loss:
+                        reevaluated = read_json(best / f'{partition}_metrics.json')
+                        self.assertAlmostEqual(reevaluated['composite_loss'], fusion_metrics['composite_loss'])
+                        self.assertNotIn('normalized_MAE', reevaluated)
 
     def test_direct_pp_model_has_no_pp_parameters_and_ignores_pp_hpo(self):
         with tempfile.TemporaryDirectory() as directory:

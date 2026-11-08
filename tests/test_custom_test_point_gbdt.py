@@ -366,11 +366,83 @@ class CustomPipelineTests(unittest.TestCase):
             root = Path(directory) / 'CustomGBDT' / 'best_overall'
             self.assertEqual(json.loads((root / 'best_metrics.json').read_text())['MAE'], 100.)
 
+    def test_main_runs_custom_with_neural_tp_disabled_on_the_saved_m1_split(self):
+        x, y, ids = fixture()
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            training = config(epochs=1)
+            training['test_point_training'].update(enabled=False, beta_values=[0, .25])
+            cfg = {'training': training,
+                   'data': {'id_col': 'part', 'group_col': 'TP', 'target_col': 'weight',
+                            'group_split': {'enabled': True}},
+                   'preprocessing': {'random_seed': 42}, 'output_base_dir': str(root / 'outputs'),
+                   'm1_split_dir': str(root / 'M1'),
+                   'active_models': dict.fromkeys(('encoder', 'mlp', 'lgbm', 'xgboost'), 0),
+                   'custom_gbdt': {'max_depth': 2, 'min_samples_leaf': 1},
+                   'custom_gbdt_hpo': {'n_trials': 0, 'search_space': {}, 'sampler_seed': 7}}
+            cfg['active_models']['custom_gbdt'] = 1
+            path = root / 'config.json'
+            path.write_text(json.dumps(cfg))
+            (root / 'M1').mkdir()
+            split = {'train_part_ids': list(range(16)), 'val_part_ids': list(range(16, 24)),
+                     'test_part_ids': list(range(24, 32))}
+            (root / 'M1/data_processing.json').write_text(json.dumps(split))
+            stack.enter_context(patch.object(ref, 'BASE_DIR', root))
+            stack.enter_context(patch.object(ref, 'BASE_OUT', root / 'outputs'))
+            stack.enter_context(patch.object(ref, '_CFG_MAP', {'DOE1': str(path)}))
+            stack.enter_context(patch.object(ref, 'load_data', return_value=(
+                np.arange(32), x, x, y, None, ['p1', 'p2'], ids, None)))
+            stack.enter_context(patch('sys.argv', ['ref', '--material', 'DOE1']))
+            for name in ('save_cv_plots', 'save_cv_diagnostics', 'save_final_test_plots', '_save_batch_test_artifacts'):
+                stack.enter_context(patch.object(ref, name))
+            output = stack.enter_context(redirect_stdout(io.StringIO()))
+            ref.main()
+            selected = root / 'outputs/CustomGBDT/best_overall'
+            self.assertTrue((selected / 'best_model.joblib').exists())
+            self.assertEqual(json.loads(path.read_text()), cfg)
+            selection = json.loads((selected / 'beta_selection.json').read_text())
+            self.assertEqual(len(selection['experiments']), 2)
+            for result in selection['experiments']:
+                run = Path(result['run_dir'])
+                actual = json.loads((run / 'data_processing.json').read_text())
+                for key, expected in split.items():
+                    self.assertEqual(actual[key], expected)
+                effective = json.loads((run / 'configuration.json').read_text())
+                self.assertTrue(effective['training']['test_point_training']['enabled'])
+                model = custom.CustomTestPointGBDT.load(run / 'best_model.joblib')
+                self.assertTrue(np.isfinite(model.predict(x)).all())
+            self.assertIn('1/5 reference model(s) complete', output.getvalue())
+
+    def test_active_custom_requires_grouped_data_before_any_reference_training(self):
+        x, y, ids = fixture()
+        for groups, enabled in ((None, True), (ids, False)):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                root = Path(directory)
+                cfg = {'training': config(test_point_training={'enabled': False}),
+                       'data': {'target_col': 'weight', 'group_split': {'enabled': enabled}},
+                       'preprocessing': {'random_seed': 42}, 'output_base_dir': directory,
+                       'active_models': {'custom_gbdt': 1}}
+                path = root / 'config.json'
+                path.write_text(json.dumps(cfg))
+                stack.enter_context(patch.object(ref, '_CFG_MAP', {'DOE1': str(path)}))
+                stack.enter_context(patch.object(ref, 'BASE_OUT', root))
+                stack.enter_context(patch.object(ref, 'load_data', return_value=(
+                    np.arange(32), x, x, y, None, ['p1', 'p2'], groups, None)))
+                stack.enter_context(patch('sys.argv', ['ref', '--material', 'DOE1']))
+                runners = [stack.enter_context(patch.object(ref, name)) for name in
+                           ('run_encoder', 'run_mlp', 'run_lgbm', 'run_xgboost', 'run_custom_gbdt')]
+                stack.enter_context(redirect_stdout(io.StringIO()))
+                with self.assertRaisesRegex(ValueError, 'requires test-point IDs'):
+                    ref.main()
+                for runner in runners:
+                    runner.assert_not_called()
+
     def test_main_registers_custom_model_and_passes_shared_split(self):
         x, y, ids = fixture()
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             path = Path(directory) / 'config.json'
-            cfg = {'training': config(), 'data': {'target_col': 'weight', 'group_split': {'enabled': True}},
+            cfg = {'training': config(test_point_training={'enabled': False}),
+                   'data': {'target_col': 'weight', 'group_split': {'enabled': True}},
                    'preprocessing': {'random_seed': 42}, 'output_base_dir': directory,
                    'active_models': {'encoder': 1, 'mlp': 1, 'lgbm': 1, 'xgboost': 1, 'custom_gbdt': 1}}
             path.write_text(json.dumps(cfg))
@@ -381,6 +453,7 @@ class CustomPipelineTests(unittest.TestCase):
             stack.enter_context(patch('sys.argv', ['ref', '--material', 'DOE1', '--models', 'custom_gbdt', '--beta-values', '0', '.25']))
             def sweep(label, cfg, mat_dir, seed, run, override):
                 self.assertEqual(label, 'CustomGBDT')
+                self.assertTrue(cfg['training']['test_point_training']['enabled'])
                 self.assertEqual(override, [0, .25])
                 return run(cfg)
             stack.enter_context(patch.object(ref, 'run_test_point_beta_experiments', side_effect=sweep))
