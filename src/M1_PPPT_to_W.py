@@ -18,7 +18,7 @@ Parameters
 
 Architecture
 ------------
-  p(t) branch : Conv1D stack → GlobalAvgPool → Linear → n_f features  (f)
+  sensor branch : concatenate signals over time → one Conv1D stack → GlobalAvgPool → Linear → f
   pp   branch : MLP  (process parameters)    → n_f features
   merge       : concat(f, pp_out) → MLP → 1  (predicted weight)
 
@@ -41,7 +41,7 @@ Outputs
   outputs/[dataset]/M1/[material]/plots/           scatter & metrics plots
   outputs/[dataset]/M1/[material]/run_best/        best model of this run (always written)
   outputs/[dataset]/M1/[material]/best_overall/    overall best model across all runs (updated when MAE improves)
-    outputs/[dataset]/M1/[material]/sensors_features_f.csv    per-signal encoder features for every part
+    outputs/[dataset]/M1/[material]/sensors_features_f.csv    joint encoder features for every part
 """
 
 import argparse
@@ -320,6 +320,9 @@ class M1Model(nn.Module):
     def __init__(self, n_pp: int, mcfg: dict):
         super().__init__()
         curve_cfgs = mcfg.get("curve_encoders", [])
+        self.concatenate_signals = mcfg.get("encoder_input_layout") == "concatenate_time"
+        if self.concatenate_signals and curve_cfgs:
+            raise ValueError("Time-concatenated inputs require one top-level encoder configuration")
         if curve_cfgs:
             self.encoders = nn.ModuleList([
                 PressureEncoder(
@@ -341,7 +344,7 @@ class M1Model(nn.Module):
                 )
             ])
             self.n_f_total = int(mcfg["n_f_features"])
-        self.n_curves = len(self.encoders)
+        self.n_curves = (int(mcfg.get("n_signals", 1)) if self.concatenate_signals else len(self.encoders))
         if mcfg.get("pp_branch", "mlp") == "direct":
             self.pp_latent_dim = n_pp
             self.pp_mlp = nn.Identity()
@@ -365,6 +368,9 @@ class M1Model(nn.Module):
         return [x_pt]
 
     def forward(self, x_pt, x_pp: torch.Tensor) -> torch.Tensor:
+        if self.concatenate_signals:
+            f = self.encoders[0](self._concatenate_curves(x_pt))
+            return self.merge(torch.cat([f, self.pp_mlp(x_pp)], dim=1))
         x_curves = self._ensure_curve_list(x_pt)
         if len(x_curves) != self.n_curves:
             raise ValueError(
@@ -376,7 +382,10 @@ class M1Model(nn.Module):
 
     @torch.no_grad()
     def get_f_by_curve(self, x_pt) -> list[torch.Tensor]:
+        """One joint block for concatenated inputs; per-curve blocks for old checkpoints."""
         self.eval()
+        if self.concatenate_signals:
+            return [self.encoders[0](self._concatenate_curves(x_pt))]
         x_curves = self._ensure_curve_list(x_pt)
         if len(x_curves) != self.n_curves:
             raise ValueError(
@@ -386,6 +395,19 @@ class M1Model(nn.Module):
     @torch.no_grad()
     def get_f(self, x_pt) -> torch.Tensor:
         return torch.cat(self.get_f_by_curve(x_pt), dim=1)
+
+    def _concatenate_curves(self, x_pt):
+        if isinstance(x_pt, (list, tuple)):
+            if len(x_pt) != self.n_curves:
+                raise ValueError(f"Expected {self.n_curves} sensor signals, got {len(x_pt)}")
+            if any(x.ndim != 3 or x.shape[1] != 1 for x in x_pt):
+                raise ValueError("Each sensor signal must have shape (B, 1, T)")
+            if len({x.shape[0] for x in x_pt}) != 1:
+                raise ValueError("Sensor signal rows must align")
+            return torch.cat(list(x_pt), dim=-1)
+        if x_pt.ndim != 3 or x_pt.shape[1] != 1:
+            raise ValueError("Concatenated sensor input must have shape (B, 1, sum(T))")
+        return x_pt
 
 
 def _count_params(model: nn.Module) -> int:
@@ -644,19 +666,20 @@ def _timeseries_sources(data_cfg: dict) -> list[dict]:
 
 
 def _validate_curve_encoder_config(data_cfg: dict, model_cfg: dict) -> None:
-    """Require one encoder per configured signal before launching training/HPO."""
+    """Resolve one single-channel CNN for time-concatenated training signals.
+
+    Legacy training configs inherit the first branch's stack and the sum of
+    branch feature widths. Checkpoint loading keeps saved architectures intact.
+    """
     sources = _timeseries_sources(data_cfg)
-    encoders = model_cfg.get("curve_encoders")
-    n_encoders = len(encoders) if encoders else 1
-    if n_encoders != len(sources):
-        names = [source.get("name", f"curve_{i + 1}")
-                 for i, source in enumerate(sources)]
-        raise ValueError(
-            f"Configured {len(sources)} time-series signal(s) {names}, but "
-            f"model.curve_encoders defines {n_encoders} encoder(s). "
-            "Keep one encoder entry per signal, in the same order; when removing "
-            "a signal, also remove its corresponding model.curve_encoders entry."
-        )
+    encoders = model_cfg.pop("curve_encoders", None)
+    if encoders:
+        model_cfg.update(copy.deepcopy(encoders[0]))
+        model_cfg["n_f_features"] = sum(int(enc["n_f_features"]) for enc in encoders)
+    channels = list(model_cfg["conv_channels"])
+    channels[0] = 1
+    model_cfg.update(conv_channels=channels, encoder_input_layout="concatenate_time",
+                     n_signals=len(sources))
 
 
 def load_data(data_cfg: dict):
@@ -1015,7 +1038,8 @@ def _feature_summary(feat_csv: Path, id_col: str, n_samples: int,
                      n_pp: int, model_cfg: dict,
                      signals: list[dict]) -> dict:
     curve_feature_total = sum(signal["n_features"] for signal in signals)
-    _, pp_embedding_width = _resolve_pp_branch_dims(model_cfg)
+    pp_embedding_width = (n_pp if model_cfg.get("pp_branch") == "direct"
+                          else _resolve_pp_branch_dims(model_cfg)[1])
     return {
         "feature_file": feat_csv.name,
         "id_column": id_col,
@@ -1087,7 +1111,7 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
                      part_ids, feat_csv: Path, id_col: str,
                      device: torch.device, curve_names: list[str],
                      model_cfg: dict) -> tuple[pd.DataFrame, dict]:
-    """Run curve encoders over all cleaned parts and save labeled features."""
+    """Save joint features, retaining per-signal exports for old checkpoints."""
     pp_sc, pt_scalers = best_scalers
     _, X_pt_sc_list = apply_scalers(X_pp, X_pt, pp_sc, pt_scalers)
     pt_t_list = [
@@ -1095,15 +1119,21 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
         for X_pt_sc in X_pt_sc_list
     ]
     curve_features = best_model_cv.get_f_by_curve(pt_t_list)
-    if len(curve_features) != len(curve_names):
+    joint = getattr(best_model_cv, "concatenate_signals", False)
+    if not joint and len(curve_features) != len(curve_names):
         raise ValueError(
             f"Received {len(curve_features)} encoded curves but {len(curve_names)} "
             "configured signal names."
         )
 
     feature_arrays = [features.cpu().numpy() for features in curve_features]
-    f_cols, signals = _build_sensor_feature_schema(
-        curve_names, [features.shape[1] for features in feature_arrays])
+    if joint:
+        f_cols = [f"f_concat_{i}" for i in range(feature_arrays[0].shape[1])]
+        signals = [{"source_names": curve_names, "signal_name": "concatenated",
+                    "n_features": len(f_cols), "feature_columns": f_cols}]
+    else:
+        f_cols, signals = _build_sensor_feature_schema(
+            curve_names, [features.shape[1] for features in feature_arrays])
 
     f_features = np.concatenate(feature_arrays, axis=1)
     if len(f_cols) != f_features.shape[1]:
@@ -1117,6 +1147,11 @@ def extract_features(best_model_cv, best_scalers, X_pp, X_pt,
     df_f.to_csv(feat_csv)
     feature_summary = _feature_summary(
         feat_csv, id_col, len(part_ids), X_pp.shape[1], model_cfg, signals)
+    if joint:
+        lengths = [int(x.shape[1]) for x in X_pt]
+        feature_summary.update(encoder_input_layout="concatenate_time", input_signals=curve_names,
+                               signal_lengths=lengths, concatenated_length=sum(lengths),
+                               n_input_channels=1)
     (feat_csv.parent / "feature_summary.json").write_text(
         json.dumps(feature_summary, indent=2))
     print(f"Sensor features f saved → {feat_csv}  "
@@ -1225,84 +1260,28 @@ def suggest_hyperparams(trial, ss: dict, n_pp: int,
         m_upd["dropout"] = _sof(trial, "dropout", ss["dropout"])
 
     # ── Conv encoder ──────────────────────────────────────────────────────────
-    # Multi-curve models use the same configurable ranges for every branch,
-    # but each branch gets its own Optuna parameter names and therefore its
-    # own independent samples.  PP/ABS/ALL retain the legacy single-encoder
-    # parameter names and behaviour.
-    has_curve_encoders = bool(base_model_cfg and base_model_cfg.get("curve_encoders"))
-    encoder_keys = {
-        "enc_n_conv_layers", "enc_channels", "enc_kernel_size",
-        "enc_pool_kernel_size", "n_f_features",
-    }
-    if has_curve_encoders and encoder_keys.intersection(ss):
-        curve_updates = []
-        for curve_idx, base_curve in enumerate(base_model_cfg["curve_encoders"]):
-            curve_cfg = copy.deepcopy(base_curve)
-            enc_prefix = f"enc_c{curve_idx}"
-            base_channels = curve_cfg.get("conv_channels", [1, 16])
-            base_kernels = curve_cfg.get("conv_kernels", [5])
-            base_pools = curve_cfg.get("enc_pool_kernels", [])
-
-            enc_n_key = f"{enc_prefix}_n_conv_layers"
-            enc_n = (_soi(trial, enc_n_key, ss["enc_n_conv_layers"])
-                     if "enc_n_conv_layers" in ss
-                     else len(base_channels) - 1)
-            conv_channels = [1]
-            conv_kernels = []
-            pool_kernels = []
-            for i in range(enc_n):
-                ch_key = f"{enc_prefix}_ch_{i}"
-                k_key = f"{enc_prefix}_k_{i}"
-                ch = (_soi(trial, ch_key, ss["enc_channels"])
-                      if "enc_channels" in ss
-                      else (base_channels[i + 1] if i + 1 < len(base_channels) else 16))
-                kernel = (_soi(trial, k_key, ss["enc_kernel_size"])
-                          if "enc_kernel_size" in ss
-                          else (base_kernels[i] if i < len(base_kernels) else 5))
-                conv_channels.append(ch)
-                conv_kernels.append(kernel)
-
-                if i < enc_n - 1:
-                    pool_key = f"{enc_prefix}_pk_{i}"
-                    pool = (_soi(trial, pool_key, ss["enc_pool_kernel_size"])
-                            if "enc_pool_kernel_size" in ss
-                            else (base_pools[i] if i < len(base_pools) else 1))
-                    pool_kernels.append(pool)
-
-            curve_cfg["conv_channels"] = conv_channels
-            curve_cfg["conv_kernels"] = conv_kernels
-            curve_cfg["enc_pool_kernels"] = pool_kernels
-            if "n_f_features" in ss:
-                curve_cfg["n_f_features"] = _soi(
-                    trial, f"{enc_prefix}_n_f_features", ss["n_f_features"])
-            curve_updates.append(curve_cfg)
-        m_upd["curve_encoders"] = curve_updates
-
-    elif "enc_n_conv_layers" in ss:
-        enc_n  = _soi(trial, "enc_n_conv_layers", ss["enc_n_conv_layers"])
-        ch_cfg = ss.get("enc_channels", 16)
-        k_cfg  = ss.get("enc_kernel_size", 5)
-        pk_cfg = ss.get("enc_pool_kernel_size", 1)
-        conv_channels = [1]
-        conv_kernels  = []
-        pool_kernels  = []
+    # Sample one stack for the full time-concatenated sequence.
+    base_channels = (base_model_cfg or {}).get("conv_channels", [1, 16])
+    base_kernels = (base_model_cfg or {}).get("conv_kernels", [5])
+    base_pools = (base_model_cfg or {}).get("enc_pool_kernels", [])
+    if {"enc_n_conv_layers", "enc_channels", "enc_kernel_size", "enc_pool_kernel_size"}.intersection(ss):
+        enc_n = (_soi(trial, "enc_n_conv_layers", ss["enc_n_conv_layers"])
+                 if "enc_n_conv_layers" in ss else len(base_channels) - 1)
+        conv_channels, conv_kernels, pool_kernels = [1], [], []
         for i in range(enc_n):
-            ch = (trial.suggest_int(f"enc_ch_{i}", int(ch_cfg[0]), int(ch_cfg[1]))
-                  if isinstance(ch_cfg, list) else int(ch_cfg))
-            k  = (trial.suggest_int(f"enc_k_{i}",  int(k_cfg[0]),  int(k_cfg[1]))
-                  if isinstance(k_cfg,  list) else int(k_cfg))
+            ch = (_soi(trial, f"enc_ch_{i}", ss["enc_channels"]) if "enc_channels" in ss
+                  else base_channels[min(i + 1, len(base_channels) - 1)])
+            kernel = (_soi(trial, f"enc_k_{i}", ss["enc_kernel_size"]) if "enc_kernel_size" in ss
+                      else base_kernels[min(i, len(base_kernels) - 1)])
             conv_channels.append(ch)
-            conv_kernels.append(k)
-            # pool after every conv except the last
+            conv_kernels.append(kernel)
             if i < enc_n - 1:
-                pk = (trial.suggest_int(f"enc_pk_{i}", int(pk_cfg[0]), int(pk_cfg[1]))
-                      if isinstance(pk_cfg, list) else int(pk_cfg))
-                pool_kernels.append(pk)
-        m_upd["conv_channels"]    = conv_channels
-        m_upd["conv_kernels"]     = conv_kernels
-        m_upd["enc_pool_kernels"] = pool_kernels
-
-    if not has_curve_encoders and "n_f_features" in ss:
+                pool = (_soi(trial, f"enc_pk_{i}", ss["enc_pool_kernel_size"])
+                        if "enc_pool_kernel_size" in ss else (base_pools[i] if i < len(base_pools) else 1))
+                pool_kernels.append(pool)
+        m_upd.update(conv_channels=conv_channels, conv_kernels=conv_kernels,
+                     enc_pool_kernels=pool_kernels)
+    if "n_f_features" in ss:
         m_upd["n_f_features"] = _soi(trial, "n_f_features", ss["n_f_features"])
 
     # ── PP MLP ────────────────────────────────────────────────────────────────

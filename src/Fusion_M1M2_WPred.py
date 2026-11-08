@@ -386,6 +386,7 @@ class M1Model(nn.Module):
     def __init__(self, n_pp, mcfg):
         super().__init__()
         curve_cfgs = mcfg.get("curve_encoders", [])
+        self.concatenate_signals = mcfg.get("encoder_input_layout") == "concatenate_time"
         if curve_cfgs:
             self.encoders = nn.ModuleList([
                 PressureEncoder(
@@ -406,6 +407,9 @@ class M1Model(nn.Module):
                     pool_kernels=mcfg.get("enc_pool_kernels", []),
                 )
             ])
+            if self.concatenate_signals:
+                # Match M1's linear feature projection exactly for new checkpoints.
+                self.encoders[0].act = nn.Identity()
             n_f_total = int(mcfg["n_f_features"])
         if "pp_latent_dim" in mcfg:
             pp_latent_dim = mcfg["pp_latent_dim"]
@@ -425,7 +429,11 @@ class M1Model(nn.Module):
         self.merge   = MergeHead(merge_in, mcfg["merge_hidden"], mcfg["dropout"])
 
     def forward(self, x_pt, x_pp):
-        if isinstance(x_pt, (list, tuple)):
+        if self.concatenate_signals:
+            if isinstance(x_pt, (list, tuple)):
+                x_pt = torch.cat(list(x_pt), dim=-1)
+            f_parts = [self.encoders[0](x_pt)]
+        elif isinstance(x_pt, (list, tuple)):
             f_parts = [enc(x_pt[i]) for i, enc in enumerate(self.encoders)]
         else:
             f_parts = [self.encoders[0](x_pt)]

@@ -70,8 +70,10 @@ class M1Wrapper(nn.Module):
         self.T_viz = T_viz
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_pt = x[:, : self.T_viz].unsqueeze(1)   # (B, 1, T_viz)
-        x_pp = x[:, self.T_viz :]                 # (B, n_pp)
+        n_signals = self.m1.n_curves if self.m1.concatenate_signals else 1
+        width = n_signals * self.T_viz
+        x_pt = x[:, :width].unsqueeze(1)
+        x_pp = x[:, width:]
         return self.m1(x_pt, x_pp)
 
 
@@ -186,7 +188,8 @@ def load_m1(model_dir: Path):
     model.load_state_dict(state)
 
     wrapper = M1Wrapper(model, n_pp, T_VIZ)
-    return wrapper, (1, T_VIZ + n_pp)
+    n_signals = model.n_curves if model.concatenate_signals else 1
+    return wrapper, (1, n_signals * T_VIZ + n_pp)
 
 
 def load_m2(model_dir: Path):
