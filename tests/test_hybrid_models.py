@@ -54,8 +54,7 @@ def fixture(root):
                       "n_folds": 2, "search_space": {"max_depth": [1, 2]}},
            "cv": {"enabled": True, "n_folds": 2, "plots": False}, "evaluation": {"enabled": False, "plots": False},
            "checkpoint": {"reuse": True}, "output": {"output_dir": str(root / "output")}}
-    model_cfg = {"curve_encoders": [{"conv_channels": [1, 2], "conv_kernels": [3],
-                                    "n_f_features": 2} for _ in sources],
+    model_cfg = {"conv_channels": [len(sources), 2], "conv_kernels": [3], "n_f_features": 4,
                  "pp_hidden": [3], "pp_latent_dim": 2, "merge_hidden": [3], "dropout": 0.}
     return cfg, model_cfg
 

@@ -12,6 +12,7 @@ from .hybrid_data import load_data, read_json, write_json
 from .hybrid_diagnostics import save_partition_plots
 from .m1_test_point_training import test_point_metrics
 from .doe1_columns import doe1_column_name
+from .signal_channels import stack_signal_arrays
 
 
 def external_dataset(cfg, data_cfg=None):
@@ -129,14 +130,17 @@ def finish_original_stage(cfg, stage, directory, overall=None, model=None, trans
         write_json(directory/"test_2_metrics.json", report)
     else:
         if stage == "Encoder":
-            values = np.concatenate(external.curves, axis=1)
+            first_conv = next(m for m in model.modules() if isinstance(m, torch.nn.Conv1d))
+            # Old reference checkpoints treated all signals as one long curve.
+            values = (np.concatenate(external.curves, axis=1) if first_conv.in_channels == 1
+                      and len(external.curves) > 1 else stack_signal_arrays(external.curves))
         else:
             values = external.pp
         values = transform(values) if transform else values
         if isinstance(model, torch.nn.Module):
             dev = next(model.parameters()).device
             tensor = torch.as_tensor(values, dtype=torch.float32, device=dev)
-            if stage == "Encoder":
+            if stage == "Encoder" and tensor.ndim == 2:
                 tensor = tensor[:, None, :]
             model.eval()
             with torch.inference_mode():

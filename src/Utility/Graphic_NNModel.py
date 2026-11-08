@@ -58,9 +58,9 @@ T_VIZ = 128   # used only for graph tracing; actual T does not affect structure
 class M1Wrapper(nn.Module):
     """Single-tensor wrapper around M1Model for visualtorch compatibility.
 
-    Concatenates the flattened pressure curve (T_viz timesteps) and the
+    Concatenates the flattened signal channels (C * T_viz values) and the
     process-parameter vector into one flat input:
-        x : (B, T_viz + n_pp)
+        x : (B, C * T_viz + n_pp)
     """
 
     def __init__(self, m1_model: nn.Module, n_pp: int, T_viz: int):
@@ -68,10 +68,14 @@ class M1Wrapper(nn.Module):
         self.m1    = m1_model
         self.n_pp  = n_pp
         self.T_viz = T_viz
+        self.n_channels = m1_model.n_curves
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_pt = x[:, : self.T_viz].unsqueeze(1)   # (B, 1, T_viz)
-        x_pp = x[:, self.T_viz :]                 # (B, n_pp)
+        width = self.n_channels * self.T_viz
+        x_pt = x[:, :width].reshape(-1, self.n_channels, self.T_viz)
+        if not self.m1.multichannel:
+            x_pt = list(x_pt.split(1, dim=1))
+        x_pp = x[:, width:]
         return self.m1(x_pt, x_pp)
 
 
@@ -170,7 +174,7 @@ def load_ref_encoder(model_dir: Path):
     model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout)
     state = torch.load(model_dir / "best_model.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(state)
-    return model, (1, 1, T_VIZ)
+    return model, (1, channels[0], T_VIZ)
 
 
 def load_m1(model_dir: Path):
@@ -186,7 +190,7 @@ def load_m1(model_dir: Path):
     model.load_state_dict(state)
 
     wrapper = M1Wrapper(model, n_pp, T_VIZ)
-    return wrapper, (1, T_VIZ + n_pp)
+    return wrapper, (1, model.n_curves * T_VIZ + n_pp)
 
 
 def load_m2(model_dir: Path):

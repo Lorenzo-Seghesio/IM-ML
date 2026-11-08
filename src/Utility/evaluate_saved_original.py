@@ -338,7 +338,9 @@ def evaluate_run(run_dir, output, xai=True, threads=4):
     for source in sorted((run_dir / 'RefModels').glob('*/best_overall')):
         label = source.parent.name
         rcfg, meta = read_json(source / 'configuration.json'), read_json(source / 'best_metrics.json')
-        rids, rpp, rpt, ry, _, rcols, rgroups, _ = refs.load_data(rcfg['data'], rcfg['preprocessing'], 'DOE1')
+        channel_input = label == 'Encoder' and (meta.get('input_layout') == 'channels' or meta.get('channels', [1])[0] > 1)
+        rids, rpp, rpt, ry, _, rcols, rgroups, _ = refs.load_data(
+            rcfg['data'], rcfg['preprocessing'], 'DOE1', multichannel=channel_input)
         if rcols != [doe1_column_name(c) for c in pp_cols]:
             raise ValueError(f'{label}: reference PP feature ordering differs')
         rtest, rdev = map_ids(rids, contract['test_part_ids']), map_ids(rids, contract['train_part_ids'] + contract['val_part_ids'])

@@ -157,6 +157,7 @@ def train_teacher(cfg, dataset, splits, contract, directory, seed):
     dev = np.concatenate([train, val])
     device = device_for(cfg)
     model_cfg, train_cfg = copy.deepcopy(cfg["model"]), copy.deepcopy(cfg["training"])
+    m1._validate_curve_encoder_config(dataset.config["data"], model_cfg)
     hpo = cfg.get("optuna", {})
     if hpo_enabled(hpo) and cfg.get("mode", "manual") == "optuna":
         def objective(trial):

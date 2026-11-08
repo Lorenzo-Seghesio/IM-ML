@@ -90,6 +90,8 @@ def _reuse_checkpoint(cfg, directory, signature, files, training_selected=True):
 
 
 def _feature_names(teacher, dataset):
+    if teacher.model.multichannel:
+        return [f"f_joint_{i}" for i in range(teacher.model.n_f_total)]
     widths = [encoder.fc.out_features for encoder in teacher.model.encoders]
     return [f"f_{source.get('name', f'signal_{number+1}')}__{i}"
             for number, (source, width) in enumerate(zip(dataset.sources, widths)) for i in range(width)]

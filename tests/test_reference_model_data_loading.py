@@ -26,6 +26,7 @@ class ReferenceModelDataLoadingTests(unittest.TestCase):
             pd.DataFrame({
                 'ID': [1, 2],
                 't0': [50.0, 60.0],
+                't1': [70.0, 80.0],
             }).to_csv(root / 'temperature.csv', index=False)
 
             data_cfg = {
@@ -45,7 +46,9 @@ class ReferenceModelDataLoadingTests(unittest.TestCase):
         part_ids, x_pp, x_pt, y, strat_labels, pp_cols, group_ids, edge_values = result
         np.testing.assert_array_equal(part_ids, [1, 2])
         np.testing.assert_array_equal(x_pp, [[3.0], [4.0]])
-        np.testing.assert_allclose(x_pt, [[0.1, 0.3, 50.0], [0.2, 0.4, 60.0]])
+        self.assertEqual(x_pt.shape, (2, 2, 2))
+        np.testing.assert_allclose(x_pt, [[[0.1, 0.3], [50.0, 70.0]],
+                                         [[0.2, 0.4], [60.0, 80.0]]])
         np.testing.assert_array_equal(y, [10.0, 20.0])
         self.assertIsNone(strat_labels)
         self.assertEqual(pp_cols, ['feature'])

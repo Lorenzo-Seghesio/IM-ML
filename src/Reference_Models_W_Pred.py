@@ -166,8 +166,10 @@ warnings.simplefilter("always", InsufficientVariabilityWarning)
 
 try:
     from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+    from Utility.signal_channels import stack_signal_arrays
 except ModuleNotFoundError:
     from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+    from src.Utility.signal_channels import stack_signal_arrays
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 BASE_OUT = BASE_DIR / "outputs" # It will be in main
@@ -220,7 +222,7 @@ def _initial_split(n: int, test_frac: float, seed: int, strat_labels=None,
 class EncoderModel(nn.Module):
     """
     Conv1D stack → MaxPool (between layers) → AdaptiveAvgPool1d(1) → MLP head → scalar.
-    Input : (B, 1, T)  — normalised pressure curve.
+    Input : (B, C, T)  — one configured signal per channel.
     Output: (B,)       — predicted weight.
     """
 
@@ -293,8 +295,12 @@ class MLPModel(nn.Module):
 # ── Input preparation helpers ─────────────────────────────────────────────────
 
 def _enc_prepare(x_np: np.ndarray) -> torch.Tensor:
-    """(N, T) → (N, 1, T) float32 tensor."""
-    return torch.tensor(x_np[:, None, :], dtype=torch.float32)
+    """Preserve (N, C, T); accept legacy single-channel (N, T) arrays."""
+    if x_np.ndim == 2:
+        x_np = x_np[:, None, :]
+    if x_np.ndim != 3:
+        raise ValueError("Encoder inputs must have shape (N, C, T)")
+    return torch.tensor(x_np, dtype=torch.float32)
 
 
 def _mlp_prepare(x_np: np.ndarray) -> torch.Tensor:
@@ -333,7 +339,7 @@ def _timeseries_sources(data_cfg: dict) -> list[dict]:
     return sources
 
 
-def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
+def load_data(data_cfg: dict, prep_cfg: dict, material: str = "", *, multichannel=True):
     """Join scalar and configured time-series CSVs and return aligned model arrays."""
     df_scalar   = pd.read_csv(BASE_DIR / data_cfg["scalar_csv"],
                                index_col=data_cfg["id_col"])
@@ -381,9 +387,6 @@ def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
         df = df.join(df_curve, how="inner")
     print(f"Joined : {df.shape[0]} parts × {df.shape[1]} columns")
 
-    timeseries_cols = []
-    for df_curve in timeseries_frames:
-        timeseries_cols.extend(list(df_curve.columns))
     pp_cols       = [c for c in df_scalar.columns
                      if c != target_col and c != group_col]
 
@@ -413,11 +416,13 @@ def load_data(data_cfg: dict, prep_cfg: dict, material: str = ""):
 
     part_ids     = df.index.to_numpy()
     X_pp         = df[pp_cols].to_numpy(dtype=np.float32)
-    X_pt         = df[timeseries_cols].to_numpy(dtype=np.float32)
+    signal_arrays = [df[list(frame.columns)].to_numpy(dtype=np.float32) for frame in timeseries_frames]
+    X_pt = (stack_signal_arrays(signal_arrays) if multichannel
+            else np.concatenate(signal_arrays, axis=1))
     y            = df[target_col].to_numpy(dtype=np.float32)
     strat_labels = df[mat_col].to_numpy() if mat_col else None
 
-    print(f"pp features: {X_pp.shape[1]}  |  time steps: {X_pt.shape[1]}  |  samples: {len(y)}")
+    print(f"pp features: {X_pp.shape[1]}  |  signal shape: {X_pt.shape[1:]}  |  samples: {len(y)}")
     print(f"Target: mean={y.mean():.3f}  std={y.std():.3f}  "
           f"min={y.min():.3f}  max={y.max():.3f}")
     group_ids = (group_values.reindex(df.index).to_numpy()
@@ -1100,7 +1105,7 @@ def _xai_ig_mlp(model: nn.Module, X_test_sc: np.ndarray, X_bg_sc: np.ndarray,
 def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
                          out_dir: Path, label: str, device: torch.device):
     """GradCAM on the last Conv1d of EncoderModel.
-    Produces (1) mean heatmap overlaid on mean pressure curve and
+    Produces (1) mean heatmap overlaid on mean signal curves and
              (2) per-sample heatmap as an image.
     """
     try:
@@ -1125,7 +1130,7 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
         fwd_h = last_conv.register_forward_hook(_fwd)
         bwd_h = last_conv.register_full_backward_hook(_bwd)
 
-        X_t = torch.tensor(X_test_sc[:, None, :], dtype=torch.float32, device=device)
+        X_t = _enc_prepare(X_test_sc).to(device)
         model.zero_grad()
         model(X_t).sum().backward()
         fwd_h.remove()
@@ -1140,7 +1145,7 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
         cam_max[cam_max == 0] = 1.0
         cam /= cam_max
 
-        T_orig   = X_test_sc.shape[1]
+        T_orig   = X_test_sc.shape[-1]
         t_orig   = np.linspace(0, 1, T_orig)
         t_cam    = np.linspace(0, 1, cam.shape[1])
         cam_up   = np.stack([np.interp(t_orig, t_cam, cam[i]) for i in range(len(cam))])
@@ -1150,8 +1155,9 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
 
         ax = axes[0]
         t_ax = np.arange(T_orig)
-        ax.plot(t_ax, X_test_sc.mean(axis=0), color=_PLT_C["pressure"],
-                linewidth=1.5, label="Mean pressure (test, normalised)")
+        mean_signals = X_t.detach().cpu().numpy().mean(axis=0)
+        for channel, signal in enumerate(mean_signals):
+            ax.plot(t_ax, signal, linewidth=1.5, label=f"Signal {channel + 1} (test mean)")
         ax2 = ax.twinx()
         ax2.spines["right"].set_visible(True)
         ax2.spines["top"].set_visible(False)
@@ -1160,7 +1166,7 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
         ax2.tick_params(axis="y", labelcolor=_PLT_C["gradcam"])
         ax2.set_ylim(0, 1.3)
         ax.set_xlabel("Time step")
-        ax.set_ylabel("Normalised pressure", color=_PLT_C["pressure"])
+        ax.set_ylabel("Normalised signals", color=_PLT_C["pressure"])
         ax.tick_params(axis="y", labelcolor=_PLT_C["pressure"])
         ax.set_title(f"[{label}] GradCAM — averaged over test set")
         h1, l1 = ax.get_legend_handles_labels()
@@ -1438,7 +1444,7 @@ def _soi(trial, key, val, log=False):
         if isinstance(val, list) else int(val)
 
 
-def suggest_encoder_params(trial, ss: dict):
+def suggest_encoder_params(trial, ss: dict, n_input_channels: int = 1):
     mcfg, tcfg = {}, {}
     if "lr" in ss:           tcfg["lr"]           = _sof(trial, "lr",           ss["lr"],           log=True)
     if "weight_decay" in ss: tcfg["weight_decay"] = _sof(trial, "weight_decay", ss["weight_decay"], log=True)
@@ -1451,7 +1457,7 @@ def suggest_encoder_params(trial, ss: dict):
         ch_cfg = ss.get("enc_channels", 16)
         k_cfg  = ss.get("enc_kernel_size", 5)
         pk_cfg = ss.get("enc_pool_kernel_size", 1)
-        channels, kernels, pool_kernels = [1], [], []
+        channels, kernels, pool_kernels = [n_input_channels], [], []
         for i in range(enc_n):
             ch = (trial.suggest_int(f"enc_ch_{i}", int(ch_cfg[0]), int(ch_cfg[1]))
                   if isinstance(ch_cfg, list) else int(ch_cfg))
@@ -1532,13 +1538,14 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
                  edge_cfg=None):
     _require_test_point_grouping(base_tcfg, group_values, group_cfg)
     ss = _nn_search_space(hpo_cfg, base_tcfg)
-    mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
+    n_input_channels = X_pt.shape[1] if X_pt.ndim == 3 else 1
+    mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss, n_input_channels)
     tcfg = {**base_tcfg, **tcfg_upd,
             "val_fraction": validation_fraction(base_tcfg, hpo_cfg),
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
             "print_every": 999999, "k_folds": hpo_cfg["n_folds"]}
 
-    channels     = mcfg_upd.get("channels",     [1, 16])
+    channels     = mcfg_upd.get("channels",     [n_input_channels, 16])
     kernels      = mcfg_upd.get("kernels",       [5])
     pool_kernels = mcfg_upd.get("pool_kernels",  [])
     head_hidden  = mcfg_upd.get("head_hidden",   [64])
@@ -1691,7 +1698,7 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         d.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#' * 60}")
-    print("# ENCODER: Conv1D pressure curves → weight")
+    print("# ENCODER: multichannel Conv1D signals → weight")
     print(f"{'#' * 60}")
 
     dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
@@ -1710,10 +1717,11 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
-    mcfg_u, tcfg_u = suggest_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg))
+    n_input_channels = X_pt.shape[1] if X_pt.ndim == 3 else 1
+    mcfg_u, tcfg_u = suggest_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg), n_input_channels)
     train_cfg.update(tcfg_u)
 
-    channels     = mcfg_u.get("channels",     [1, 16])
+    channels     = mcfg_u.get("channels",     [n_input_channels, 16])
     kernels      = mcfg_u.get("kernels",       [5])
     pool_kernels = mcfg_u.get("pool_kernels",  [])
     head_hidden  = mcfg_u.get("head_hidden",   [64])
@@ -1772,7 +1780,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     (rb_dir / "scalers.json").write_text(json.dumps({"pt_min": pt_min, "pt_max": pt_max}, indent=2))
 
     arch_info = {"channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
-                 "head_hidden": head_hidden, "dropout": dropout}
+                 "head_hidden": head_hidden, "dropout": dropout,
+                 "input_layout": "channels", "n_input_channels": n_input_channels}
     updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "Encoder")
 
     # XAI — GradCAM on the last Conv1d layer

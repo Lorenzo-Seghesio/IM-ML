@@ -25,6 +25,22 @@ from src import Reference_Models_W_Pred as references
 
 
 class DividedDatasetTests(unittest.TestCase):
+    def test_reference_multichannel_external_test_preserves_signal_order(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory)
+            cfg, _ = divided_fixture(root)
+            external = external_dataset(cfg)
+            cfg['evaluation'].update(enabled=True, plots=False)
+            model = references.EncoderModel([len(external.curves), 3], [3], [], [2], 0.).eval()
+            with torch.no_grad():
+                expected = model(torch.tensor(np.stack(external.curves, axis=1))).numpy()
+            out = root / 'multichannel_reference'
+            out.mkdir()
+            finish_original_stage(cfg, 'Encoder', out, model=model)
+            predicted = pd.read_csv(out / 'test_2_predictions.csv')
+            np.testing.assert_allclose(predicted['y_pred'], expected, rtol=1e-6)
+            self.assertEqual(predicted['part_id'].tolist(), external.ids.tolist())
+
     def test_original_stage_with_test2_disabled_keeps_test1_and_removes_old_external_reports(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); cfg, _ = divided_fixture(root)

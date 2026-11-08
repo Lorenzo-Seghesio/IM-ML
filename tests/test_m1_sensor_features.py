@@ -18,11 +18,22 @@ from src.M1_PPPT_to_W import (
 
 
 class M1SensorFeatureSchemaTests(unittest.TestCase):
-    def test_removed_signal_requires_removing_its_encoder(self):
+    def test_input_channel_count_tracks_configured_signals(self):
         data = {"timeseries_csvs": [{"name": "p1"}, {"name": "p2"}]}
-        with self.assertRaisesRegex(ValueError, "also remove its corresponding"):
-            _validate_curve_encoder_config(data, {"curve_encoders": [{}, {}, {}]})
-        _validate_curve_encoder_config(data, {"curve_encoders": [{}, {}]})
+        model = {"conv_channels": [3, 8, 16], "n_f_features": 4}
+        _validate_curve_encoder_config(data, model)
+        self.assertEqual(model["conv_channels"], [2, 8, 16])
+        self.assertEqual(model["n_f_features"], 4)
+
+    def test_legacy_training_configs_resolve_to_one_shared_encoder(self):
+        data = {"timeseries_csvs": [{"name": "p1"}, {"name": "T"}]}
+        model = {"curve_encoders": [
+            {"conv_channels": [1, 8], "conv_kernels": [3], "n_f_features": 4},
+            {"conv_channels": [1, 16], "conv_kernels": [5], "n_f_features": 2}]}
+        _validate_curve_encoder_config(data, model)
+        self.assertNotIn("curve_encoders", model)
+        self.assertEqual(model["conv_channels"], [2, 8])
+        self.assertEqual(model["n_f_features"], 6)
 
     def test_source_names_support_current_and_legacy_configuration(self):
         sources = [{"name": "p1", "path": "p1.csv"},
