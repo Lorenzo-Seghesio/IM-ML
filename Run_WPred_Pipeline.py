@@ -10,7 +10,18 @@ Usage
     python Run_WPred_Pipeline.py --material PP ABS
     python Run_WPred_Pipeline.py --material PP ABS ALL
 
-The pipeline config (config/WPred_Pipeline_config.json) controls:
+The default config selects original, gbdt_pppt, gbdt_ppdirect_pt and
+gbdt_engineered with models.<family>.enabled/n_runs. Each count is one complete
+sequential repetition. Architecture/HPO/training/testing remain in each model's
+own configuration. See docs/xgboost_hybrid_pipeline.md. --dry-run previews work.
+models.original.n_m1_run_per_pipeline_run, n_m2_run_per_pipeline_run and
+n_fusion_run_per_pipeline_run control stage launches (default: 1). Zero skips
+training and copies required parents from best_reference_run. M2-only results
+stay separate; only requested Fusion runs can update the reference snapshot.
+data_split.seed and data_split.seed_step choose fixed or changing final splits
+across repetitions. Reused models retain their saved split contracts.
+
+Legacy pipeline configurations also support:
   - n_runs_m1          : how many times M1 is launched per material
   - n_runs_m2          : how many times M2 is launched per material after M1 finishes
   - n_runs_fusion      : how many times Fusion is launched per material after M2
@@ -121,6 +132,8 @@ def main() -> None:
     parser.add_argument(
         "--optuna-seed", type=int, default=None,
         help="Optuna sampler seed for exact replay; omit for fresh seeds per HPO launch.")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print selected families/repetitions without training or evaluation")
     args = parser.parse_args()
 
     # Default to all materials when --material is omitted or empty
@@ -130,6 +143,15 @@ def main() -> None:
     if not cfg_path.exists():
         sys.exit(f"[pipeline] Config not found: {cfg_path}")
     cfg = json.loads(cfg_path.read_text())
+
+    if "models" in cfg:
+        from src.Utility.family_launcher import run_families
+        failures = run_families(cfg, materials, args.optuna_seed, args.dry_run)
+        sys.exit(1 if failures else 0)
+    if args.dry_run:
+        print("Legacy pipeline: materials=", materials, "counts=",
+              {key: cfg.get(key, 1) for key in ("n_runs_m1", "n_runs_m2", "n_runs_fusion", "n_runs_ref")})
+        return
 
     n_runs_m1         = int(cfg.get("n_runs_m1", 1))
     n_runs_m2         = int(cfg.get("n_runs_m2", 1))
@@ -152,7 +174,7 @@ def main() -> None:
             sys.exit(f"[pipeline] {name} script not found: {path}")
 
     _banner(f"WPred Pipeline  ·  materials={', '.join(materials)}", char="═")
-    print(f"  Config    : {cfg_path.relative_to(BASE_DIR)}")
+    print(f"  Config    : {cfg_path}")
     print(f"  Materials : {', '.join(materials)}")
     print(f"  M1        : {m1_script.relative_to(BASE_DIR)}  ×{n_runs_m1}"
           f"  (abort_on_error={abort_on_m1_err})")

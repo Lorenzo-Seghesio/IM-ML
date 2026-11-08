@@ -7,12 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.preprocessing import MinMaxScaler
 
 from src.Fusion_M1M2_WPred import (
     FusionModel, M2Model, PPMLP, MergeHead, TorchMinMaxScaler,
     finetune_m2, finetuning_split, fusion_mae_loss, resolve_finetuning, parse_args,
+    fusion_loss_normalization, train_alpha_sweep,
 )
 
 
@@ -32,10 +34,137 @@ class FusionFinetuningTests(unittest.TestCase):
         pred_f = torch.tensor([[0., 4.], [2., 8.]])
         true_f = torch.zeros_like(pred_f)
         for alpha in (0., 0.25, 1.):
-            loss, w, f = fusion_mae_loss(pred_w, true_w, pred_f, true_f, alpha)
+            loss, w, f, nw, nf = fusion_mae_loss(
+                pred_w, true_w, pred_f, true_f, alpha, 2., torch.tensor([1., 3.]))
             self.assertAlmostEqual(w.item(), 2.5)
             self.assertAlmostEqual(f.item(), 3.5)
+            self.assertAlmostEqual(nw.item(), 1.25)
+            self.assertAlmostEqual(nf.item(), 1.5)
+            self.assertAlmostEqual(loss.item(), alpha * 1.25 + (1-alpha) * 1.5)
+
+    def test_raw_loss_matches_original_maes_and_endpoints(self):
+        pred_w, true_w = torch.tensor([2., 6.]), torch.tensor([1., 2.])
+        pred_f = torch.tensor([[0., 4.], [2., 8.]])
+        for alpha in (0., .25, 1.):
+            loss, mae_w, mae_f = fusion_mae_loss(
+                pred_w, true_w, pred_f, torch.zeros_like(pred_f), alpha)
+            self.assertAlmostEqual(mae_w.item(), 2.5)
+            self.assertAlmostEqual(mae_f.item(), 3.5)
             self.assertAlmostEqual(loss.item(), alpha * 2.5 + (1-alpha) * 3.5)
+
+    def test_normalize_loss_config_and_cli_precedence(self):
+        _, settings = resolve_finetuning({}, SimpleNamespace())
+        self.assertTrue(settings["normalize_loss"])
+        for configured in (False, True):
+            cfg = {"finetuning": {"normalize_loss": configured}}
+            for flag, expected in ((None, configured), ("--normalize-loss", True),
+                                   ("--no-normalize-loss", False)):
+                argv = ["fusion", "--material", "DOE1"] + ([flag] if flag else [])
+                with self.subTest(configured=configured, flag=flag), patch("sys.argv", argv):
+                    _, settings = resolve_finetuning(cfg, parse_args())
+                    self.assertIs(settings["normalize_loss"], expected)
+                self.assertIs(cfg["finetuning"]["normalize_loss"], configured)
+        for invalid in ("false", 0, 1, None):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "normalize_loss"):
+                resolve_finetuning({"finetuning": {"normalize_loss": invalid}}, SimpleNamespace())
+
+    def test_disabled_normalization_skips_factors_and_uses_raw_loss_for_train_and_val(self):
+        model = self.make_model()
+        X = np.random.default_rng(3).uniform(size=(12, 2)).astype(np.float32)
+        # Zero variances are valid for the original objective.
+        y, features = np.zeros(12), np.zeros((12, 2))
+        settings = {"epochs": 2, "lr": .001, "batch_size": 4, "patience": 2,
+                    "normalize_loss": False}
+        with tempfile.TemporaryDirectory() as tmp, patch(
+                "src.Fusion_M1M2_WPred.fusion_loss_normalization",
+                side_effect=AssertionError("Raw loss must not compute normalization factors")):
+            run_dir = Path(tmp)
+            train_alpha_sweep(model, X, y, features, np.arange(8), np.arange(8, 12),
+                [.25], settings, 42, torch.device("cpu"), run_dir, np.arange(12), plots=False)
+            self.assertFalse((run_dir / "loss_normalization.json").exists())
+            folder = run_dir / "alpha_0.25"
+            info = json.loads((folder / "finetuning_info.json").read_text())
+            self.assertIs(info["normalize_loss"], False)
+            self.assertIsNone(info["normalization"])
+            self.assertEqual(info["loss"], "alpha * MAE_w + (1-alpha) * mean_i(MAE_f_i)")
+            history = pd.read_csv(folder / "training_history.csv")
+            self.assertFalse(any("normalized" in name for name in history.columns))
+            for partition in ("train", "val"):
+                np.testing.assert_allclose(history[f"{partition}_loss"],
+                    .25 * history[f"{partition}_mae_w"] + .75 * history[f"{partition}_mae_f"], rtol=1e-6)
+            report = json.loads((folder / "validation_metrics.json").read_text())
+            self.assertNotIn("normalized_MAE", report)
+            self.assertNotIn("normalized_feature_MAE", report)
+            metrics = info["val_metrics"]
+            self.assertAlmostEqual(info["best_val_loss"], .25 * metrics["mae_w"] + .75 * metrics["mae_f"])
+
+    def test_normalization_uses_only_training_population_std_and_relative_floor(self):
+        y = np.array([0., 2., 1000., np.nan])
+        features = np.array([[0., 0., 0., 0.], [0., .002, 4., 8.],
+                             [1e6, 1e6, 1e6, 1e6], [np.nan] * 4])
+        factors = fusion_loss_normalization(y, features, np.arange(2))
+        self.assertEqual(factors["std_w"], 1.)
+        np.testing.assert_allclose(factors["std_f"], [0., .001, 2., 4.])
+        self.assertAlmostEqual(factors["median_std_f"], 1.0005, places=6)
+        np.testing.assert_allclose(factors["feature_scale"], [.010005, .010005, 2., 4.])
+        self.assertFalse(factors["unbiased"])
+        loss = fusion_mae_loss(torch.ones(2), torch.zeros(2), torch.ones(2, 4),
+            torch.zeros(2, 4), .5, factors["std_w"], torch.tensor(factors["feature_scale"]))[0]
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_degenerate_normalization_is_rejected(self):
+        train = np.arange(3)
+        with self.assertRaisesRegex(ValueError, "std_w"):
+            fusion_loss_normalization(np.ones(3), np.arange(6).reshape(3, 2), train)
+        with self.assertRaisesRegex(ValueError, r"median\(std_f\)"):
+            fusion_loss_normalization(np.arange(3), np.zeros((3, 2)), train)
+
+    def test_eps_rel_default_config_and_cli_override(self):
+        _, settings = resolve_finetuning({}, SimpleNamespace())
+        self.assertEqual(settings["eps_rel"], .01)
+        config = {"finetuning": {"eps_rel": .02}}
+        _, settings = resolve_finetuning(config, SimpleNamespace())
+        self.assertEqual(settings["eps_rel"], .02)
+        with patch("sys.argv", ["fusion", "--material", "DOE1", "--eps-rel", ".03"]):
+            _, settings = resolve_finetuning(config, parse_args())
+        self.assertEqual(settings["eps_rel"], .03)
+        for invalid in (0., -.01, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "eps_rel"):
+                resolve_finetuning({"finetuning": {"eps_rel": invalid}}, SimpleNamespace())
+
+    def test_sweep_fits_factors_once_and_logs_fixed_normalized_metrics(self):
+        from src import Fusion_M1M2_WPred as module
+        model = self.make_model()
+        X = np.random.default_rng(3).uniform(size=(12, 2)).astype(np.float32)
+        y, features = np.arange(12, dtype=np.float32), X.copy()
+        features[8:] *= 1000
+        settings = {"epochs": 2, "lr": .001, "batch_size": 4, "patience": 2}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+                module, "fusion_loss_normalization", wraps=fusion_loss_normalization) as fit:
+            run_dir = Path(tmp)
+            train_alpha_sweep(model, X, y, features, np.arange(8), np.arange(8, 12),
+                [0., .5], settings, 42, torch.device("cpu"), run_dir, np.arange(12), plots=False)
+            self.assertEqual(fit.call_count, 1)
+            factors = json.loads((run_dir / "loss_normalization.json").read_text())
+            self.assertAlmostEqual(factors["std_w"], float(y[:8].std()), places=6)
+            np.testing.assert_allclose(factors["std_f"], features[:8].std(axis=0))
+            for alpha in (0., .5):
+                folder = run_dir / f"alpha_{alpha}"
+                info = json.loads((folder / "finetuning_info.json").read_text())
+                self.assertEqual(info["normalization"], factors)
+                history = pd.read_csv(folder / "training_history.csv")
+                for partition in ("train", "val"):
+                    np.testing.assert_allclose(history[f"{partition}_normalized_mae_w"],
+                        history[f"{partition}_mae_w"] / factors["std_w"], rtol=1e-6)
+                    np.testing.assert_allclose(history[f"{partition}_loss"],
+                        alpha * history[f"{partition}_normalized_mae_w"]
+                        + (1-alpha) * history[f"{partition}_normalized_mae_f"], rtol=1e-6)
+                with torch.no_grad():
+                    model.load_state_dict(torch.load(folder / "fusion_model.pt", weights_only=True))
+                    _, pred = model(torch.tensor(X[8:]), torch.tensor(X[8:]), return_features=True)
+                expected = (np.abs(pred.numpy() - features[8:]).mean(axis=0)
+                            / np.asarray(factors["feature_scale"])).mean()
+                self.assertAlmostEqual(info["val_metrics"]["normalized_mae_f"], expected, places=3)
 
     def test_embedding_preserves_permuted_positions(self):
         model = self.make_model()
@@ -165,7 +294,7 @@ class FusionFinetuningTests(unittest.TestCase):
         hook = model.merge.register_forward_pre_hook(
             lambda module, inputs: m1_modes.append(module.training))
         with tempfile.TemporaryDirectory() as tmp:
-            info = finetune_m2(model, X, np.zeros(12), np.zeros((12, 2)),
+            info = finetune_m2(model, X, np.arange(12), X.copy(),
                                np.arange(8), np.arange(8, 12), 0., settings,
                                42, torch.device("cpu"), Path(tmp))
             self.assertGreater(info["best_epoch"], 0)
@@ -186,10 +315,36 @@ class FusionFinetuningTests(unittest.TestCase):
             p.requires_grad_(True)
         x = torch.ones(4, 2)
         w, f = model(x, x, return_features=True)
-        loss, _, _ = fusion_mae_loss(w, w.detach() + 1, f, f.detach(), 1.)
+        loss = fusion_mae_loss(w, w.detach() + 1, f, f.detach(), 1., 2., torch.ones(2))[0]
         loss.backward()
         self.assertGreater(sum(p.grad.abs().sum().item() for p in model.m2.parameters()), 0)
         self.assertTrue(all(p.grad is None for p in model.merge.parameters()))
+
+    def test_selected_xai_helper_writes_explanations_to_best_fusion(self):
+        from contextlib import ExitStack, redirect_stdout
+        import io
+        from src import Fusion_M1M2_WPred as fusion_module
+
+        model = self.make_model()
+        X = np.random.default_rng(5).uniform(size=(5, 2)).astype(np.float32)
+        args = SimpleNamespace(shap_bg=2, n_ig_steps=2, eg_bg=2, ih_samples=1)
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            output = Path(directory) / "best_fusion"
+            output.mkdir()
+            stack.enter_context(redirect_stdout(io.StringIO()))
+            for name in ('run_shap', 'run_ig', 'run_shap_m1merge', 'run_ig_m1merge'):
+                stack.enter_context(patch.object(fusion_module, name,
+                    side_effect=lambda model, background, samples, *args: np.zeros_like(samples)))
+            stack.enter_context(patch.object(fusion_module, 'run_jacobian',
+                side_effect=lambda model, samples, device: np.zeros_like(samples)))
+            stack.enter_context(patch.object(fusion_module, 'run_integrated_hessians',
+                return_value=np.zeros((4, 4))))
+            fusion_module.run_fusion_xai(model, X[:3], X[3:], np.array([40, 41]),
+                ['pp_a', 'pp_b'], 3, [2, 0], args, torch.device('cpu'), output, 'synthetic')
+            import pandas as pd
+            self.assertEqual(pd.read_csv(output / 'shap_values.csv')['ID_Part'].tolist(), [40, 41])
+            self.assertTrue((output / 'feature_attributions_single_pp.csv').is_file())
+            self.assertTrue((output / 'xai_m1merge_shap_beeswarm.png').is_file())
 
     def test_selection_uses_a_finetuned_epoch_even_when_baseline_has_zero_loss(self):
         model = self.make_model()

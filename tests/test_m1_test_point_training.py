@@ -308,6 +308,33 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.assertFalse(m1.save_models(model, metrics, 1, [], {}, run_dir, overall))
             self.assertEqual(json.loads((overall / 'best_metrics.json').read_text())['validation_MAE'], 1.)
 
+    def test_complete_promotion_replaces_old_test_1_and_nested_reports(self):
+        from src.Utility.dataset_layout import label_test_1
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, overall = Path(directory) / 'winner', Path(directory) / 'overall'
+            source.mkdir()
+            overall.mkdir()
+            (source / 'test_predictions_per_batch.csv').write_text('winning predictions')
+            (source / 'scatter_final_test.png').write_bytes(b'winning plot')
+            (source / 'test_2').mkdir()
+            (source / 'test_2' / 'scatter_test_2.png').write_bytes(b'winning external plot')
+            (overall / 'test_1_predictions_per_batch.csv').write_text('first run predictions')
+            (overall / 'scatter_final_test_1.png').write_bytes(b'first run plot')
+            (overall / 'test_2').mkdir()
+            (overall / 'test_2' / 'obsolete.png').write_bytes(b'obsolete plot')
+            (overall / 'manifest.json').write_text('stale checkpoint hashes')
+            (Path(directory) / 'dataset/Train').mkdir(parents=True)
+            label_test_1(source, {'dataset_dir': str(Path(directory) / 'dataset')})
+            m1._promote_complete_run(source, overall)
+            self.assertEqual((overall / 'test_1_predictions_per_batch.csv').read_text(),
+                             'winning predictions')
+            self.assertEqual((overall / 'scatter_final_test_1.png').read_bytes(), b'winning plot')
+            self.assertEqual((overall / 'test_2/scatter_test_2.png').read_bytes(),
+                             b'winning external plot')
+            self.assertFalse((overall / 'test_2/obsolete.png').exists())
+            self.assertFalse((overall / 'manifest.json').exists())
+
     def test_beta_resolution(self):
         self.assertEqual(m1.resolve_beta_values(.25), [.25])
         self.assertEqual(m1.resolve_beta_values([0, .1]), [0., .1])
@@ -333,6 +360,8 @@ class TrainingIntegrationTests(unittest.TestCase):
                 metrics = {'MAE': 100. if beta == .25 else 0., 'validation_MAE': validation}
                 (run_dir / 'best_metrics.json').write_text(json.dumps(metrics))
                 (run_dir / 'data_processing.json').write_text(json.dumps({'edge_group_split': {}}))
+                (run_dir / 'test_2').mkdir()
+                (run_dir / 'test_2' / 'predictions.csv').write_text(str(beta))
                 return {'validation_mae_g': validation, 'run_dir': str(run_dir),
                         'within_test_point_beta': beta}
             with patch.object(m1, 'run_experiment', side_effect=fake_experiment), redirect_stdout(io.StringIO()):
@@ -351,6 +380,8 @@ class TrainingIntegrationTests(unittest.TestCase):
             promoted = json.loads((Path(cfg['output']['best_overall_dir']) / 'best_metrics.json').read_text())
             self.assertEqual(promoted['MAE'], 100.)
             self.assertEqual(promoted['validation_MAE'], 1.)
+            self.assertEqual((Path(cfg['output']['best_overall_dir']) /
+                              'test_2/predictions.csv').read_text(), '0.25')
             summary = Path(cfg['output']['output_dir']) / 'beta_experiments' / m1._RUN_TS
             for name in ('beta_mae_comparison.png', 'beta_mae_comparison.csv'):
                 self.assertTrue((summary / name).exists())

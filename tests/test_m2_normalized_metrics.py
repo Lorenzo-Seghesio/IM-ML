@@ -39,6 +39,30 @@ def metrics(mean_mae, mean_nmae, pred):
 
 
 class M2NormalizedMetricTests(unittest.TestCase):
+    def test_training_uses_only_prediction_mae_even_with_legacy_l1_setting(self):
+        model = nn.Linear(1, 1)
+        with torch.no_grad():
+            model.weight.fill_(2.)
+            model.bias.zero_()
+        x = np.zeros((4, 1), dtype=np.float32)
+        y = np.ones((4, 1), dtype=np.float32)
+        cfg = {'lr': .01, 'weight_decay': 0., 'scheduler_factor': 1.,
+               'batch_size': 4, 'epochs': 1, 'patience': 1, 'print_every': 99,
+               'l1_lambda': 100.}
+        trained, _ = m2.train_fold(model, x, y, x, y, cfg, torch.device('cpu'))
+        # These weights have zero prediction gradient because every input is zero.
+        # A parameter penalty would still shrink them and increase training loss.
+        torch.testing.assert_close(trained.weight, torch.full_like(trained.weight, 2.), rtol=0, atol=0)
+        self.assertEqual(trained.m2_training_info['history'][0]['train_loss'], 1.)
+        self.assertGreater(trained.bias.item(), 0.)
+
+    def test_hpo_does_not_sample_legacy_l1_regularization(self):
+        trial = optuna.trial.FixedTrial({'lr': .001})
+        _, updates = m2.suggest_hyperparams(trial, {'lr': [.0001, .01],
+                                                  'l1_lambda': [.000001, .01]}, 1)
+        self.assertEqual(updates, {'lr': .001})
+        self.assertNotIn('l1_lambda', trial.params)
+
     def test_evaluation_keeps_original_unit_mae_and_adds_range_normalized_mae(self):
         y_train = np.array([[0.0, 0.0], [10.0, 100.0]], dtype=np.float32)
         y_sc = MinMaxScaler().fit(y_train)
@@ -131,7 +155,7 @@ class M2NormalizedMetricTests(unittest.TestCase):
                 42, torch.device("cpu"),
             )
 
-        self.assertEqual(create_study.call_args.kwargs["study_name"], "M2_test_hpo_nmae")
+        self.assertEqual(create_study.call_args.kwargs["study_name"], "M2_test_hpo_nmae_no_l1")
 
     def test_best_model_promotion_uses_nmae_and_saves_raw_test_mae(self):
         with tempfile.TemporaryDirectory() as temp_dir:

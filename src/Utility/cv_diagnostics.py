@@ -23,6 +23,12 @@ def _slug(value: str) -> str:
 
 def _draw_diagnostics(axes, y_true: np.ndarray, y_pred: np.ndarray,
                       fold_label: str, target_label: str) -> None:
+    valid = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true, y_pred = y_true[valid], y_pred[valid]
+    if not len(y_true):
+        for ax in axes:
+            ax.text(0.5, 0.5, "No observed targets", ha="center", transform=ax.transAxes)
+        return
     residuals = y_pred - y_true
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred)) if len(y_true) > 1 else float("nan")

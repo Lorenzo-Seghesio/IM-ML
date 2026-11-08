@@ -37,6 +37,7 @@ def save_batch_test_diagnostics(
     out_dir: Path,
     target_names: Sequence[str] | None = None,
     title: str = "Final held-out test",
+    partition: str = "test",
 ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Save per-batch test metrics, per-sample predictions, and one plot.
 
@@ -119,8 +120,8 @@ def save_batch_test_diagnostics(
 
     metrics_df = pd.DataFrame(metric_rows)
     predictions_df = pd.DataFrame(prediction_rows)
-    metrics_path = out_dir / "test_metrics_per_batch.csv"
-    predictions_path = out_dir / "test_predictions_per_batch.csv"
+    metrics_path = out_dir / f"{partition}_metrics_per_batch.csv"
+    predictions_path = out_dir / f"{partition}_predictions_per_batch.csv"
     metrics_df.to_csv(metrics_path, index=False)
     predictions_df.to_csv(predictions_path, index=False)
 
@@ -174,7 +175,7 @@ def save_batch_test_diagnostics(
         fontsize=8, title_fontsize=9,
     )
     fig.tight_layout(rect=(0, 0.06, 1, 0.96))
-    plot_path = out_dir / "test_scatter_residuals_by_batch.png"
+    plot_path = out_dir / f"{partition}_scatter_residuals_by_batch.png"
     fig.savefig(plot_path, dpi=180)
     plt.close(fig)
 
