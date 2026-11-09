@@ -35,6 +35,15 @@ def configure(cfg, stage, material):
     run_dir = os.environ.get("IM_ML_RUN_DIR")
     if run_dir:
         root = Path(run_dir)
+        teacher_cfg = stage_directory(root, "M1", material) / "best_overall" / "configuration.json"
+        if stage in ("M2", "Fusion", "RefModels") and teacher_cfg.is_file():
+            # Reused historical teachers may have different PP columns and ID namespaces.
+            # Their serialized data schema is authoritative for every downstream stage.
+            teacher_data = json.loads(teacher_cfg.read_text())["data"]
+            cfg["data"] = copy.deepcopy(teacher_data)
+            if stage == "M2" and teacher_data.get("target_col"):
+                cfg["data"]["drop_cols"] = list(dict.fromkeys([
+                    *teacher_data.get("drop_cols", []), teacher_data["target_col"]]))
         if stage in ("M1", "M2"):
             base = stage_directory(root, stage, material)
             cfg["output"] = {**cfg.get("output", {}), "output_dir": str(base),

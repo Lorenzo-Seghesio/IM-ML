@@ -1,20 +1,21 @@
 """
 Reference_Models_W_Pred.py
 ==========================
-Five reference models that all predict injection-moulded part weight (W):
+Six reference models that all predict injection-moulded part weight (W):
 
   1. Encoder  — Conv1D stack → GlobalAvgPool → MLP head    (input: configured time-series signals)
   2. MLP      — fully connected MLP                         (input: process parameters)
   3. LightGBM — gradient-boosted trees                      (input: process parameters)
   4. XGBoost  — gradient-boosted trees                      (input: process parameters)
   5. CustomGBDT — TP-aware stochastic first-order boosting   (input: process parameters)
+  6. MultiEncoder — one CNN per signal → concatenation → MLP (input: sensor signals only)
 
 All models support Optuna (TPE sampler); CustomGBDT also supports fixed parameters.
 NN and CustomGBDT models use HyperbandPruner; standard GBDTs use MedianPruner.
 After HPO a full K-fold CV is run for each model to produce final metrics.
 CustomGBDT always uses the shared normalized within-test-point loss,
 multi-test-point mini-batches, and validation-selected beta sweeps when selected.
-Encoder/MLP opt into that mode with training.test_point_training.enabled;
+Encoder/MultiEncoder/MLP opt into that mode with training.test_point_training.enabled;
 otherwise they use legacy training. LightGBM/XGBoost keep standard fitting.
 All models report complete-test-point variability metrics when IDs are available.
 
@@ -166,8 +167,12 @@ warnings.simplefilter("always", InsufficientVariabilityWarning)
 
 try:
     from Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+    from Utility.multi_encoder_reference import (MultiEncoderModel, suggest_params as suggest_multi_encoder_params,
+        fit_scalers as fit_encoder_scalers, scale_inputs as scale_encoder_inputs, gradcam as multi_encoder_gradcam)
 except ModuleNotFoundError:
     from src.Utility.pipeline_runtime import model_config as load_pipeline_config, finalize_evaluation, stage_directory
+    from src.Utility.multi_encoder_reference import (MultiEncoderModel, suggest_params as suggest_multi_encoder_params,
+        fit_scalers as fit_encoder_scalers, scale_inputs as scale_encoder_inputs, gradcam as multi_encoder_gradcam)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 BASE_OUT = BASE_DIR / "outputs" # It will be in main
@@ -295,6 +300,12 @@ class MLPModel(nn.Module):
 def _enc_prepare(x_np: np.ndarray) -> torch.Tensor:
     """(N, T) → (N, 1, T) float32 tensor."""
     return torch.tensor(x_np[:, None, :], dtype=torch.float32)
+
+
+def _build_encoder(channels, kernels, pool_kernels, head_hidden, dropout, encoder_cfg=None):
+    if encoder_cfg is not None:
+        return MultiEncoderModel(**encoder_cfg)
+    return EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout)
 
 
 def _mlp_prepare(x_np: np.ndarray) -> torch.Tensor:
@@ -588,8 +599,12 @@ def run_test_point_beta_experiments(label, cfg, mat_dir, seed, run_experiment, b
     beta_values = resolve_beta_values(beta_override if beta_override is not None else
                                      tp_cfg.get("beta_values", [0, 0.1, 0.25, 0.5, 1.0]))
     base = copy.deepcopy(cfg)
-    hpo_key = {"Encoder": "encoder_hpo", "MLP": "mlp_hpo",
+    hpo_key = {"Encoder": "encoder_hpo", "MultiEncoder": "multi_encoder_hpo", "MLP": "mlp_hpo",
                "CustomGBDT": "custom_gbdt_hpo"}[label]
+    if label == "MultiEncoder" and hpo_key not in base:
+        base[hpo_key] = copy.deepcopy(base["encoder_hpo"])
+        base[hpo_key]["study_name"] = "RefMultiEncoder_hpo"
+        base[hpo_key]["search_space"].setdefault("n_f_features", [2, 6])
     base.setdefault(hpo_key, {"n_trials": 0, "search_space": {}})
     base[hpo_key]["sampler_seed"] = resolve_optuna_seed(base[hpo_key])
     if "batch_size" in base[hpo_key].get("search_space", {}):
@@ -1103,6 +1118,8 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
     Produces (1) mean heatmap overlaid on mean pressure curve and
              (2) per-sample heatmap as an image.
     """
+    if isinstance(model, MultiEncoderModel):
+        return multi_encoder_gradcam(model, X_test_sc, out_dir, device)
     try:
         model.eval()
         last_conv = None
@@ -1188,14 +1205,14 @@ def _xai_gradcam_encoder(model: EncoderModel, X_test_sc: np.ndarray,
 def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
                    dropout, train_cfg, device, seed, strat_labels=None,
                    group_values=None, group_cfg=None, edge_values=None,
-                   edge_cfg=None):
+                   edge_cfg=None, encoder_cfg=None):
     """K-fold CV for Encoder on dev data only (indicative). Scales pressure curves per-fold."""
     _require_test_point_grouping(train_cfg, group_values, group_cfg)
     K      = train_cfg["k_folds"]
     splits = _split_iter(K, seed, strat_labels, X_pt, group_values, group_cfg,
                          edge_values, edge_cfg)
 
-    _dummy = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout)
+    _dummy = _build_encoder(channels, kernels, pool_kernels, head_hidden, dropout, encoder_cfg)
     print(f"\n[Encoder] Parameters : {_count_params(_dummy):,}")
     del _dummy
 
@@ -1210,13 +1227,13 @@ def run_cv_encoder(X_pt, y, channels, kernels, pool_kernels, head_hidden,
                            group_values, group_cfg, edge_values, edge_cfg)
         print(f"  Train={len(tr_idx)}  Val={len(val_idx)}  Test={len(test_idx)}")
 
-        pt_min = float(X_pt[tr_idx].min())
-        pt_max = float(X_pt[tr_idx].max())
-        scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
+        lengths = encoder_cfg["signal_lengths"] if encoder_cfg else None
+        pt_min, pt_max = fit_encoder_scalers(X_pt[tr_idx], lengths)
+        scale = lambda x: scale_encoder_inputs(x, pt_min, pt_max, lengths)
         X_tr_s, X_val_s, X_te_s = scale(X_pt[tr_idx]), scale(X_pt[val_idx]), scale(X_pt[test_idx])
 
         torch.manual_seed(seed + fold)
-        model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
+        model = _build_encoder(channels, kernels, pool_kernels, head_hidden, dropout, encoder_cfg).to(device)
         model, _ = train_fold_nn(model, _enc_prepare, X_tr_s, y[tr_idx],
                                  X_val_s, y[val_idx], {**train_cfg, "mini_batch_seed": seed + fold}, device,
                                  group_values[tr_idx] if group_values is not None else None,
@@ -1340,7 +1357,7 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
                         seed: int, strat_labels=None, group_values=None,
                         group_cfg=None, fixed_train_idx=None,
                         fixed_val_idx=None, edge_values=None,
-                        edge_cfg=None):
+                        edge_cfg=None, encoder_cfg=None):
     """Train the final Encoder on all dev data.
     Val split from dev used for early stopping and beta selection.
     Returns (model, (pt_min, pt_max)).
@@ -1354,9 +1371,9 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
     _validate_nn_final_split(tr_idx, val_idx, dev_idx, train_cfg, group_values, group_cfg)
     print(f"\n══ Final Encoder Training ══════════════════════════════════")
     print(f"  Dev Train={len(tr_idx)}  Dev Val={len(val_idx)}  (val for early stopping and model selection)")
-    pt_min = float(X_pt[tr_idx].min())
-    pt_max = float(X_pt[tr_idx].max())
-    scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
+    lengths = encoder_cfg["signal_lengths"] if encoder_cfg else None
+    pt_min, pt_max = fit_encoder_scalers(X_pt[tr_idx], lengths)
+    scale = lambda x: scale_encoder_inputs(x, pt_min, pt_max, lengths)
     X_tr_s, X_val_s = scale(X_pt[tr_idx]), scale(X_pt[val_idx])
     final_tcfg = {
         **train_cfg,
@@ -1364,7 +1381,7 @@ def final_train_encoder(X_pt, y, dev_idx: np.ndarray,
         "patience": train_cfg.get("final_patience", train_cfg["patience"]),
     }
     torch.manual_seed(seed)
-    model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
+    model = _build_encoder(channels, kernels, pool_kernels, head_hidden, dropout, encoder_cfg).to(device)
     model, best_val_mae = train_fold_nn(
         model, _enc_prepare, X_tr_s, y[tr_idx], X_val_s, y[val_idx],
         {**final_tcfg, "mini_batch_seed": seed}, device,
@@ -1529,10 +1546,14 @@ def suggest_xgb_params(trial, ss: dict) -> dict:
 
 def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
                  group_values=None, group_cfg=None, edge_values=None,
-                 edge_cfg=None):
+                 edge_cfg=None, encoder_cfg=None):
     _require_test_point_grouping(base_tcfg, group_values, group_cfg)
     ss = _nn_search_space(hpo_cfg, base_tcfg)
-    mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
+    if encoder_cfg is None:
+        mcfg_upd, tcfg_upd = suggest_encoder_params(trial, ss)
+    else:
+        mcfg_upd, tcfg_upd = suggest_multi_encoder_params(trial, ss, encoder_cfg)
+        encoder_cfg = mcfg_upd
     tcfg = {**base_tcfg, **tcfg_upd,
             "val_fraction": validation_fraction(base_tcfg, hpo_cfg),
             "epochs": hpo_cfg["epochs"], "patience": hpo_cfg["patience"],
@@ -1550,13 +1571,13 @@ def _obj_encoder(trial, X_pt, y, hpo_cfg, base_tcfg, seed, device, strat_labels,
     for fold, (tv_idx, test_idx) in enumerate(splits):
         tr_idx, val_idx = _inner_split(tv_idx, tcfg, seed, fold, strat_labels,
                            group_values, group_cfg, edge_values, edge_cfg)
-        pt_min = float(X_pt[tr_idx].min())
-        pt_max = float(X_pt[tr_idx].max())
-        scale  = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
+        lengths = encoder_cfg["signal_lengths"] if encoder_cfg else None
+        pt_min, pt_max = fit_encoder_scalers(X_pt[tr_idx], lengths)
+        scale = lambda x: scale_encoder_inputs(x, pt_min, pt_max, lengths)
         X_tr_s, X_val_s, X_te_s = scale(X_pt[tr_idx]), scale(X_pt[val_idx]), scale(X_pt[test_idx])
 
         torch.manual_seed(seed + trial.number * 13 + fold)
-        model = EncoderModel(channels, kernels, pool_kernels, head_hidden, dropout).to(device)
+        model = _build_encoder(channels, kernels, pool_kernels, head_hidden, dropout, encoder_cfg).to(device)
         model, _ = train_fold_nn(model, _enc_prepare, X_tr_s, y[tr_idx],
                                  X_val_s, y[val_idx], {**tcfg, "mini_batch_seed": seed + fold}, device,
                                  group_values[tr_idx] if group_values is not None else None,
@@ -1682,16 +1703,31 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                 dev_idx: np.ndarray, test_idx: np.ndarray,
                 group_values=None, group_cfg=None, fixed_train_idx=None,
                 fixed_val_idx=None, edge_values=None, edge_cfg=None,
-                part_ids=None, target_name="weight"):
-    hpo_cfg   = copy.deepcopy(cfg["encoder_hpo"])
+                part_ids=None, target_name="weight", multi_encoder=False):
+    label = "MultiEncoder" if multi_encoder else "Encoder"
+    hpo_cfg = copy.deepcopy(cfg.get("multi_encoder_hpo", cfg["encoder_hpo"]) if multi_encoder else cfg["encoder_hpo"])
+    if multi_encoder:
+        hpo_cfg["search_space"].setdefault("n_f_features", [2, 6])
+    base_encoder_cfg = None
+    if multi_encoder:
+        sources = _timeseries_sources(cfg["data"])
+        lengths = [pd.read_csv(BASE_DIR / source["path"], index_col=cfg["data"]["id_col"], nrows=0).shape[1]
+                   for source in sources]
+        if sum(lengths) != X_pt.shape[1]:
+            raise ValueError("Configured signal widths differ from reference encoder data")
+        base_encoder_cfg = copy.deepcopy(cfg.get("multi_encoder_model", {}))
+        base_encoder_cfg.setdefault("curve_encoders", [
+            {"conv_channels": [1, 8, 16], "conv_kernels": [5, 3],
+             "enc_pool_kernels": [2], "n_f_features": 4} for _ in sources])
+        base_encoder_cfg["signal_lengths"] = lengths
     sampler_seed = resolve_optuna_seed(hpo_cfg)
     train_cfg = cfg["training"].copy()
-    rb_dir, ob_dir = _nn_output_dirs("Encoder", mat_dir, train_cfg)
+    rb_dir, ob_dir = _nn_output_dirs(label, mat_dir, train_cfg)
     for d in [rb_dir, ob_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'#' * 60}")
-    print("# ENCODER: Conv1D pressure curves → weight")
+    print(f"# {label}: sensor curves → weight")
     print(f"{'#' * 60}")
 
     dev_strat = strat_labels[dev_idx] if strat_labels is not None else None
@@ -1704,13 +1740,17 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
                                             group_values[dev_idx] if group_values is not None else None,
                                             group_cfg,
                                             edge_values[dev_idx] if edge_values is not None else None,
-                                            edge_cfg),
+                                            edge_cfg, encoder_cfg=base_encoder_cfg),
         out_dir=rb_dir, seed=seed,
         pruner_type="hyperband", n_folds=hpo_cfg["n_folds"],
         sampler_seed=sampler_seed)
 
     fixed   = optuna.trial.FixedTrial(study.best_trial.params)
-    mcfg_u, tcfg_u = suggest_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg))
+    if multi_encoder:
+        mcfg_u, tcfg_u = suggest_multi_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg), base_encoder_cfg)
+    else:
+        mcfg_u, tcfg_u = suggest_encoder_params(fixed, _nn_search_space(hpo_cfg, train_cfg))
+    encoder_cfg = mcfg_u if multi_encoder else None
     train_cfg.update(tcfg_u)
 
     channels     = mcfg_u.get("channels",     [1, 16])
@@ -1722,7 +1762,8 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     hpo_info = {"trial": study.best_trial.number, "hpo_mae": float(study.best_trial.value),
                 "sampler_seed": sampler_seed,
                 "channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
-                "head_hidden": head_hidden, "dropout": dropout, **tcfg_u}
+                "head_hidden": head_hidden, "dropout": dropout, **tcfg_u,
+                **(encoder_cfg or {})}
     (rb_dir / "hpo_best_config.json").write_text(json.dumps(hpo_info, indent=2))
 
     # Indicative CV on dev data
@@ -1731,13 +1772,13 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
         X_pt[dev_idx], y[dev_idx], channels, kernels, pool_kernels, head_hidden,
         dropout, train_cfg, device, seed, dev_strat,
         group_values[dev_idx] if group_values is not None else None, group_cfg,
-        edge_values[dev_idx] if edge_values is not None else None, edge_cfg)
+        edge_values[dev_idx] if edge_values is not None else None, edge_cfg, encoder_cfg=encoder_cfg)
 
     K = train_cfg["k_folds"]
     metrics_df.index = [f"Fold_{i+1}" for i in range(K)]
     metrics_df.to_csv(rb_dir / "cv_fold_metrics.csv")
-    print_summary(metrics_df, best_fold_idx, best_fold_mae, K, "Encoder")
-    save_cv_plots(metrics_df, K, mat, rb_dir, "Encoder")
+    print_summary(metrics_df, best_fold_idx, best_fold_mae, K, label)
+    save_cv_plots(metrics_df, K, mat, rb_dir, label)
     save_cv_diagnostics(cv_predictions, rb_dir,
                         f"[{mat} | Encoder] Indicative K-fold CV on dev set")
 
@@ -1745,9 +1786,9 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     final_model, (pt_min, pt_max) = final_train_encoder(
         X_pt, y, dev_idx, channels, kernels, pool_kernels, head_hidden,
         dropout, train_cfg, device, seed, strat_labels, group_values, group_cfg,
-        fixed_train_idx, fixed_val_idx, edge_values, edge_cfg)
+        fixed_train_idx, fixed_val_idx, edge_values, edge_cfg, encoder_cfg=encoder_cfg)
 
-    scale = lambda x: ((x - pt_min) / (pt_max - pt_min + 1e-8)).astype(np.float32)
+    scale = lambda x: scale_encoder_inputs(x, pt_min, pt_max, encoder_cfg["signal_lengths"] if encoder_cfg else None)
     test_enabled = cfg.get("evaluation", {}).get("enabled", True)
     eval_idx = test_idx if test_enabled else np.asarray(final_model.ref_training_info["validation_indices"])
     res = evaluate_nn(final_model, _enc_prepare, scale(X_pt[eval_idx]), y[eval_idx], device,
@@ -1762,33 +1803,36 @@ def run_encoder(X_pt, y, cfg, mat, mat_dir, seed, device, strat_labels,
     print(f"[Encoder] Final Test  MAE={res['MAE']:.4f}  RMSE={res['RMSE']:.4f}  "
           f"R²={res['R2']:.4f}  MSE={res['MSE']:.4f}")
     print(f"{'═' * 60}")
-    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, "Encoder")
+    save_final_test_plots(y[eval_idx], res["pred"], final_metrics, rb_dir, mat, label)
     _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
-                               part_ids, eval_idx, rb_dir, mat, "Encoder",
+                               part_ids, eval_idx, rb_dir, mat, label,
                                target_name, partition="test" if test_enabled else "validation")
 
     _save_nn_training_artifacts(final_model, cfg, train_cfg, final_metrics, rb_dir,
                                 part_ids, dev_idx, test_idx, group_cfg, edge_cfg)
-    (rb_dir / "scalers.json").write_text(json.dumps({"pt_min": pt_min, "pt_max": pt_max}, indent=2))
+    (rb_dir / "scalers.json").write_text(json.dumps({"pt_min": pt_min, "pt_max": pt_max,
+        **({"signal_lengths": encoder_cfg["signal_lengths"]} if encoder_cfg else {})}, indent=2))
 
     arch_info = {"channels": channels, "kernels": kernels, "pool_kernels": pool_kernels,
                  "head_hidden": head_hidden, "dropout": dropout}
-    updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, "Encoder")
+    if encoder_cfg:
+        arch_info = {**encoder_cfg, "input_layout": "per_signal"}
+    updated = save_model_nn(final_model, final_metrics, rb_dir, ob_dir, arch_info, label)
 
     # XAI — GradCAM on the last Conv1d layer
-    _xai_gradcam_encoder(final_model, scale(X_pt[eval_idx]), rb_dir, "Encoder", device)
+    _xai_gradcam_encoder(final_model, scale(X_pt[eval_idx]), rb_dir, label, device)
 
-    _save_run_info(rb_dir, ob_dir, mat, "Encoder", updated, seed, sampler_seed)
+    _save_run_info(rb_dir, ob_dir, mat, label, updated, seed, sampler_seed)
     if updated:
-        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, "Encoder")
+        save_final_test_plots(y[eval_idx], res["pred"], final_metrics, ob_dir, mat, label)
         _save_batch_test_artifacts(y[eval_idx], res["pred"], group_values,
-                                   part_ids, eval_idx, ob_dir, mat, "Encoder",
+                                   part_ids, eval_idx, ob_dir, mat, label,
                                    target_name, partition="test" if test_enabled else "validation")
-        save_cv_plots(metrics_df, K, mat, ob_dir, "Encoder")
+        save_cv_plots(metrics_df, K, mat, ob_dir, label)
         _copy_artefacts(rb_dir, ob_dir)
         print(f"[Encoder] All artefacts copied → {ob_dir}")
     from src.Utility.external_evaluation import finish_original_stage
-    finish_original_stage(cfg, "Encoder", rb_dir, ob_dir if updated else None,
+    finish_original_stage(cfg, label, rb_dir, ob_dir if updated else None,
                           model=final_model, transform=scale)
     finalize_evaluation(rb_dir, test_enabled)
     if updated:
@@ -2343,7 +2387,7 @@ def run_custom_gbdt(X_pp, y, cfg, mat, mat_dir, seed, strat_labels, dev_idx, tes
 def main():
     global BASE_OUT
     parser = argparse.ArgumentParser(
-        description="Reference models: Encoder, MLP, LightGBM, XGBoost, CustomGBDT.")
+        description="Reference models: Encoder, MultiEncoder, MLP, LightGBM, XGBoost, CustomGBDT.")
     parser.add_argument("--material", type=str.upper,
                         choices=["PP", "ABS", "ALL", "DOE1"], required=True,
                         help="Material subset: PP | ABS (plain KFold) or ALL (stratified). "
@@ -2353,7 +2397,7 @@ def main():
     parser.add_argument("--beta-values", type=float, nargs="+", default=None,
                         help="Within-test-point loss coefficients for Encoder, MLP and CustomGBDT")
     parser.add_argument("--models", nargs="+", default=None,
-                        choices=["encoder", "mlp", "lgbm", "xgboost", "custom_gbdt"],
+                        choices=["encoder", "multi_encoder", "mlp", "lgbm", "xgboost", "custom_gbdt"],
                         help="Run only these models, overriding active_models in the config")
     args = parser.parse_args()
     mat  = args.material
@@ -2362,9 +2406,9 @@ def main():
     cfg, cfg_path = load_pipeline_config(cfg_path, "RefModels", mat)
     if args.models is not None:
         cfg["active_models"] = {name: int(name in args.models) for name in (
-            "encoder", "mlp", "lgbm", "xgboost", "custom_gbdt")}
+            "encoder", "multi_encoder", "mlp", "lgbm", "xgboost", "custom_gbdt")}
     if args.optuna_seed is not None:
-        for model_name in ("encoder_hpo", "mlp_hpo", "lgbm_hpo", "xgboost_hpo", "custom_gbdt_hpo"):
+        for model_name in ("encoder_hpo", "multi_encoder_hpo", "mlp_hpo", "lgbm_hpo", "xgboost_hpo", "custom_gbdt_hpo"):
             if model_name in cfg:
                 cfg[model_name]["sampler_seed"] = args.optuna_seed
         print(f"[CLI override] Optuna sampler seed set to {args.optuna_seed} for active reference studies")
@@ -2464,13 +2508,14 @@ def main():
     # ── Active-model gates (default: all on) ──────────────────────────────────
     active = cfg.get("active_models", {})
     enc_on  = bool(active.get("encoder", 1))
+    multi_enc_on = bool(active.get("multi_encoder", 0))
     mlp_on  = bool(active.get("mlp",     1))
     lgbm_on = bool(active.get("lgbm",    1))
     xgb_on  = bool(active.get("xgboost", 1))
     if custom_on and not neural_tp_enabled:
         print("\n[custom_gbdt] Enabled with its TP loss/sampler; "
               "Encoder/MLP retain their configured training mode.")
-    print(f"\nActive models  →  encoder={enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}  custom_gbdt={custom_on}")
+    print(f"\nActive models  →  encoder={enc_on}  multi_encoder={multi_enc_on}  mlp={mlp_on}  lgbm={lgbm_on}  xgboost={xgb_on}  custom_gbdt={custom_on}")
 
     if enc_on:
         run_nn_beta_experiments("Encoder", cfg, mat_dir, seed,
@@ -2482,6 +2527,15 @@ def main():
             neural_beta_override)
     else:
         print("\n[encoder]  skipped (active_models.encoder = 0)")
+
+    if multi_enc_on:
+        run_nn_beta_experiments("MultiEncoder", cfg, mat_dir, seed,
+            lambda experiment: run_encoder(
+                X_pt, y, experiment, mat, mat_dir, seed, device, strat_labels,
+                dev_idx, test_idx, group_ids, group_cfg,
+                m1_train_idx, m1_val_idx, edge_values, edge_cfg,
+                part_ids=part_ids, target_name=cfg["data"]["target_col"], multi_encoder=True),
+            neural_beta_override)
 
     if mlp_on:
         run_nn_beta_experiments("MLP", cfg, mat_dir, seed,
@@ -2520,9 +2574,9 @@ def main():
     elif not active.get("custom_gbdt", 0):
         print("\n[custom_gbdt] skipped (active_models.custom_gbdt = 0)")
 
-    n_active = sum([enc_on, mlp_on, lgbm_on, xgb_on, custom_on])
+    n_active = sum([enc_on, multi_enc_on, mlp_on, lgbm_on, xgb_on, custom_on])
     print(f"\n{'═' * 60}")
-    print(f"{n_active}/5 reference model(s) complete.")
+    print(f"{n_active}/6 reference model(s) complete.")
     print(f"Results saved under: {BASE_OUT}")
     print(f"{'═' * 60}")
 

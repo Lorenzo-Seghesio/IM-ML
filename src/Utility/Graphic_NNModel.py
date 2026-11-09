@@ -116,6 +116,8 @@ def detect_model_type(model_dir: Path) -> str:
             "visualtorch only supports PyTorch nn.Module models."
         )
 
+    if "RefModels/MultiEncoder" in p:
+        return "ref_multi_encoder"
     if "RefModels/Encoder" in p:
         return "ref_encoder"
     if "RefModels/MLP" in p:
@@ -171,6 +173,14 @@ def load_ref_encoder(model_dir: Path):
     state = torch.load(model_dir / "best_model.pt", map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     return model, (1, 1, T_VIZ)
+
+
+def load_ref_multi_encoder(model_dir: Path):
+    from src.Utility.multi_encoder_reference import MultiEncoderModel
+    meta = json.loads((model_dir / "best_metrics.json").read_text())
+    model = MultiEncoderModel(**{k: meta[k] for k in ("curve_encoders", "signal_lengths", "head_hidden", "dropout")})
+    model.load_state_dict(torch.load(model_dir / "best_model.pt", map_location="cpu", weights_only=True))
+    return model, (1, 1, sum(meta["signal_lengths"]))
 
 
 def load_m1(model_dir: Path):
@@ -295,6 +305,7 @@ def load_bc_mlp(model_dir: Path):
 _LOADERS = {
     "ref_mlp":     load_ref_mlp,
     "ref_encoder": load_ref_encoder,
+    "ref_multi_encoder": load_ref_multi_encoder,
     "m1":          load_m1,
     "m2":          load_m2,
     "fusion":      load_fusion,

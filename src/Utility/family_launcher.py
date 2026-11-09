@@ -193,14 +193,16 @@ def _publish_best_reference_run(material, run_dir, configs):
     scalers = read_json(sources["M2"] / "scalers.json")
     if scalers.get("m1_run_ts") != split.get("run_ts"):
         raise ValueError("Cannot publish original checkpoints: M1/M2 originate from different runs")
-    data_cfg = requested["M1"]["data"]
+    saved_configuration = sources["M1"] / "configuration.json"
+    data_cfg = (read_json(saved_configuration).get("data", requested["M1"]["data"])
+                if saved_configuration.is_file() else requested["M1"]["data"])
     data_paths = [data_cfg["scalar_csv"]]
     data_paths += [source["path"] for source in data_cfg.get("timeseries_csvs", data_cfg.get("pressure_csvs", []))]
     if data_cfg.get("pressure_csv"):
         data_paths.append(data_cfg["pressure_csv"])
     # Compare runs on the same task and exact test membership, even when training
     # seeds, validation membership or model hyperparameters differ.
-    signature = fingerprint(requested["M1"]["data"],
+    signature = fingerprint(data_cfg,
         [(path, file_hash(ROOT / path)) for path in data_paths],
         {key: split.get(key) for key in ("pp_cols", "test_part_ids", "group_split", "edge_group_split")})
     manifest_path = destination / "reference_run.json"

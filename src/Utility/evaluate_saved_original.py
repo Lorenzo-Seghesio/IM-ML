@@ -346,10 +346,13 @@ def evaluate_run(run_dir, output, xai=True, threads=4):
         rval = map_ids(rids, saved_val)
         out = output / 'RefModels' / label / 'best_overall'
         copy_stage(source, out)
-        if label == 'Encoder':
-            model = refs.EncoderModel(**{k: meta[k] for k in ('channels', 'kernels', 'pool_kernels', 'head_hidden', 'dropout')}).to(device)
+        if label in ('Encoder', 'MultiEncoder'):
+            keys = (('curve_encoders', 'signal_lengths', 'head_hidden', 'dropout') if label == 'MultiEncoder'
+                    else ('channels', 'kernels', 'pool_kernels', 'head_hidden', 'dropout'))
+            cls = refs.MultiEncoderModel if label == 'MultiEncoder' else refs.EncoderModel
+            model = cls(**{k: meta[k] for k in keys}).to(device)
             scale = read_json(source / 'scalers.json')
-            rx = ((rpt - scale['pt_min']) / (scale['pt_max'] - scale['pt_min'] + 1e-8)).astype(np.float32)
+            rx = refs.scale_encoder_inputs(rpt, scale['pt_min'], scale['pt_max'], scale.get('signal_lengths'))
             prepare = refs._enc_prepare
         elif label == 'MLP':
             model = refs.MLPModel(meta['n_in'], meta['hidden_dims'], meta['dropout']).to(device)
@@ -377,8 +380,8 @@ def evaluate_run(run_dir, output, xai=True, threads=4):
         summarize(f'Reference/{label}', report, out)
         if not xai:
             continue
-        if label == 'Encoder':
-            job = lambda model=model, rx=rx, rtest=rtest, out=out: refs._xai_gradcam_encoder(model, rx[rtest], out, 'Encoder', device)
+        if label in ('Encoder', 'MultiEncoder'):
+            job = lambda model=model, rx=rx, rtest=rtest, out=out, label=label: refs._xai_gradcam_encoder(model, rx[rtest], out, label, device)
             expected = ['xai_gradcam.png']
         elif label == 'MLP':
             def job(model=model, rx=rx, rtest=rtest, rdev=rdev, rcols=rcols, out=out):

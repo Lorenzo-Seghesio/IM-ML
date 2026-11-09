@@ -128,7 +128,7 @@ def finish_original_stage(cfg, stage, directory, overall=None, model=None, trans
             directory/"test_2", "DOE1", partition="test_2", target_scale=ys.scale_, plots=plots)
         write_json(directory/"test_2_metrics.json", report)
     else:
-        if stage == "Encoder":
+        if stage in ("Encoder", "MultiEncoder"):
             values = np.concatenate(external.curves, axis=1)
         else:
             values = external.pp
@@ -136,7 +136,7 @@ def finish_original_stage(cfg, stage, directory, overall=None, model=None, trans
         if isinstance(model, torch.nn.Module):
             dev = next(model.parameters()).device
             tensor = torch.as_tensor(values, dtype=torch.float32, device=dev)
-            if stage == "Encoder":
+            if stage in ("Encoder", "MultiEncoder"):
                 tensor = tensor[:, None, :]
             model.eval()
             with torch.inference_mode():

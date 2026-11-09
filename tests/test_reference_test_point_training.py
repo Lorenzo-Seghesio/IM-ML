@@ -439,7 +439,7 @@ class ReferenceArtifactTests(unittest.TestCase):
             custom.assert_called_once()
             self.assertTrue(custom.call_args.args[2]['training']['test_point_training']['enabled'])
             self.assertEqual(json.loads(path.read_text()), cfg)
-            self.assertIn('5/5 reference model(s) complete', output.getvalue())
+            self.assertIn('5/6 reference model(s) complete', output.getvalue())
 
     def test_main_legacy_mode_runs_original_models_when_custom_is_disabled(self):
         for tp_cfg in ({'test_point_training': {'enabled': False, 'beta_values': [0, .25]}}, {}):
@@ -476,7 +476,7 @@ class ReferenceArtifactTests(unittest.TestCase):
                     custom.assert_not_called()
                     comparison.assert_not_called()
                     self.assertIn('active_models.custom_gbdt = 0', output.getvalue())
-                    self.assertIn('4/5 reference model(s) complete', output.getvalue())
+                    self.assertIn('4/6 reference model(s) complete', output.getvalue())
 
 
 if __name__ == '__main__':

@@ -411,7 +411,7 @@ class CustomPipelineTests(unittest.TestCase):
                 self.assertTrue(effective['training']['test_point_training']['enabled'])
                 model = custom.CustomTestPointGBDT.load(run / 'best_model.joblib')
                 self.assertTrue(np.isfinite(model.predict(x)).all())
-            self.assertIn('1/5 reference model(s) complete', output.getvalue())
+            self.assertIn('1/6 reference model(s) complete', output.getvalue())
 
     def test_active_custom_requires_grouped_data_before_any_reference_training(self):
         x, y, ids = fixture()
